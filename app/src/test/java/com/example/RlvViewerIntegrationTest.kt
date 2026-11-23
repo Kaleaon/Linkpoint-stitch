@@ -53,14 +53,20 @@ class RlvViewerIntegrationTest {
         val app = ApplicationProvider.getApplicationContext<Application>()
         val vm = ViewerSessionViewModel(app)
 
-        // Ensure RLVa starts enabled and enter Local Sandbox
-        vm.setRlvaEnabled(true)
+        // 0. Out of the box, RLVa must default to explicitly disabled (opt-in TPV user safety)
+        assertFalse("RLVa must start disabled until explicitly opted in by the user", vm.state.value.rlvSnapshot.enabled)
         vm.enterLocalSandbox()
         shadowOf(android.os.Looper.getMainLooper()).idle()
+        assertFalse(
+            "Disabled RLVa must not emit @versionnew replies on sandbox entry",
+            vm.state.value.localChat.any { it.channel == 4711 }
+        )
 
-        // 1. Initial sandbox handshake should reply on channel 4711
+        // 1. Explicitly enable RLVa via user toggle — triggers initial sandbox @versionnew=4711 handshake
+        vm.setRlvaEnabled(true)
+        shadowOf(android.os.Looper.getMainLooper()).idle()
         assertTrue(
-            "Expected initial RLVa @versionnew handshake reply on ch 4711",
+            "Expected initial RLVa @versionnew handshake reply on ch 4711 once enabled",
             vm.state.value.localChat.any { it.channel == 4711 && it.text.contains("RestrainedLove viewer") }
         )
 
@@ -160,5 +166,13 @@ class RlvViewerIntegrationTest {
 
         vm.openInventoryNotecard(notecardItem.id)
         assertNotNull(vm.state.value.activeNotecardPreview)
+        vm.dismissNotecardPreview()
+
+        // 10. Toggling the user RLVa switch OFF in Studio disables RLVa and ignores subsequent @commands
+        composeRule.onNodeWithTag("rlva_enable_switch").performScrollTo().performClick()
+        composeRule.waitForIdle()
+        assertFalse(vm.state.value.rlvSnapshot.enabled)
+        vm.triggerSandboxRlvDemo("lock_and_gag")
+        assertEquals(0, vm.state.value.rlvSnapshot.activeRuleCount)
     }
 }

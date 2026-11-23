@@ -5,20 +5,31 @@ import java.util.UUID
 /**
  * Constants, data models, canonical LSL/RLVa tables, and host callback contracts
  * for the Linkpoint RLV / RLVa behavioral restriction engine.
+ *
+ * Cross-checked against `LibreMetaverse.RLV` (BSD-3-Clause), `react-linkpoint` (MIT),
+ * and the public Marine Kelley RLV / Kitty Barnett Firestorm RLVa protocol specification.
  */
 object RlvConstants {
-    /** Second Life ChatFromSimulator ChatType for llOwnerSay(). */
-    const val CHAT_TYPE_OWNER: Int = 8
-
-    /** Second Life ChatFromSimulator SourceType for in-world scripted objects / attachments. */
+    /** Second Life ChatFromSimulator SourceType values (`EChatSourceType` in `llchat.h`). */
+    const val SOURCE_TYPE_SYSTEM: Int = 0
+    const val SOURCE_TYPE_AGENT: Int = 1
     const val SOURCE_TYPE_OBJECT: Int = 2
 
-    /** Second Life ChatFromViewer ChatType values. */
+    /** Second Life ChatFromSimulator / ChatFromViewer ChatType values (`EChatType` in `llchat.h`). */
     const val CHAT_TYPE_WHISPER: Int = 0
     const val CHAT_TYPE_NORMAL: Int = 1
     const val CHAT_TYPE_SHOUT: Int = 2
+    const val CHAT_TYPE_START: Int = 4
+    const val CHAT_TYPE_STOP: Int = 5
+    const val CHAT_TYPE_DEBUG_MSG: Int = 6
+    const val CHAT_TYPE_REGION: Int = 7
+    /** Second Life ChatFromSimulator ChatType for `llOwnerSay()` — the sole valid RLVa command transport. */
+    const val CHAT_TYPE_OWNER: Int = 8
+    const val CHAT_TYPE_DIRECT: Int = 9
 
-    /** Standard RLV / RLVa handshake version strings & numeric version (MNNPPBB). */
+    /** Canonical RLV / Firestorm RLVa version numbers and handshake reply strings (`MNNPPBB` = `2080000`). */
+    const val RLV_VERSION: String = "2.8.0"
+    const val RLVA_VERSION: String = "2.4.2"
     const val RLV_VERSION_REPLY: String = "RestrainedLife viewer v2.8.0 (RLVa 2.4.2 / Linkpoint 3.4.3)"
     const val RLV_VERSION_NEW_REPLY: String = "RestrainedLove viewer v2.8.0 (RLVa 2.4.2 / Linkpoint 3.4.3)"
     const val RLV_VERSION_NUM_REPLY: String = "2080000"
@@ -30,14 +41,10 @@ object RlvConstants {
     const val REDACTED_TEXT: String = "(Hidden)"
 
     /**
-     * Canonical Second Life wearable layers in exact RLV @getoutfit bitmask order (15 layers).
-     * Matches Marine Kelley RLV & Firestorm RLVa specification:
-     * gloves, jacket, pants, shirt, shoes, skirt, socks, underpants, undershirt,
-     * skin, eyes, hair, shape, alpha, tattoo (plus physics optional in newer extensions;
-     * classic 15-char bitmask is expected by OpenCollar & standard RLV scripts, with skin/eyes/hair/shape
-     * excluded or included? Wait: check RLVCmdGetOutfit: bodyparts skin/eyes/hair/shape are skipped when isBodyPart()!
-     * Wait — in RLV spec, @getoutfit returns 15 digits:
-     * gloves,jacket,pants,shirt,shoes,skirt,socks,underpants,undershirt,skin,eyes,hair,shape,alpha,tattoo).
+     * Canonical Second Life wearable layers in exact RLV `@getoutfit` 15-character bitmask order
+     * (`LibreMetaverse.RLV` & Marine Kelley RLV / Firestorm RLVa specification):
+     * `gloves, jacket, pants, shirt, shoes, skirt, socks, underpants, undershirt,
+     * skin, eyes, hair, shape, alpha, tattoo`.
      */
     val OUTFIT_LAYERS: List<String> = listOf(
         "gloves",
@@ -268,7 +275,7 @@ data class RlvObjectController(
 
 /** Immutable snapshot of RLVa engine state exposed in `ViewerState` for Compose UI rendering. */
 data class RlvUiSnapshot(
-    val enabled: Boolean = true,
+    val enabled: Boolean = false,
     val activeRuleCount: Int = 0,
     val controllers: List<RlvObjectController> = emptyList(),
     val activeBehaviors: Set<String> = emptySet(),

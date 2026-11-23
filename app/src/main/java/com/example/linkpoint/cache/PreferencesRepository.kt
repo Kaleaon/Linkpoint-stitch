@@ -78,7 +78,7 @@ class PreferencesRepository(private val context: Context) {
             pinnedTools = pinned,
             drawDistance = prefs[Keys.DRAW_DISTANCE] ?: 128f,
             environmentPreset = enumOrDefault(prefs[Keys.ENVIRONMENT_PRESET], EnvironmentPreset.TWILIGHT),
-            rlvaEnabled = prefs[Keys.RLVA_ENABLED] ?: true
+            rlvaEnabled = prefs[Keys.RLVA_ENABLED] ?: false
         )
     }
 

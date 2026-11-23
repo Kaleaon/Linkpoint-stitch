@@ -47,7 +47,7 @@ sealed class SimEvent {
         val chatType: Int,
         val message: String,
         val position: Vec3,
-        val sourceType: Int = 2
+        val sourceType: Int = 0
     ) : SimEvent()
 
     data class InstantMessageReceived(
@@ -517,7 +517,7 @@ class LludpCircuitEngine {
                     val fromName = LludpPackets.readCString(buf, nameLen)
                     val sourceId = LludpPackets.readUuid(buf)
                     LludpPackets.readUuid(buf) // OwnerId
-                    var sourceType = 2
+                    var sourceType = 0
                     var chatType = 1
                     if (buf.remaining() >= 3) {
                         sourceType = buf.get().toInt() and 0xFF
@@ -1256,10 +1256,14 @@ class LludpCircuitEngine {
 
     // --- Public Command Dispatchers ---
 
+    /** Optional hook for deterministic JVM unit tests to inspect framed outbound LLUDP packets. */
+    internal var outboundPacketObserverForTesting: ((ByteArray) -> Unit)? = null
+
     fun sendChat(message: String, chatType: Byte = 1, channel: Int = 0) {
-        if (!running.get()) return
+        if (!running.get() && outboundPacketObserverForTesting == null) return
         val body = LludpPackets.buildChatFromViewer(agentId, sessionId, message, chatType, channel)
-        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true)
+        // ChatFromViewer (Low 80 = 0xFFFF0050) is Zerocoded per Second Life message_template.msg
+        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true, zeroCode = true)
     }
 
     fun sendInstantMessage(toAgentId: UUID, imSessionId: UUID, fromName: String, message: String) {
@@ -1344,6 +1348,7 @@ class LludpCircuitEngine {
             piggyAcks.add(next)
         }
         val framed = LludpPackets.framePacket(seq, reliable, messageId, body, piggyAcks, zeroCode)
+        outboundPacketObserverForTesting?.invoke(framed)
         if (reliable) {
             unackedReliable[seq] = System.currentTimeMillis() to framed
         }

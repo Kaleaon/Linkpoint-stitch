@@ -6,18 +6,40 @@ import java.util.UUID
  * Standalone Second Life RLV / Firestorm RLVa Command Parser, Query Responder,
  * and Behavioral Restriction Engine.
  *
- * Key invariants:
- * - Only processes `ChatFromSimulator` messages when RLVa is enabled, `sourceType == SOURCE_TYPE_OBJECT (2)`,
- *   `chatType == CHAT_TYPE_OWNER (8)` (`llOwnerSay`), and the message starts with `@`.
- * - Tracks restrictions per issuing object UUID so `@clear` / `@clear=<filter>` and attachment detach
- *   garbage-collection affect only that object's rules while preserving rules held by other objects.
- * - Replies to `@version`, `@versionnew`, `@versionnum`, `@getstatus`, `@getstatusall`,
- *   `@getoutfit`, `@getattach`, and `@getsitid` strictly on positive non-zero script channels (`channel > 0`).
- * - When `enabled == false`, all restriction checks return unrestricted/no-op results.
+ * ### Provenance & Open-Source Licensing
+ * - **`LibreMetaverse.RLV` (BSD 3-Clause License, Sjofn LLC / LibreMetaverse contributors)**:
+ *   Cross-checked for canonical per-object rule tracking, `@version` / `@versionnew` / `@versionnum` /
+ *   `@getstatus[:filter[;separator]]` positive-channel reply semantics, target-exception evaluation,
+ *   and 15-layer `@getoutfit` / 41-slot `@getattach` bitmask ordering.
+ * - **`react-linkpoint` / Linkpoint (MIT License)**:
+ *   Adapted for the reactive [RlvUiSnapshot] state contract, mobile inspector controller grouping,
+ *   and offline sandbox RLVa relay presets.
+ * - **Public RLV / Firestorm Release-Branch RLVa Protocol Specification**:
+ *   Interoperates with Marine Kelley's RLV (`v2.8.0`, `MNNPPBB = 2080000`) and Kitty Barnett's
+ *   Firestorm release-branch RLVa (`RLVa 2.4.2`, `RestrainedLove viewer v...`) LSL wire conventions.
+ *   Clean-room Kotlin implementation; zero LGPL viewer C++ source code is copied.
+ *
+ * ### Linden Lab Third-Party Viewer (TPV) Policy & Safety Invariants
+ * - **Explicit User Opt-In (`initialEnabled = false`)**: RLVa is disabled by default until the user
+ *   explicitly enables it via the persisted **Enable RLVa** toggle (`RlvStatusPanel`). Turning RLVa
+ *   off immediately purges all active restrictions and ignores subsequent `@` commands.
+ * - **Anti-Spoofing `llOwnerSay` Gate**: Processes `ChatFromSimulator` messages **only** when
+ *   `enabled == true`, `sourceType == SOURCE_TYPE_OBJECT (2)`, `chatType == CHAT_TYPE_OWNER (8)`
+ *   (`llOwnerSay`), and the message starts with `@`. Public (`1`), whisper (`0`), shout (`2`),
+ *   debug (`6`), `llRegionSayTo` (`7`), direct (`9`), and avatar (`sourceType == 1`) chat are strictly
+ *   ignored so spoofed public `@` chat can never trigger restrictions or channel replies.
+ * - **Positive-Channel-Only Replies (`channel > 0`)**: Handshake and status queries (`@version`,
+ *   `@versionnew`, `@versionnum`, `@versionnumbl`, `@getstatus[:filter[;sep]]`, `@getstatusall`,
+ *   `@getoutfit`, `@getattach`, and `@getsitid`) reply exclusively on positive `> 0` script channels
+ *   via `ChatFromViewer` (`Low 80 = 0xFFFF0050`, **`Zerocoded`**), never on channel `0` or negative channels.
+ * - **Creator & User Safety Controls**: Preserves Second Life server-enforced content permissions and
+ *   creator attribution while surfacing a transparent active-restrictions inspector ([getSnapshot])
+ *   grouped by holding object name & UUID, per-object release ([onObjectDetached]), and one-tap
+ *   **Emergency Release** ([clearAllRestrictions]).
  */
 class RlvEngine(
     private val host: RlvHostCallbacks,
-    initialEnabled: Boolean = true
+    initialEnabled: Boolean = false
 ) {
     private val lock = Any()
 
@@ -422,7 +444,12 @@ class RlvEngine(
 
                 val colonIdx = lhs.indexOf(':')
                 val cmdName = (if (colonIdx >= 0) lhs.substring(0, colonIdx) else lhs).trim().lowercase()
-                val opt = if (colonIdx >= 0) lhs.substring(colonIdx + 1).trim() else ""
+                val opt = if (colonIdx >= 0) {
+                    val rawOpt = lhs.substring(colonIdx + 1)
+                    if (';' in rawOpt) rawOpt else rawOpt.trim()
+                } else {
+                    ""
+                }
                 if (cmdName.isNotEmpty()) {
                     result += ParsedRlvCommand(command = cmdName, option = opt, param = param)
                 }
@@ -469,11 +496,11 @@ class RlvEngine(
                 }
             }
 
-            "versionnum" -> {
+            "versionnum", "versionnumbl" -> {
                 val chan = cmd.param.toIntOrNull()
                 if (chan != null && chan > 0) {
                     pendingReplies += chan to RlvConstants.RLV_VERSION_NUM_REPLY
-                    appendLogLocked("$sourceName -> @versionnum=$chan")
+                    appendLogLocked("$sourceName -> @${cmd.command}=$chan")
                 }
             }
 
@@ -560,14 +587,10 @@ class RlvEngine(
                 }
             }
 
-            // --- Allowance command (@accepttp uses =add|=y to enable, =rem|=n to disable) ---
+            // --- Allowance command (@accepttp uses =n|=add to add rule, =y|=rem to remove rule per RLVa/LibreMetaverse.RLV) ---
             "accepttp" -> {
                 val normalizedOpt = normalizeUuidOrEmptyOption(cmd.option) ?: return
-                if (cmd.param == "add" || cmd.param == "y") {
-                    addRuleLocked(sourceId, RlvRule("accepttp", normalizedOpt))
-                } else if (cmd.param == "rem" || cmd.param == "n") {
-                    removeRuleLocked(sourceId, RlvRule("accepttp", normalizedOpt))
-                }
+                applyBooleanRuleLocked(sourceId, "accepttp", normalizedOpt, cmd.param)
             }
 
             // --- Redirchat requires a positive non-zero script channel ---

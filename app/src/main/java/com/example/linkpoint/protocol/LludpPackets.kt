@@ -253,13 +253,11 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
-        val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
+        val payloadBytes = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
 
         var flags = 0
         if (reliable) flags = flags or FLAG_RELIABLE
-        if (actuallyZeroCoded) flags = flags or FLAG_ZEROCODED
+        if (useZeroCoding) flags = flags or FLAG_ZEROCODED
         if (acks.isNotEmpty()) flags = flags or FLAG_ACK
 
         val ackTailSize = if (acks.isNotEmpty()) acks.size * 4 + 1 else 0

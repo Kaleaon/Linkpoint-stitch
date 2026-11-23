@@ -71,7 +71,7 @@ data class PersonalDesignState(
     val pinnedTools: List<DockToolId> = DockToolId.entries.toList(),
     val drawDistance: Float = 128f,
     val environmentPreset: EnvironmentPreset = EnvironmentPreset.TWILIGHT,
-    val rlvaEnabled: Boolean = true
+    val rlvaEnabled: Boolean = false
 )
 
 data class DesignStarterPreset(

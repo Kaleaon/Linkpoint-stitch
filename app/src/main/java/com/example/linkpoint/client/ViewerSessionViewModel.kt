@@ -77,6 +77,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -131,6 +132,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     @Volatile private var lastUiPosSyncMs = 0L
     private val pressedMoveKeys = ConcurrentHashMap.newKeySet<Int>()
     private val requestedProfiles = ConcurrentHashMap.newKeySet<UUID>()
+    private val pendingDesignSaves = AtomicInteger(0)
     private var simLoopJob: Job? = null
 
     private data class LoginAttemptSpec(
@@ -296,6 +298,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         }
         viewModelScope.launch {
             prefsRepo.designStateFlow.collect { design ->
+                if (pendingDesignSaves.get() > 0) return@collect
                 rlvEngine.setEnabled(design.rlvaEnabled)
                 _state.update { it.copy(design = design, rlvSnapshot = rlvEngine.getSnapshot()) }
                 lludpEngine.drawDistance = design.drawDistance
@@ -2461,6 +2464,15 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         rlvEngine.setEnabled(enabled)
         mutateDesign { it.copy(rlvaEnabled = enabled) }
         _state.update { it.copy(rlvSnapshot = rlvEngine.getSnapshot()) }
+        if (enabled && _state.value.connection is ConnectionState.LocalSandbox) {
+            rlvEngine.onIncomingChat(
+                sourceId = LocalSandboxBuilder.SANDBOX_RLV_RELAY_UUID,
+                fromName = "OpenCollar RLVa Relay HUD",
+                chatType = RlvConstants.CHAT_TYPE_OWNER,
+                message = "@versionnew=4711",
+                sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+            )
+        }
         showToast(if (enabled) "RLVa enabled" else "RLVa disabled — restrictions cleared")
     }
 
@@ -2617,7 +2629,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     }
 
     override fun applyStarterPreset(preset: DesignStarterPreset) {
-        mutateDesign { preset.state }
+        mutateDesign { prev -> preset.state.copy(rlvaEnabled = prev.rlvaEnabled) }
         showToast("Applied preset: ${preset.name}")
     }
 
@@ -2648,7 +2660,14 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private fun mutateDesign(transform: (PersonalDesignState) -> PersonalDesignState) {
         val next = transform(_state.value.design)
         _state.update { it.copy(design = next) }
-        viewModelScope.launch { prefsRepo.saveDesignState(next) }
+        pendingDesignSaves.incrementAndGet()
+        viewModelScope.launch {
+            try {
+                prefsRepo.saveDesignState(next)
+            } finally {
+                pendingDesignSaves.decrementAndGet()
+            }
+        }
         pushSceneSnapshot()
     }
 
