@@ -13,6 +13,9 @@ import kotlin.math.sqrt
  */
 object LocalSandboxBuilder {
 
+    val SANDBOX_RLV_RELAY_UUID: UUID = UUID.fromString("88888888-8888-4888-8888-888888888888")
+    val SANDBOX_RLV_CHAIR_UUID: UUID = UUID.fromString("99999999-9999-4999-8999-999999999999")
+
     fun buildTerrain(): TerrainGrid {
         val grid = TerrainGrid(gridSize = 65, waterHeight = 20.0f)
         for (gy in 0 until grid.gridSize) {
@@ -153,6 +156,20 @@ object LocalSandboxBuilder {
                 scale = Vec3(2.6f, 2.6f, 2.6f),
                 color = ColorRgba(1.0f, 0.68f, 0.14f, 1f),
                 isFullbright = true,
+                isScripted = true
+            )
+        )
+        objs.add(
+            SceneObject(
+                localId = nextId++,
+                uuid = SANDBOX_RLV_CHAIR_UUID,
+                name = "RLVa Restraint Chair",
+                description = "Scripted RLVa demo seat (@sit=force / @unsit=n / @getsitid)",
+                shape = PrimShape.BOX,
+                position = Vec3(125f, 124f, groundZ(125f, 124f, 0.55f)),
+                rotation = Quat.fromYaw(1.1f),
+                scale = Vec3(1.1f, 1.1f, 1.1f),
+                color = ColorRgba(0.38f, 0.20f, 0.48f, 1f),
                 isScripted = true
             )
         )

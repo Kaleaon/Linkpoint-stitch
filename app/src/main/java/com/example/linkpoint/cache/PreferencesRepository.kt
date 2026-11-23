@@ -47,6 +47,7 @@ class PreferencesRepository(private val context: Context) {
         val PINNED_TOOLS = stringPreferencesKey("pinned_tools")
         val DRAW_DISTANCE = floatPreferencesKey("draw_distance")
         val ENVIRONMENT_PRESET = stringPreferencesKey("environment_preset")
+        val RLVA_ENABLED = booleanPreferencesKey("rlva_enabled")
         val CUSTOM_PRESET_BLOB = stringPreferencesKey("custom_preset_blob")
         val CLIENT_MAC_HASH = stringPreferencesKey("client_mac_hash")
         val CLIENT_ID0_HASH = stringPreferencesKey("client_id0_hash")
@@ -76,7 +77,8 @@ class PreferencesRepository(private val context: Context) {
             hudTouchCaptureEnabled = prefs[Keys.HUD_TOUCH_CAPTURE] ?: true,
             pinnedTools = pinned,
             drawDistance = prefs[Keys.DRAW_DISTANCE] ?: 128f,
-            environmentPreset = enumOrDefault(prefs[Keys.ENVIRONMENT_PRESET], EnvironmentPreset.TWILIGHT)
+            environmentPreset = enumOrDefault(prefs[Keys.ENVIRONMENT_PRESET], EnvironmentPreset.TWILIGHT),
+            rlvaEnabled = prefs[Keys.RLVA_ENABLED] ?: true
         )
     }
 
@@ -101,6 +103,7 @@ class PreferencesRepository(private val context: Context) {
             prefs[Keys.PINNED_TOOLS] = state.pinnedTools.joinToString(",") { it.name }
             prefs[Keys.DRAW_DISTANCE] = state.drawDistance
             prefs[Keys.ENVIRONMENT_PRESET] = state.environmentPreset.name
+            prefs[Keys.RLVA_ENABLED] = state.rlvaEnabled
         }
     }
 

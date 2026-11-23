@@ -65,6 +65,7 @@ import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.EnvironmentPreset
 import com.example.linkpoint.scene.HudAttachmentPoint
 import com.example.linkpoint.store.ViewerState
+import com.example.linkpoint.ui.floaters.RlvStatusPanel
 
 @Composable
 fun ObjectInspectorContent(
@@ -136,6 +137,7 @@ fun ObjectInspectorContent(
                 if (obj.isFullbright) LinkpointStatusChip("Fullbright", tokens.accentPrimary)
                 if (obj.isPhantom) LinkpointStatusChip("Phantom", tokens.textSecondary)
                 if (obj.isHudAttachment) LinkpointStatusChip("HUD Slot ${obj.attachmentPoint}", tokens.statusOnline)
+                if (state.rlvSnapshot.editRestricted) LinkpointStatusChip("RLVa @edit=n", tokens.statusWarning)
             }
         }
 
@@ -151,7 +153,11 @@ fun ObjectInspectorContent(
                 modifier = Modifier.weight(1f)
             )
             LinkpointActionButton(
-                text = if (state.isSitting) "Stand" else "Sit",
+                text = when {
+                    state.isSitting && state.rlvSnapshot.unsitRestricted -> "Stand (Locked)"
+                    state.isSitting -> "Stand"
+                    else -> "Sit"
+                },
                 icon = Icons.Default.Chair,
                 onClick = client::toggleSitOnSelected,
                 primary = false,
@@ -334,9 +340,19 @@ fun LayoutDesignStudioContent(
                 .horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            LinkpointStatusChip("Theme & Presets", if (tab == 0) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 0 })
-            LinkpointStatusChip("Layout & Ergonomics", if (tab == 1) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 1 })
-            LinkpointStatusChip("Dock Tools & Sky", if (tab == 2) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 2 })
+            LinkpointStatusChip("Theme", if (tab == 0) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 0 })
+            LinkpointStatusChip("Layout", if (tab == 1) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 1 })
+            LinkpointStatusChip("Dock & Sky", if (tab == 2) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 2 })
+            LinkpointStatusChip(
+                label = if (state.rlvSnapshot.activeRuleCount > 0) "RLVa (${state.rlvSnapshot.activeRuleCount})" else "RLVa",
+                color = when {
+                    tab == 3 -> tokens.accentPrimary
+                    state.rlvSnapshot.activeRuleCount > 0 -> tokens.statusWarning
+                    else -> tokens.textMuted
+                },
+                onClick = { tab = 3 },
+                modifier = Modifier.testTag("studio_tab_rlva")
+            )
         }
 
         when (tab) {
@@ -560,6 +576,10 @@ fun LayoutDesignStudioContent(
                         }
                     }
                 }
+            }
+
+            3 -> {
+                RlvStatusPanel(state = state, client = client)
             }
         }
     }

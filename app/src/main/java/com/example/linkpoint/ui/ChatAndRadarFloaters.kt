@@ -50,6 +50,7 @@ import com.example.linkpoint.designsystem.DesignLanguage
 import com.example.linkpoint.designsystem.LinkpointFloaterHeader
 import com.example.linkpoint.designsystem.LinkpointStatusChip
 import com.example.linkpoint.designsystem.LocalLinkpointDesign
+import com.example.linkpoint.rlv.RlvConstants
 import com.example.linkpoint.store.ChatRange
 import com.example.linkpoint.store.ViewerState
 
@@ -233,6 +234,7 @@ fun RadarFloaterContent(
                 items(state.nearbyAvatars, key = { it.agentId }) { av ->
                     val shape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(12.dp))
                     val altSign = if (av.altitudeDelta >= 0) "+" else ""
+                    val shownName = if (state.rlvSnapshot.showNamesRestricted) RlvConstants.REDACTED_TEXT else av.name
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -257,7 +259,7 @@ fun RadarFloaterContent(
                             )
                             Column {
                                 Text(
-                                    text = av.name,
+                                    text = shownName,
                                     style = MaterialTheme.typography.bodyMedium.copy(
                                         fontWeight = FontWeight.SemiBold,
                                         color = tokens.textPrimary
@@ -278,7 +280,7 @@ fun RadarFloaterContent(
                             IconButton(onClick = { client.focusCameraOn(av.position) }) {
                                 Icon(Icons.Default.CenterFocusStrong, contentDescription = "Focus camera", tint = tokens.accentPrimary)
                             }
-                            IconButton(onClick = { client.openImWith(av.agentId, av.name) }) {
+                            IconButton(onClick = { client.openImWith(av.agentId, shownName) }) {
                                 Icon(Icons.Default.ChatBubbleOutline, contentDescription = "Open IM", tint = tokens.accentSecondary)
                             }
                         }

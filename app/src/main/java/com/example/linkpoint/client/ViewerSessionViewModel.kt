@@ -37,6 +37,11 @@ import com.example.linkpoint.protocol.SlBinaryParsers
 import com.example.linkpoint.protocol.XmlRpcLoginClient
 import com.example.linkpoint.render.LinkpointGlRenderer
 import com.example.linkpoint.render.RenderSceneSnapshot
+import com.example.linkpoint.rlv.RlvChatOutcome
+import com.example.linkpoint.rlv.RlvConstants
+import com.example.linkpoint.rlv.RlvEngine
+import com.example.linkpoint.rlv.RlvHostCallbacks
+import com.example.linkpoint.rlv.RlvUiSnapshot
 import com.example.linkpoint.scene.AvatarEntity
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
@@ -144,6 +149,128 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private var lastRegionGridX: Int = 1000
     private var lastRegionGridY: Int = 1000
 
+    val rlvEngine: RlvEngine = RlvEngine(
+        host = object : RlvHostCallbacks {
+            override fun sayOnChannel(channel: Int, message: String) {
+                if (channel <= 0) return
+                when (_state.value.connection) {
+                    is ConnectionState.Connected -> {
+                        lludpEngine.sendChat(message, RlvConstants.CHAT_TYPE_NORMAL.toByte(), channel)
+                    }
+                    is ConnectionState.LocalSandbox -> {
+                        appendLocalChat(
+                            ChatMessage(
+                                speaker = "RLVa Reply [ch $channel]",
+                                text = message.ifEmpty { "(empty)" },
+                                channel = channel,
+                                isFromHud = true
+                            )
+                        )
+                    }
+                    else -> Unit
+                }
+            }
+
+            override fun forceTeleportTo(x: Float, y: Float, z: Float, regionName: String?, sourceId: UUID) {
+                val localX = if (x >= 256f || x < 0f) ((x % 256f) + 256f) % 256f else x
+                val localY = if (y >= 256f || y < 0f) ((y % 256f) + 256f) % 256f else y
+                performTeleportInternal(
+                    regionName = regionName?.takeIf { it.isNotBlank() } ?: currentRegionName(),
+                    x = localX.toInt(),
+                    y = localY.toInt(),
+                    z = z.toInt()
+                )
+            }
+
+            override fun forceSitOnObject(targetId: UUID, sourceId: UUID) {
+                val self = avatars[selfAgentId] ?: return
+                val target = allSceneObjects.values.firstOrNull { it.uuid == targetId }
+                if (_state.value.connection is ConnectionState.Connected) {
+                    lludpEngine.sendSitRequest(targetId)
+                }
+                val newPos = if (target != null) {
+                    target.position + Vec3(0f, 0f, target.scale.z * 0.5f)
+                } else {
+                    self.position
+                }
+                avatars[selfAgentId] = self.copy(position = newPos, isFlying = false, isSitting = true)
+                _state.update {
+                    it.copy(
+                        isSitting = true,
+                        sittingOnObjectId = targetId,
+                        isFlying = false,
+                        avatarPosition = newPos
+                    )
+                }
+                showToast("RLVa forced sit on ${target?.name ?: targetId.toString().take(8)}")
+                pushSceneSnapshot()
+            }
+
+            override fun forceUnsit(sourceId: UUID) {
+                val self = avatars[selfAgentId] ?: return
+                if (!self.isSitting && _state.value.sittingOnObjectId == null) return
+                avatars[selfAgentId] = self.copy(isSitting = false)
+                _state.update { it.copy(isSitting = false, sittingOnObjectId = null) }
+                showToast("RLVa forced stand (@unsit=force)")
+                pushSceneSnapshot()
+            }
+
+            override fun forceDetachAttachment(attachmentPointId: Int?, sourceId: UUID) {
+                val candidates = _state.value.inventoryEntries.filter { entry ->
+                    !entry.isFolder && entry.isWorn && entry.assetType == 6 &&
+                        (attachmentPointId == null || entry.attachmentPoint == attachmentPointId) &&
+                        rlvEngine.canDetach(entry.id, entry.attachmentPoint)
+                }
+                candidates.forEach { entry ->
+                    performSetInventoryWornInternal(entry, nextWorn = false, slot = entry.attachmentPoint)
+                }
+            }
+
+            override fun forceRemoveOutfit(layerName: String?, sourceId: UUID) {
+                val candidates = _state.value.inventoryEntries.filter { entry ->
+                    if (entry.isFolder || !entry.isWorn || entry.assetType != 5) return@filter false
+                    val inferred = RlvConstants.inferWearableLayer(entry.name, entry.assetType) ?: return@filter false
+                    if (inferred in RlvConstants.BODY_PART_LAYERS) return@filter false
+                    (layerName == null || inferred == layerName) && rlvEngine.canRemoveOutfit(inferred)
+                }
+                candidates.forEach { entry ->
+                    performSetInventoryWornInternal(entry, nextWorn = false, slot = entry.attachmentPoint)
+                }
+            }
+
+            override fun isWearableLayerWorn(layerName: String): Boolean {
+                if (layerName in RlvConstants.BODY_PART_LAYERS && avatars.containsKey(selfAgentId)) {
+                    return true
+                }
+                return _state.value.inventoryEntries.any { entry ->
+                    !entry.isFolder && entry.isWorn &&
+                        RlvConstants.inferWearableLayer(entry.name, entry.assetType) == layerName
+                }
+            }
+
+            override fun isAttachmentPointOccupied(pointId: Int): Boolean {
+                if (pointId <= 0) return false
+                if (_state.value.inventoryEntries.any { !it.isFolder && it.isWorn && it.assetType == 6 && it.attachmentPoint == pointId }) {
+                    return true
+                }
+                if (manualHudAttachments.values.any { it.attachmentPoint == pointId }) {
+                    return true
+                }
+                val selfLocalId = avatars[selfAgentId]?.localId ?: 0
+                return allSceneObjects.values.any { obj ->
+                    obj.attachmentPoint == pointId &&
+                        (obj.attachedAvatarId == selfAgentId || (selfLocalId != 0 && obj.parentId == selfLocalId))
+                }
+            }
+
+            override fun getCurrentSitTargetId(): UUID? = _state.value.sittingOnObjectId
+
+            override fun onStateChanged(snapshot: RlvUiSnapshot) {
+                _state.update { it.copy(rlvSnapshot = snapshot) }
+            }
+        }
+    )
+
     init {
         viewModelScope.launch {
             cacheRepo.ensureBuiltInGrids()
@@ -169,7 +296,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         }
         viewModelScope.launch {
             prefsRepo.designStateFlow.collect { design ->
-                _state.update { it.copy(design = design) }
+                rlvEngine.setEnabled(design.rlvaEnabled)
+                _state.update { it.copy(design = design, rlvSnapshot = rlvEngine.getSnapshot()) }
                 lludpEngine.drawDistance = design.drawDistance
                 pushSceneSnapshot()
             }
@@ -209,14 +337,58 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         pushSceneSnapshot()
                     }
                     is SimEvent.ChatReceived -> {
-                        val msg = ChatMessage(speaker = evt.fromName, text = evt.message)
+                        if (rlvEngine.onIncomingChat(
+                                sourceId = evt.sourceId,
+                                fromName = evt.fromName,
+                                chatType = evt.chatType,
+                                message = evt.message,
+                                sourceType = evt.sourceType
+                            )
+                        ) {
+                            return@collect
+                        }
+                        if (evt.sourceType != RlvConstants.SOURCE_TYPE_OBJECT &&
+                            evt.sourceId != selfAgentId &&
+                            !rlvEngine.canReceiveChat(evt.message, evt.sourceId)
+                        ) {
+                            appendLocalChat(ChatMessage(speaker = RlvConstants.REDACTED_TEXT, text = "..."))
+                            return@collect
+                        }
+                        val speakerName = if (!rlvEngine.canShowNames() &&
+                            evt.sourceType != RlvConstants.SOURCE_TYPE_OBJECT &&
+                            evt.sourceId != selfAgentId
+                        ) {
+                            RlvConstants.REDACTED_TEXT
+                        } else {
+                            evt.fromName
+                        }
+                        val msg = ChatMessage(speaker = speakerName, text = evt.message)
                         appendLocalChat(msg)
                         viewModelScope.launch {
-                            cacheRepo.logChat(evt.fromName, evt.message, 0, currentRegionName())
+                            cacheRepo.logChat(speakerName, evt.message, 0, currentRegionName())
                         }
                     }
                     is SimEvent.InstantMessageReceived -> {
-                        appendImMessage(evt.imSessionId, evt.fromAgentId, evt.fromName, evt.fromName, evt.message)
+                        if (!rlvEngine.canReceiveIm(evt.fromAgentId)) {
+                            if (_state.value.connection is ConnectionState.Connected) {
+                                lludpEngine.sendInstantMessage(
+                                    evt.fromAgentId,
+                                    evt.imSessionId,
+                                    selfAvatarName,
+                                    "*** The resident you messaged is prevented from reading Instant Messages right now (RLVa). ***"
+                                )
+                            }
+                            appendImMessage(
+                                evt.imSessionId,
+                                evt.fromAgentId,
+                                evt.fromName,
+                                "RLVa",
+                                "[Incoming IM blocked by @recvim=n]"
+                            )
+                            return@collect
+                        }
+                        val peerDisplay = if (!rlvEngine.canShowNames()) RlvConstants.REDACTED_TEXT else evt.fromName
+                        appendImMessage(evt.imSessionId, evt.fromAgentId, peerDisplay, peerDisplay, evt.message)
                     }
                     is SimEvent.ObjectUpdated -> {
                         val obj = mergeIncomingObjectWithCaps(evt.sceneObject)
@@ -469,8 +641,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         pushSceneSnapshot()
                     }
                     is SimEvent.ObjectKilled -> {
-                        allSceneObjects.remove(evt.localId)
+                        val killedObj = allSceneObjects.remove(evt.localId) ?: manualHudAttachments.remove(evt.localId)
                         manualHudAttachments.remove(evt.localId)
+                        killedObj?.let { rlvEngine.onObjectDetached(it.uuid) }
                         val deadAv = avatars.values.firstOrNull { it.localId == evt.localId && !it.isSelf }
                         if (deadAv != null) {
                             avatars.remove(deadAv.agentId)
@@ -1166,6 +1339,18 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         verticalVelocityZ = 0f
         hasServerSelfPosition = false
         LocalSandboxBuilder.buildDefaultAvatarHuds().forEach { manualHudAttachments[it.localId] = it }
+        manualHudAttachments[9035] = SceneObject(
+            localId = 9035,
+            uuid = LocalSandboxBuilder.SANDBOX_RLV_RELAY_UUID,
+            name = "OpenCollar RLVa Relay HUD",
+            description = "Worn RLVa controller attachment on Slot 35 (Center). Open Design Studio -> RLVa to test restrictions.",
+            attachmentPoint = 35,
+            isFullbright = true,
+            isScripted = true,
+            scale = Vec3(0.02f, 0.24f, 0.08f),
+            color = ColorRgba(0.18f, 0.12f, 0.28f, 0.90f)
+        )
+        rlvEngine.clearAllRestrictions()
 
         avatars.clear()
         val sandboxAvatars = LocalSandboxBuilder.buildSandboxAvatars(terrain)
@@ -1187,7 +1372,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             InventoryEntry(manualHudAttachments[9032]!!.uuid, hudsFolder, "AO & Flight Booster HUD", false, 6, isWorn = true, attachmentPoint = 32),
             InventoryEntry(manualHudAttachments[9034]!!.uuid, hudsFolder, "EEP Atmosphere HUD", false, 6, isWorn = true, attachmentPoint = 34),
             InventoryEntry(manualHudAttachments[9036]!!.uuid, hudsFolder, "Avatar Outfit & Tint HUD", false, 6, isWorn = true, attachmentPoint = 36),
+            InventoryEntry(LocalSandboxBuilder.SANDBOX_RLV_RELAY_UUID, hudsFolder, "OpenCollar RLVa Relay HUD", false, 6, isWorn = true, attachmentPoint = 35),
             InventoryEntry(UUID.randomUUID(), outfitsFolder, "Obsidian Telemetry Jacket", false, 5, isWorn = true, attachmentPoint = 5),
+            InventoryEntry(UUID.randomUUID(), rootId, "RLVa Protocol Guide", false, 7),
             InventoryEntry(UUID.randomUUID(), landmarksFolder, "Linkpoint Welcome Deck", false, 3),
             InventoryEntry(UUID.randomUUID(), landmarksFolder, "Harbor Signal Spire", false, 3)
         )
@@ -1206,18 +1393,31 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 parcelName = "Linkpoint Welcome Deck (Local Preview)",
                 isFlying = false,
                 isSitting = false,
+                sittingOnObjectId = null,
+                activeNotecardPreview = null,
                 inventoryEntries = sandboxInventory,
                 expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
                 mapRegions = sandboxMap,
                 localChat = listOf(
                     ChatMessage(
                         speaker = "Linkpoint Sandbox",
-                        text = "Offline 3D & HUD Engine Preview active. Drag to orbit, use joystick to walk/fly, tap the 3 Avatar Attachment HUDs (slots 32, 34, 36), or open Design Studio to switch Polished / Terminal / LCARS / Metro!",
+                        text = "Offline 3D & HUD Engine Preview active. Drag to orbit, use joystick to walk/fly, tap the Avatar Attachment HUDs, or open Design Studio -> RLVa to run the Test RLVa Relay Demo!",
                         isSystem = true
                     )
                 ),
                 activeFloater = null,
-                selectedObject = null
+                selectedObject = null,
+                rlvSnapshot = rlvEngine.getSnapshot()
+            )
+        }
+        // Perform non-restrictive initial RLVa relay version handshake on sandbox entry
+        if (rlvEngine.isEnabled()) {
+            rlvEngine.onIncomingChat(
+                sourceId = LocalSandboxBuilder.SANDBOX_RLV_RELAY_UUID,
+                fromName = "OpenCollar RLVa Relay HUD",
+                chatType = RlvConstants.CHAT_TYPE_OWNER,
+                message = "@versionnew=4711",
+                sourceType = RlvConstants.SOURCE_TYPE_OBJECT
             )
         }
         renderer.focusOverride = null
@@ -1238,19 +1438,24 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         capsAttachmentOverridesByLocalId.clear()
         pressedMoveKeys.clear()
         requestedProfiles.clear()
+        rlvEngine.clearAllRestrictions()
         verticalVelocityZ = 0f
         textInputFocused = false
         renderer.focusOverride = null
         _state.update { s ->
             s.copy(
                 connection = ConnectionState.Disconnected,
+                isSitting = false,
+                sittingOnObjectId = null,
                 activeFloater = null,
                 selectedObject = null,
                 selectedAvatarId = null,
                 projectedNametags = emptyList(),
                 activeKeyboardHint = null,
                 scriptDialog = null,
-                hudEditMode = false
+                activeNotecardPreview = null,
+                hudEditMode = false,
+                rlvSnapshot = rlvEngine.getSnapshot()
             )
         }
     }
@@ -1372,6 +1577,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
     override fun triggerJump() {
         val self = avatars[selfAgentId] ?: return
+        if (self.isSitting && !rlvEngine.canUnsit()) {
+            showToast(RlvConstants.reasonForBehavior("unsit"))
+            return
+        }
         if (self.isFlying) {
             elevateAvatar(1.8f)
             return
@@ -1383,7 +1592,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             jumpPulseTicks = 14
             if (self.isSitting) {
                 avatars[selfAgentId] = self.copy(isSitting = false)
-                _state.update { it.copy(isSitting = false) }
+                _state.update { it.copy(isSitting = false, sittingOnObjectId = null) }
             }
         }
     }
@@ -1506,35 +1715,46 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     if (_state.value.cameraMode == CameraMode.MOUSELOOK) flags = flags or LludpPackets.CONTROL_MOUSELOOK
                     if (jumpPulseTicks > 0) jumpPulseTicks--
 
-                    val moved = abs(nx - self.position.x) > 1e-4f ||
-                        abs(ny - self.position.y) > 1e-4f ||
-                        abs(nz - self.position.z) > 1e-4f ||
-                        abs(yawDelta) > 1e-4f
+                    val lockedSeated = self.isSitting && !rlvEngine.canUnsit()
+                    val finalPos = if (lockedSeated) self.position else Vec3(nx, ny, nz)
+                    val nextSitting = if (lockedSeated) true else false
+
+                    val moved = (!lockedSeated && (
+                        abs(nx - self.position.x) > 1e-4f ||
+                            abs(ny - self.position.y) > 1e-4f ||
+                            abs(nz - self.position.z) > 1e-4f
+                        )) || abs(yawDelta) > 1e-4f
 
                     if (moved) {
-                        val updated = self.copy(position = Vec3(nx, ny, nz), yaw = yaw, isSitting = false)
+                        val updated = self.copy(position = finalPos, yaw = yaw, isSitting = nextSitting)
                         avatars[selfAgentId] = updated
                         if (_state.value.cameraMode == CameraMode.FOLLOW) {
                             renderer.nudgeFollowCamera(
                                 deltaAvatarYaw = yawDelta,
                                 avatarYaw = yaw,
-                                movingForward = normFwd > 0.15f,
+                                movingForward = !lockedSeated && normFwd > 0.15f,
                                 dtSec = dt
                             )
                         }
                         lludpEngine.avatarPos = updated.position
                         lludpEngine.avatarYaw = yaw
-                        lludpEngine.controlFlags = flags
+                        lludpEngine.controlFlags = if (lockedSeated) (flags and (LludpPackets.CONTROL_YAW_POS or LludpPackets.CONTROL_YAW_NEG or LludpPackets.CONTROL_TURN_LEFT or LludpPackets.CONTROL_TURN_RIGHT)) else flags
 
                         val nowMs = System.currentTimeMillis()
                         if (nowMs - lastUiPosSyncMs >= 125L) {
                             lastUiPosSyncMs = nowMs
-                            _state.update { it.copy(avatarPosition = updated.position, isSitting = false) }
+                            _state.update {
+                                it.copy(
+                                    avatarPosition = updated.position,
+                                    isSitting = nextSitting,
+                                    sittingOnObjectId = if (nextSitting) it.sittingOnObjectId else null
+                                )
+                            }
                         }
                         pushSceneSnapshot(syncUiState = false)
                     } else {
                         lludpEngine.avatarYaw = self.yaw
-                        lludpEngine.controlFlags = flags
+                        lludpEngine.controlFlags = if (lockedSeated) 0 else flags
                     }
 
                     // Gentle orbital drift for the sandbox patrol drone
@@ -1565,17 +1785,36 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
     override fun toggleFly() {
         val self = avatars[selfAgentId] ?: return
+        if (self.isSitting && !rlvEngine.canUnsit()) {
+            showToast(RlvConstants.reasonForBehavior("unsit"))
+            return
+        }
         val nextFly = !self.isFlying
+        if (nextFly && "fly" in rlvEngine.getSnapshot().activeBehaviors) {
+            showToast(RlvConstants.reasonForBehavior("fly"))
+            return
+        }
         verticalVelocityZ = 0f
         val floor = computeFloorZ(self.position.x, self.position.y)
         val newZ = if (nextFly) self.position.z + 2.0f else floor
         avatars[selfAgentId] = self.copy(isFlying = nextFly, isSitting = false, position = self.position.copy(z = newZ))
-        _state.update { it.copy(isFlying = nextFly, isSitting = false, avatarPosition = avatars[selfAgentId]!!.position) }
+        _state.update {
+            it.copy(
+                isFlying = nextFly,
+                isSitting = false,
+                sittingOnObjectId = null,
+                avatarPosition = avatars[selfAgentId]!!.position
+            )
+        }
         pushSceneSnapshot()
     }
 
     override fun elevateAvatar(deltaZ: Float) {
         val self = avatars[selfAgentId] ?: return
+        if (self.isSitting && !rlvEngine.canUnsit()) {
+            showToast(RlvConstants.reasonForBehavior("unsit"))
+            return
+        }
         val ground = computeFloorZ(self.position.x, self.position.y)
         val nextZ = (self.position.z + deltaZ).coerceIn(ground, 4090f)
         val flying = nextZ > ground + 0.3f
@@ -1584,14 +1823,36 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         pushSceneSnapshot()
     }
 
+    override fun standUp() {
+        val self = avatars[selfAgentId] ?: return
+        if (!self.isSitting) return
+        if (!rlvEngine.canUnsit()) {
+            showToast(RlvConstants.reasonForBehavior("unsit"))
+            return
+        }
+        avatars[selfAgentId] = self.copy(isSitting = false)
+        _state.update { it.copy(isSitting = false, sittingOnObjectId = null) }
+        showToast("Stood up")
+        pushSceneSnapshot()
+    }
+
     override fun toggleSitOnSelected() {
         val self = avatars[selfAgentId] ?: return
         val target = _state.value.selectedObject
         if (self.isSitting) {
-            avatars[selfAgentId] = self.copy(isSitting = false)
-            _state.update { it.copy(isSitting = false) }
-            showToast("Stood up")
-        } else if (target != null) {
+            standUp()
+            return
+        }
+        if (!rlvEngine.canSit()) {
+            showToast(RlvConstants.reasonForBehavior("sit"))
+            return
+        }
+        if (target != null) {
+            val dist = self.position.distanceTo(target.position)
+            if (!rlvEngine.canSitTeleport(dist)) {
+                showToast(RlvConstants.reasonForBehavior("sittp"))
+                return
+            }
             if (_state.value.connection is ConnectionState.Connected) {
                 lludpEngine.sendSitRequest(target.uuid)
             }
@@ -1600,11 +1861,18 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 isFlying = false,
                 isSitting = true
             )
-            _state.update { it.copy(isSitting = true, isFlying = false, avatarPosition = avatars[selfAgentId]!!.position) }
+            _state.update {
+                it.copy(
+                    isSitting = true,
+                    sittingOnObjectId = target.uuid,
+                    isFlying = false,
+                    avatarPosition = avatars[selfAgentId]!!.position
+                )
+            }
             showToast("Sitting on ${target.name}")
         } else {
             avatars[selfAgentId] = self.copy(isSitting = true, isFlying = false)
-            _state.update { it.copy(isSitting = true, isFlying = false) }
+            _state.update { it.copy(isSitting = true, sittingOnObjectId = null, isFlying = false) }
             showToast("Ground Sit enabled")
         }
         pushSceneSnapshot()
@@ -1873,6 +2141,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     // --- Floaters, Chat, IM, Map & Inventory ---
 
     override fun toggleFloater(tool: DockToolId?) {
+        if (tool == DockToolId.INVENTORY && _state.value.activeFloater != DockToolId.INVENTORY && !rlvEngine.canShowInventory()) {
+            showToast(RlvConstants.reasonForBehavior("showinv"))
+            return
+        }
         _state.update { s ->
             val next = if (tool == null || s.activeFloater == tool) null else tool
             s.copy(
@@ -1887,30 +2159,68 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
 
-        var channel = 0
-        var body = trimmed
-        if (trimmed.startsWith("/")) {
-            val match = Regex("^/(-?\\d+)\\s+(.*)$").find(trimmed)
-            if (match != null) {
-                channel = match.groupValues[1].toIntOrNull() ?: 0
-                body = match.groupValues[2]
+        when (val outcome = rlvEngine.processOutgoingChat(trimmed, range.packetType.toInt())) {
+            is RlvChatOutcome.Blocked -> {
+                showToast(outcome.reason)
+            }
+            is RlvChatOutcome.RedirectToChannels -> {
+                for (ch in outcome.channels) {
+                    if (_state.value.connection is ConnectionState.Connected) {
+                        lludpEngine.sendChat(outcome.text, outcome.chatType.toByte(), ch)
+                    } else {
+                        appendLocalChat(
+                            ChatMessage(
+                                speaker = "RLVa Redirect [ch $ch]",
+                                text = outcome.text,
+                                channel = ch,
+                                isFromHud = true
+                            )
+                        )
+                    }
+                    viewModelScope.launch { cacheRepo.logChat(selfAvatarName, outcome.text, ch, currentRegionName()) }
+                }
+            }
+            is RlvChatOutcome.SendOnChannel -> {
+                if (_state.value.connection is ConnectionState.Connected) {
+                    lludpEngine.sendChat(outcome.text, outcome.chatType.toByte(), outcome.channel)
+                }
+                appendLocalChat(
+                    ChatMessage(
+                        speaker = selfAvatarName,
+                        text = "[ch ${outcome.channel}] ${outcome.text}",
+                        channel = outcome.channel
+                    )
+                )
+                viewModelScope.launch { cacheRepo.logChat(selfAvatarName, outcome.text, outcome.channel, currentRegionName()) }
+            }
+            is RlvChatOutcome.SendPublic -> {
+                if (_state.value.connection is ConnectionState.Connected) {
+                    lludpEngine.sendChat(outcome.text, outcome.chatType.toByte(), 0)
+                }
+                val effectiveLabel = when (outcome.chatType) {
+                    RlvConstants.CHAT_TYPE_WHISPER -> ChatRange.WHISPER.label
+                    RlvConstants.CHAT_TYPE_SHOUT -> ChatRange.SHOUT.label
+                    else -> ChatRange.SAY.label
+                }
+                val prefix = if (outcome.chatType != RlvConstants.CHAT_TYPE_NORMAL) "($effectiveLabel) " else ""
+                appendLocalChat(ChatMessage(speaker = selfAvatarName, text = "$prefix${outcome.text}", channel = 0))
+                viewModelScope.launch { cacheRepo.logChat(selfAvatarName, outcome.text, 0, currentRegionName()) }
             }
         }
-        if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendChat(body, range.packetType, channel)
-        }
-        val prefix = if (channel != 0) "[ch $channel] " else if (range != ChatRange.SAY) "(${range.label}) " else ""
-        appendLocalChat(ChatMessage(speaker = selfAvatarName, text = "$prefix$body", channel = channel))
-        viewModelScope.launch { cacheRepo.logChat(selfAvatarName, body, channel, currentRegionName()) }
     }
 
     override fun openImWith(agentId: UUID, name: String) {
+        if (!rlvEngine.canSendIm(agentId)) {
+            showToast(RlvConstants.reasonForBehavior("sendim"))
+            return
+        }
+        val displayName = if (!rlvEngine.canShowNames()) RlvConstants.REDACTED_TEXT else name
         val existing = _state.value.imConversations.firstOrNull { it.peerAgentId == agentId }
         val sessionId = existing?.sessionId ?: UUID.nameUUIDFromBytes((selfAgentId.toString() + agentId.toString()).toByteArray())
         if (existing == null) {
             _state.update { s ->
                 s.copy(
-                    imConversations = s.imConversations + ImConversation(sessionId, agentId, name),
+                    imConversations = s.imConversations + ImConversation(sessionId, agentId, displayName),
                     activeImSessionId = sessionId,
                     activeFloater = DockToolId.CHAT
                 )
@@ -1936,6 +2246,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
         val convo = _state.value.imConversations.firstOrNull { it.sessionId == sessionId } ?: return
+        if (!rlvEngine.canSendIm(convo.peerAgentId)) {
+            showToast(RlvConstants.reasonForBehavior("sendim"))
+            return
+        }
         if (_state.value.connection is ConnectionState.Connected) {
             lludpEngine.sendInstantMessage(convo.peerAgentId, sessionId, selfAvatarName, trimmed)
         }
@@ -1953,6 +2267,27 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     }
 
     override fun teleportToRegion(regionName: String, x: Int, y: Int, z: Int) {
+        if (!rlvEngine.canTeleportLocation()) {
+            showToast(RlvConstants.reasonForBehavior("tploc"))
+            return
+        }
+        performTeleportInternal(regionName, x, y, z)
+    }
+
+    override fun teleportToLandmark(regionName: String, x: Int, y: Int, z: Int) {
+        if (!rlvEngine.canTeleportLandmark()) {
+            showToast(RlvConstants.reasonForBehavior("tplm"))
+            return
+        }
+        performTeleportInternal(regionName, x, y, z)
+    }
+
+    private fun performTeleportInternal(regionName: String, x: Int, y: Int, z: Int) {
+        val self = avatars[selfAgentId]
+        if (self != null && self.isSitting && !rlvEngine.canUnsit()) {
+            showToast(RlvConstants.reasonForBehavior("unsit"))
+            return
+        }
         val clampedX = x.coerceIn(4, 252).toFloat()
         val clampedY = y.coerceIn(4, 252).toFloat()
         val clampedZ = z.coerceIn(18, 240).toFloat()
@@ -1961,13 +2296,19 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             lludpEngine.sendTeleportLocation(handle, Vec3(clampedX, clampedY, clampedZ))
             showToast("Teleporting to $regionName <$x, $y, $z>...")
         } else {
-            val self = avatars[selfAgentId] ?: return
-            val ground = terrain.sampleWorldHeight(clampedX, clampedY) + self.heightMeters * 0.50f
+            val av = self ?: return
+            val ground = terrain.sampleWorldHeight(clampedX, clampedY) + av.heightMeters * 0.50f
             val targetZ = clampedZ.coerceAtLeast(ground)
-            avatars[selfAgentId] = self.copy(position = Vec3(clampedX, clampedY, targetZ), isFlying = targetZ > ground + 1f)
+            avatars[selfAgentId] = av.copy(
+                position = Vec3(clampedX, clampedY, targetZ),
+                isFlying = targetZ > ground + 1f,
+                isSitting = false
+            )
             _state.update {
                 it.copy(
                     avatarPosition = Vec3(clampedX, clampedY, targetZ),
+                    isSitting = false,
+                    sittingOnObjectId = null,
                     parcelName = regionName.ifBlank { it.parcelName }
                 )
             }
@@ -2002,6 +2343,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     }
 
     override fun toggleInventoryFolder(folderId: UUID) {
+        if (!rlvEngine.canShowInventory()) {
+            showToast(RlvConstants.reasonForBehavior("showinv"))
+            return
+        }
         val currentlyExpanded = folderId in _state.value.expandedFolderIds
         _state.update { s ->
             val next = if (currentlyExpanded) s.expandedFolderIds - folderId else s.expandedFolderIds + folderId
@@ -2027,7 +2372,33 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val entry = _state.value.inventoryEntries.firstOrNull { it.id == itemId } ?: return
         val nextWorn = !entry.isWorn
         val slot = targetHudSlot ?: if (entry.attachmentPoint > 0) entry.attachmentPoint else HudAttachmentPoint.TOP_CENTER.slotId
+        val wearableLayer = RlvConstants.inferWearableLayer(entry.name, entry.assetType)
 
+        if (wearableLayer != null) {
+            if (nextWorn && !rlvEngine.canAddOutfit(wearableLayer)) {
+                showToast(RlvConstants.reasonForBehavior("addoutfit"))
+                return
+            }
+            if (!nextWorn && !rlvEngine.canRemoveOutfit(wearableLayer)) {
+                showToast(RlvConstants.reasonForBehavior("remoutfit"))
+                return
+            }
+        } else {
+            if (nextWorn && !rlvEngine.canAttach(slot)) {
+                showToast(RlvConstants.reasonForBehavior("addattach"))
+                return
+            }
+            if (!nextWorn && !rlvEngine.canDetach(itemId, slot)) {
+                showToast(RlvConstants.reasonForBehavior("detach"))
+                return
+            }
+        }
+
+        performSetInventoryWornInternal(entry, nextWorn, slot)
+    }
+
+    private fun performSetInventoryWornInternal(entry: InventoryEntry, nextWorn: Boolean, slot: Int) {
+        val itemId = entry.id
         if (_state.value.connection is ConnectionState.Connected) {
             if (nextWorn) lludpEngine.attachInventoryItem(itemId, slot, entry.name)
             else lludpEngine.detachInventoryItem(itemId)
@@ -2053,6 +2424,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             }
         }
 
+        if (!nextWorn) {
+            rlvEngine.onObjectDetached(itemId)
+        }
+
         _state.update { s ->
             s.copy(
                 inventoryEntries = s.inventoryEntries.map {
@@ -2062,6 +2437,122 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         }
         showToast(if (nextWorn) "Attached ${entry.name} (Slot $slot)" else "Detached ${entry.name}")
         pushSceneSnapshot()
+    }
+
+    override fun openInventoryNotecard(itemId: UUID) {
+        if (!rlvEngine.canViewNotecard()) {
+            showToast(RlvConstants.reasonForBehavior("viewnote"))
+            return
+        }
+        val entry = _state.value.inventoryEntries.firstOrNull { it.id == itemId } ?: return
+        val content = "RLVa Protocol Reference (${entry.name})\n\n" +
+            "• @version=<chan>, @versionnew=<chan>, @versionnum=<chan>\n" +
+            "• @getstatus[:filter]=<chan>, @getoutfit=<chan>, @getattach=<chan>, @getsitid=<chan>\n" +
+            "• @sendchat=n (garbles public chat to '...'), @redirchat:<chan>=add\n" +
+            "• @tploc=n, @tplm=n, @tplure=n, @unsit=n, @detach=n, @viewnote=n"
+        _state.update { it.copy(activeNotecardPreview = entry.name to content) }
+    }
+
+    override fun dismissNotecardPreview() {
+        _state.update { it.copy(activeNotecardPreview = null) }
+    }
+
+    override fun setRlvaEnabled(enabled: Boolean) {
+        rlvEngine.setEnabled(enabled)
+        mutateDesign { it.copy(rlvaEnabled = enabled) }
+        _state.update { it.copy(rlvSnapshot = rlvEngine.getSnapshot()) }
+        showToast(if (enabled) "RLVa enabled" else "RLVa disabled — restrictions cleared")
+    }
+
+    override fun clearAllRlvRestrictions() {
+        rlvEngine.clearAllRestrictions()
+        showToast("Cleared all active RLVa restrictions")
+    }
+
+    override fun clearRlvObjectRestrictions(objectId: UUID) {
+        rlvEngine.onObjectDetached(objectId)
+        showToast("Released RLVa restrictions for object ${objectId.toString().take(8)}")
+    }
+
+    override fun triggerSandboxRlvDemo(preset: String) {
+        if (!rlvEngine.isEnabled()) {
+            showToast("Enable RLVa first to run the Relay Demo")
+            return
+        }
+        val relayId = LocalSandboxBuilder.SANDBOX_RLV_RELAY_UUID
+        val relayName = "OpenCollar RLVa Relay HUD"
+        val chairId = LocalSandboxBuilder.SANDBOX_RLV_CHAIR_UUID
+        val chairName = "RLVa Restraint Chair"
+
+        when (preset) {
+            "handshake" -> {
+                rlvEngine.onIncomingChat(
+                    sourceId = relayId,
+                    fromName = relayName,
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@versionnew=4711,versionnum=4711,getstatus=4711,getoutfit=4711,getsitid=4711",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+                )
+                showToast("RLVa Demo: Handshake & status replies sent on ch 4711")
+            }
+            "redir_gag" -> {
+                rlvEngine.onIncomingChat(
+                    sourceId = relayId,
+                    fromName = relayName,
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@sendchat=n,redirchat:324=add,getstatus=4711",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+                )
+                showToast("RLVa Demo: Public chat redirected to ch 324")
+            }
+            "force_sit" -> {
+                rlvEngine.onIncomingChat(
+                    sourceId = chairId,
+                    fromName = chairName,
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@sit:$chairId=force,unsit=n,getsitid=4711",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+                )
+            }
+            "sensory_hide" -> {
+                rlvEngine.onIncomingChat(
+                    sourceId = relayId,
+                    fromName = relayName,
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@shownames=n,showloc=n,showinv=n",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+                )
+                showToast("RLVa Demo: Censored names, location & inventory")
+            }
+            "relay_clear" -> {
+                rlvEngine.onIncomingChat(
+                    sourceId = chairId,
+                    fromName = chairName,
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@clear,unsit=force",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+                )
+                rlvEngine.onIncomingChat(
+                    sourceId = relayId,
+                    fromName = relayName,
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@clear,getstatus=4711",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+                )
+                showToast("RLVa Demo: Relay issued @clear")
+            }
+            else -> {
+                rlvEngine.onIncomingChat(
+                    sourceId = relayId,
+                    fromName = relayName,
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@versionnew=4711,detach=n,sendchat=n,tploc=n,unsit=n,viewnote=n,getstatus=4711",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT
+                )
+                showToast("RLVa Demo: Collar locked (@detach, @sendchat, @tploc, @unsit, @viewnote)")
+            }
+        }
+        refreshNearbyRadar()
     }
 
     override fun respondScriptDialog(buttonLabel: String, channel: Int) {
@@ -2146,7 +2637,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     }
 
     override fun resetDesignToDefault() {
-        mutateDesign { PersonalDesignState() }
+        val next = PersonalDesignState()
+        rlvEngine.setEnabled(next.rlvaEnabled)
+        mutateDesign { next }
         showToast("Reset design & layout to default")
     }
 

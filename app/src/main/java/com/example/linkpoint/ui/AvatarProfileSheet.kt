@@ -51,6 +51,7 @@ import com.example.linkpoint.designsystem.LinkpointFloaterHeader
 import com.example.linkpoint.designsystem.LinkpointStatusChip
 import com.example.linkpoint.designsystem.LocalLinkpointDesign
 import com.example.linkpoint.protocol.SlBinaryParsers
+import com.example.linkpoint.rlv.RlvConstants
 import com.example.linkpoint.scene.AvatarEntity
 import com.example.linkpoint.store.ViewerState
 
@@ -72,21 +73,24 @@ fun AvatarProfileSheetContent(
         avatar.position.distanceTo(state.avatarPosition)
     }
 
+    val hideName = state.rlvSnapshot.showNamesRestricted && !avatar.isSelf
+    val shownDisplayName = if (hideName) RlvConstants.REDACTED_TEXT else avatar.displayName
+
     Column(
         modifier = Modifier
             .fillMaxWidth()
             .testTag("avatar_profile_sheet")
     ) {
         LinkpointFloaterHeader(
-            title = avatar.displayName,
+            title = shownDisplayName,
             subtitle = buildString {
-                if (avatar.legacyName.isNotBlank() && !avatar.legacyName.equals(avatar.displayName, ignoreCase = true)) {
+                if (!hideName && avatar.legacyName.isNotBlank() && !avatar.legacyName.equals(avatar.displayName, ignoreCase = true)) {
                     append(avatar.legacyName)
                     append(" • ")
                 }
                 if (avatar.isSelf) append("You")
                 else append("${"%.1f".format(distMeters)}m away")
-                if (avatar.bornOn.isNotBlank()) append(" • Born ${avatar.bornOn}")
+                if (!hideName && avatar.bornOn.isNotBlank()) append(" • Born ${avatar.bornOn}")
             },
             lcarsCode = "07-BIO",
             onClose = onClose
@@ -111,19 +115,23 @@ fun AvatarProfileSheetContent(
                     .border(1.dp, tokens.accentPrimary.copy(alpha = 0.55f), RoundedCornerShape(tokens.buttonRadius.coerceAtMost(12.dp))),
                 contentAlignment = Alignment.Center
             ) {
-                if (portraitBitmap != null && !portraitBitmap.isRecycled) {
+                if (portraitBitmap != null && !portraitBitmap.isRecycled && !hideName) {
                     Image(
                         bitmap = portraitBitmap.asImageBitmap(),
-                        contentDescription = "${avatar.displayName} profile picture",
+                        contentDescription = "$shownDisplayName profile picture",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier.fillMaxSize()
                     )
                 } else {
-                    val initials = avatar.displayName.split(" ")
-                        .filter { it.isNotBlank() }
-                        .take(2)
-                        .joinToString("") { it.first().uppercase() }
-                        .ifBlank { "?" }
+                    val initials = if (hideName) {
+                        "?"
+                    } else {
+                        avatar.displayName.split(" ")
+                            .filter { it.isNotBlank() }
+                            .take(2)
+                            .joinToString("") { it.first().uppercase() }
+                            .ifBlank { "?" }
+                    }
                     Text(
                         text = initials,
                         style = MaterialTheme.typography.titleMedium.copy(

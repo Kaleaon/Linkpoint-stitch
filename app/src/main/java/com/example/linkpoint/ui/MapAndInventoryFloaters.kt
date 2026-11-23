@@ -62,6 +62,7 @@ import com.example.linkpoint.designsystem.LinkpointActionButton
 import com.example.linkpoint.designsystem.LinkpointFloaterHeader
 import com.example.linkpoint.designsystem.LinkpointStatusChip
 import com.example.linkpoint.designsystem.LocalLinkpointDesign
+import com.example.linkpoint.rlv.RlvConstants
 import com.example.linkpoint.scene.HudAttachmentPoint
 import com.example.linkpoint.store.InventoryEntry
 import com.example.linkpoint.store.ViewerState
@@ -158,7 +159,7 @@ fun MapFloaterContent(
                     drawCircle(tokens.accentTertiary, radius = 7.dp.toPx(), center = Offset(tx, ty))
                 }
                 Text(
-                    text = "TARGET <$targetX, $targetY, $targetZ>",
+                    text = if (state.rlvSnapshot.showLocRestricted) "TARGET ${RlvConstants.REDACTED_TEXT}" else "TARGET <$targetX, $targetY, $targetZ>",
                     style = MaterialTheme.typography.labelSmall.copy(
                         fontFamily = tokens.monoFont,
                         color = tokens.accentTertiary
@@ -263,7 +264,7 @@ fun MapFloaterContent(
                             .clip(shape)
                             .background(tokens.surfaceElevated.copy(alpha = 0.78f))
                             .border(1.dp, tokens.borderHairline, shape)
-                            .clickable { client.teleportToRegion(lm.regionName, lm.x, lm.y, lm.z) }
+                            .clickable { client.teleportToLandmark(lm.regionName, lm.x, lm.y, lm.z) }
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalAlignment = Alignment.CenterVertically,
                         horizontalArrangement = Arrangement.SpaceBetween
@@ -307,6 +308,17 @@ fun InventoryFloaterContent(
             lcarsCode = "04-INV",
             onClose = onClose
         )
+
+        if (state.rlvSnapshot.showInvRestricted) {
+            Text(
+                text = RlvConstants.reasonForBehavior("showinv"),
+                style = MaterialTheme.typography.bodySmall.copy(color = tokens.statusWarning),
+                modifier = Modifier
+                    .padding(vertical = 16.dp)
+                    .testTag("inventory_rlv_locked")
+            )
+            return
+        }
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             LinkpointStatusChip(
@@ -389,9 +401,12 @@ fun InventoryFloaterContent(
                         )
                         .border(1.dp, if (entry.isWorn) tokens.accentPrimary else tokens.borderHairline, shape)
                         .clickable {
-                            if (entry.isFolder) client.toggleInventoryFolder(entry.id)
-                            else if (entry.assetType == 3) client.teleportToRegion(entry.name, 128, 128, 26)
-                            else client.toggleWearInventoryItem(entry.id)
+                            when {
+                                entry.isFolder -> client.toggleInventoryFolder(entry.id)
+                                entry.assetType == 3 -> client.teleportToLandmark(entry.name, 128, 128, 26)
+                                entry.assetType == 7 -> client.openInventoryNotecard(entry.id)
+                                else -> client.toggleWearInventoryItem(entry.id)
+                            }
                         }
                         .padding(horizontal = 10.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
@@ -423,7 +438,13 @@ fun InventoryFloaterContent(
                             }
                         }
                     }
-                    if (!entry.isFolder && entry.assetType != 3) {
+                    if (!entry.isFolder && entry.assetType == 7) {
+                        LinkpointStatusChip(
+                            label = if (state.rlvSnapshot.viewNoteRestricted) "Locked" else "Read Note",
+                            color = if (state.rlvSnapshot.viewNoteRestricted) tokens.statusWarning else tokens.accentTertiary,
+                            onClick = { client.openInventoryNotecard(entry.id) }
+                        )
+                    } else if (!entry.isFolder && entry.assetType != 3) {
                         LinkpointStatusChip(
                             label = if (entry.isWorn) "Detach" else "Wear / HUD",
                             color = if (entry.isWorn) tokens.statusOnline else tokens.textSecondary,
