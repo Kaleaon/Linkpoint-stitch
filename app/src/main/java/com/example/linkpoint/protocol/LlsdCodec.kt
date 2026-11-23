@@ -14,6 +14,7 @@ sealed class LlsdValue {
     data object Undef : LlsdValue()
     data class Bool(val value: Boolean) : LlsdValue()
     data class IntVal(val value: Int) : LlsdValue()
+    data class LongVal(val value: Long) : LlsdValue()
     data class Real(val value: Double) : LlsdValue()
     data class Str(val value: String) : LlsdValue()
     data class Uuid(val value: UUID) : LlsdValue()
@@ -32,6 +33,7 @@ sealed class LlsdValue {
         is Uri -> value
         is Uuid -> value.toString()
         is IntVal -> value.toString()
+        is LongVal -> value.toString()
         is Real -> value.toString()
         is Bool -> value.toString()
         else -> default
@@ -39,15 +41,39 @@ sealed class LlsdValue {
 
     fun asInt(default: Int = 0): Int = when (this) {
         is IntVal -> value
+        is LongVal -> value.toInt()
         is Real -> value.toInt()
-        is Str -> value.toIntOrNull() ?: default
+        is Str -> value.trim().toIntOrNull() ?: default
         is Bool -> if (value) 1 else 0
+        else -> default
+    }
+
+    /**
+     * Extracts a 64-bit integer value, supporting Second Life's 8-byte Big-Endian `LlsdValue.Binary`
+     * encoding of `U64` values (such as `RegionHandle` in `TeleportFinish` and `CrossedRegion`),
+     * as well as `LongVal`, `IntVal`, `Real`, and numeric `Str` representations.
+     */
+    fun asLong(default: Long = 0L): Long = when (this) {
+        is Binary -> when {
+            bytes.size >= 8 -> ByteBuffer.wrap(bytes, 0, 8).order(ByteOrder.BIG_ENDIAN).long
+            bytes.size == 4 -> ByteBuffer.wrap(bytes, 0, 4).order(ByteOrder.BIG_ENDIAN).int.toLong() and 0xFFFFFFFFL
+            else -> default
+        }
+        is LongVal -> value
+        is IntVal -> value.toLong()
+        is Real -> value.toLong()
+        is Str -> {
+            val trimmed = value.trim()
+            trimmed.toLongOrNull() ?: trimmed.toULongOrNull()?.toLong() ?: default
+        }
+        is Bool -> if (value) 1L else 0L
         else -> default
     }
 
     fun asDouble(default: Double = 0.0): Double = when (this) {
         is Real -> value
         is IntVal -> value.toDouble()
+        is LongVal -> value.toDouble()
         is Str -> value.toDoubleOrNull() ?: default
         else -> default
     }
@@ -55,6 +81,7 @@ sealed class LlsdValue {
     fun asBool(default: Boolean = false): Boolean = when (this) {
         is Bool -> value
         is IntVal -> value != 0
+        is LongVal -> value != 0L
         is Str -> value == "1" || value.equals("true", ignoreCase = true)
         else -> default
     }
@@ -179,13 +206,16 @@ object LlsdCodec {
             LlsdValue.Undef -> sb.append("<undef />")
             is LlsdValue.Bool -> sb.append("<boolean>").append(if (value.value) "1" else "0").append("</boolean>")
             is LlsdValue.IntVal -> sb.append("<integer>").append(value.value).append("</integer>")
+            is LlsdValue.LongVal -> sb.append("<integer>").append(value.value).append("</integer>")
             is LlsdValue.Real -> sb.append("<real>").append(value.value).append("</real>")
             is LlsdValue.Str -> sb.append("<string>").append(escapeXml(value.value)).append("</string>")
             is LlsdValue.Uuid -> sb.append("<uuid>").append(value.value).append("</uuid>")
             is LlsdValue.Date -> sb.append("<date>").append(escapeXml(value.iso8601)).append("</date>")
             is LlsdValue.Uri -> sb.append("<uri>").append(escapeXml(value.value)).append("</uri>")
             is LlsdValue.Binary -> {
-                val b64 = Base64.encodeToString(value.bytes, Base64.NO_WRAP)
+                @Suppress("NewApi")
+                val b64 = runCatching { Base64.encodeToString(value.bytes, Base64.NO_WRAP) }.getOrNull()
+                    ?: java.util.Base64.getEncoder().encodeToString(value.bytes)
                 sb.append("<binary encoding=\"base64\">").append(b64).append("</binary>")
             }
             is LlsdValue.ArrayVal -> {
@@ -276,7 +306,16 @@ object LlsdCodec {
                 val text = element.textContent.orEmpty().trim()
                 LlsdValue.Bool(text == "1" || text.equals("true", ignoreCase = true))
             }
-            "integer" -> LlsdValue.IntVal(element.textContent.orEmpty().trim().toIntOrNull() ?: 0)
+            "integer" -> {
+                val text = element.textContent.orEmpty().trim()
+                val intVal = text.toIntOrNull()
+                if (intVal != null) {
+                    LlsdValue.IntVal(intVal)
+                } else {
+                    val longVal = text.toLongOrNull() ?: text.toULongOrNull()?.toLong()
+                    if (longVal != null) LlsdValue.LongVal(longVal) else LlsdValue.IntVal(0)
+                }
+            }
             "real" -> LlsdValue.Real(element.textContent.orEmpty().trim().toDoubleOrNull() ?: 0.0)
             "string" -> LlsdValue.Str(element.textContent.orEmpty())
             "uuid" -> {
@@ -288,7 +327,9 @@ object LlsdCodec {
             "uri" -> LlsdValue.Uri(element.textContent.orEmpty().trim())
             "binary" -> {
                 val raw = element.textContent.orEmpty().trim()
-                val bytes = runCatching { Base64.decode(raw, Base64.DEFAULT) }.getOrDefault(ByteArray(0))
+                @Suppress("NewApi")
+                val bytes = runCatching { Base64.decode(raw, Base64.DEFAULT) }.getOrNull()
+                    ?: runCatching { java.util.Base64.getMimeDecoder().decode(raw) }.getOrDefault(ByteArray(0))
                 LlsdValue.Binary(bytes)
             }
             "array" -> LlsdValue.ArrayVal(childElements(element).map { readDomNode(it) })

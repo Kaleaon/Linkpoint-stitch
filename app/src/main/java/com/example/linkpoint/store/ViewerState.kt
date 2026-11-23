@@ -107,7 +107,8 @@ data class InventoryEntry(
     val isFolder: Boolean,
     val assetType: Int, // 0=Texture, 3=Landmark, 6=Object, 7=Notecard, 10=Script, 13=Bodypart, 5=Clothing
     val isWorn: Boolean = false,
-    val attachmentPoint: Int = 0
+    val attachmentPoint: Int = 0,
+    val assetId: UUID? = null
 )
 
 data class MapRegionTile(
@@ -169,6 +170,13 @@ data class ViewerState(
     val inventoryEntries: List<InventoryEntry> = emptyList(),
     val expandedFolderIds: Set<UUID> = emptySet(),
     val mapRegions: List<MapRegionTile> = emptyList(),
+    val isTeleporting: Boolean = false,
+    val teleportStatusMessage: String? = null,
+    val mapTargetRegion: String = "",
+    val mapTargetX: Int = 128,
+    val mapTargetY: Int = 128,
+    val mapTargetZ: Int = 25,
+    val mapTargetRevision: Int = 0,
     val scriptDialog: ScriptDialogPrompt? = null,
     val toastMessage: String? = null
 )

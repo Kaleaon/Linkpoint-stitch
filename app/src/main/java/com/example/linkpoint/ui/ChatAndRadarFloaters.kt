@@ -22,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.ChatBubbleOutline
+import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.FlightTakeoff
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material3.Icon
@@ -42,7 +43,12 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.LinkAnnotation
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLinkStyles
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.linkpoint.client.ViewerClient
@@ -50,6 +56,7 @@ import com.example.linkpoint.designsystem.DesignLanguage
 import com.example.linkpoint.designsystem.LinkpointFloaterHeader
 import com.example.linkpoint.designsystem.LinkpointStatusChip
 import com.example.linkpoint.designsystem.LocalLinkpointDesign
+import com.example.linkpoint.protocol.SlurlParser
 import com.example.linkpoint.store.ChatRange
 import com.example.linkpoint.store.ViewerState
 
@@ -126,15 +133,100 @@ fun ChatFloaterContent(
                     msg.isSystem -> tokens.accentSecondary
                     else -> tokens.accentPrimary
                 }
+                val slurlMatches = remember(msg.text) { SlurlParser.extractSlurls(msg.text) }
+                val prefix = if (tokens.language == DesignLanguage.TERMINAL) "${msg.speaker}> " else "${msg.speaker}: "
                 Column(modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        text = if (tokens.language == DesignLanguage.TERMINAL) "${msg.speaker}> ${msg.text}"
-                        else "${msg.speaker}: ${msg.text}",
-                        style = MaterialTheme.typography.bodySmall.copy(
-                            fontFamily = if (tokens.language == DesignLanguage.TERMINAL) tokens.monoFont else tokens.bodyFont,
-                            color = if (msg.isSystem || msg.isFromHud) speakerColor else tokens.textPrimary
+                    if (slurlMatches.isEmpty()) {
+                        Text(
+                            text = "$prefix${msg.text}",
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = if (tokens.language == DesignLanguage.TERMINAL) tokens.monoFont else tokens.bodyFont,
+                                color = if (msg.isSystem || msg.isFromHud) speakerColor else tokens.textPrimary
+                            )
                         )
-                    )
+                    } else {
+                        val annotated = buildAnnotatedString {
+                            append(prefix)
+                            var cursor = 0
+                            for (match in slurlMatches) {
+                                if (match.startIndex > cursor) {
+                                    append(msg.text.substring(cursor, match.startIndex))
+                                }
+                                val linkStart = length
+                                append(msg.text.substring(match.startIndex, match.endIndex))
+                                val linkEnd = length
+                                addLink(
+                                    clickable = LinkAnnotation.Clickable(
+                                        tag = match.rawSlurl,
+                                        styles = TextLinkStyles(
+                                            style = SpanStyle(
+                                                color = tokens.accentTertiary,
+                                                fontWeight = FontWeight.SemiBold,
+                                                textDecoration = TextDecoration.Underline
+                                            )
+                                        ),
+                                        linkInteractionListener = {
+                                            client.openSlurl(match.rawSlurl)
+                                        }
+                                    ),
+                                    start = linkStart,
+                                    end = linkEnd
+                                )
+                                cursor = match.endIndex
+                            }
+                            if (cursor < msg.text.length) {
+                                append(msg.text.substring(cursor))
+                            }
+                        }
+                        Text(
+                            text = annotated,
+                            style = MaterialTheme.typography.bodySmall.copy(
+                                fontFamily = if (tokens.language == DesignLanguage.TERMINAL) tokens.monoFont else tokens.bodyFont,
+                                color = if (msg.isSystem || msg.isFromHud) speakerColor else tokens.textPrimary
+                            )
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            slurlMatches.forEach { match ->
+                                val dest = match.destination
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(tokens.buttonRadius.coerceAtMost(8.dp)))
+                                        .background(tokens.accentTertiary.copy(alpha = 0.14f))
+                                        .border(
+                                            1.dp,
+                                            tokens.accentTertiary.copy(alpha = 0.6f),
+                                            RoundedCornerShape(tokens.buttonRadius.coerceAtMost(8.dp))
+                                        )
+                                        .clickable { client.openSlurl(match.rawSlurl) }
+                                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                                        .testTag("chat_slurl_chip"),
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.Explore,
+                                        contentDescription = "Teleport to SLURL",
+                                        tint = tokens.accentTertiary,
+                                        modifier = Modifier.size(13.dp)
+                                    )
+                                    Text(
+                                        text = "${dest.regionName} <${dest.x}, ${dest.y}, ${dest.z}>",
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            fontFamily = tokens.monoFont,
+                                            color = tokens.accentTertiary,
+                                            fontWeight = FontWeight.SemiBold
+                                        )
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

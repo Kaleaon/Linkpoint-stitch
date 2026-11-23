@@ -648,6 +648,7 @@ class XmlRpcLoginClient(
         LlsdValue.Undef -> ""
         is LlsdValue.Bool -> value.value
         is LlsdValue.IntVal -> value.value
+        is LlsdValue.LongVal -> value.value
         is LlsdValue.Real -> value.value
         is LlsdValue.Str -> value.value
         is LlsdValue.Uuid -> value.value.toString()

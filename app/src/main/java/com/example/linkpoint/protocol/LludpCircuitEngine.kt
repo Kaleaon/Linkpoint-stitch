@@ -108,6 +108,15 @@ sealed class SimEvent {
     data class CoarseLocationsUpdated(val locations: List<Vec3>) : SimEvent()
     data class TerrainPatchReceived(val patchX: Int, val patchY: Int, val avgHeight: Float) : SimEvent()
     data class MapBlockReceived(val x: Int, val y: Int, val name: String, val access: Int, val agents: Int) : SimEvent()
+    data class MapSearchNotFound(val queryName: String) : SimEvent()
+    data class TeleportProgressReceived(val flags: Int, val message: String) : SimEvent()
+    data class TeleportFailedReceived(val reason: String, val alertMessages: List<String> = emptyList()) : SimEvent()
+    data class TeleportLocalReceived(
+        val locationId: Int,
+        val position: Vec3,
+        val lookAt: Vec3,
+        val flags: Int
+    ) : SimEvent()
     data class PingUpdated(val pingMs: Int) : SimEvent()
     data class CircuitHealthChanged(
         val status: LayerHealthStatus,
@@ -147,6 +156,7 @@ class LludpCircuitEngine {
     private var circuitCode: Int = 0
 
     private val seqCounter = AtomicInteger(1)
+    private val circuitGeneration = AtomicInteger(0)
     private val running = AtomicBoolean(false)
     private val handshakeCompleted = AtomicBoolean(false)
     private val packetsTx = AtomicLong(0L)
@@ -208,9 +218,84 @@ class LludpCircuitEngine {
         lastRxTimestampMs.set(0L)
 
         running.set(true)
+        val gen = circuitGeneration.incrementAndGet()
         circuitJob = scope.launch {
-            runCircuitWithRecovery()
+            runCircuitWithRecovery(gen)
         }
+    }
+
+    /**
+     * Switches the active LLUDP circuit to a destination simulator during inter-region
+     * `TeleportFinish` or `CrossedRegion` handoff without sending `LogoutRequest` to the
+     * departing simulator, then performs `UseCircuitCode` + `CompleteAgentMovement` + `AgentThrottle`.
+     */
+    fun switchSimulator(
+        newSimIp: String,
+        newSimPort: Int,
+        newSeedCapability: String? = null,
+        newRegionHandle: Long = 0L,
+        newCircuitCode: Int = this.circuitCode,
+        newSessionId: UUID = this.sessionId,
+        newAgentId: UUID = this.agentId
+    ): Boolean {
+        if (newSimIp.isBlank() || newSimPort !in 1..65535) {
+            val msg = "Invalid destination simulator UDP endpoint: $newSimIp:$newSimPort"
+            ProtocolAuditLogger.logError("[HANDSHAKE] $msg")
+            _events.tryEmit(SimEvent.ProtocolAuditLog("[HANDSHAKE ERROR] $msg"))
+            _events.tryEmit(SimEvent.CircuitError(msg, NetworkErrorCategory.CIRCUIT_UNREACHABLE, msg))
+            return false
+        }
+        if (newAgentId == ProtocolAuditLogger.ZERO_UUID ||
+            newSessionId == ProtocolAuditLogger.ZERO_UUID ||
+            newCircuitCode == 0
+        ) {
+            val msg = "Cannot switch simulator without active circuit credentials"
+            ProtocolAuditLogger.logError("[HANDSHAKE] $msg")
+            _events.tryEmit(SimEvent.ProtocolAuditLog("[HANDSHAKE ERROR] $msg"))
+            return false
+        }
+
+        // Tear down departing simulator circuit quietly (never send LogoutRequest during handoff)
+        running.set(false)
+        handshakeCompleted.set(false)
+        heartbeatJob?.cancel()
+        circuitJob?.cancel()
+        runCatching { socket?.close() }
+        socket = null
+        unackedReliable.clear()
+        pendingAcks.clear()
+
+        agentId = newAgentId
+        sessionId = newSessionId
+        circuitCode = newCircuitCode
+        simIpString = newSimIp
+        simPort = newSimPort
+
+        lastSession = lastSession?.let { prev ->
+            prev.copy(
+                simIp = newSimIp,
+                simPort = newSimPort,
+                circuitCode = newCircuitCode,
+                sessionId = newSessionId,
+                agentId = newAgentId,
+                seedCapability = newSeedCapability?.takeIf { it.isNotBlank() } ?: prev.seedCapability,
+                regionX = if (newRegionHandle != 0L) LludpPackets.regionHandleToGridX(newRegionHandle) * 256 else prev.regionX,
+                regionY = if (newRegionHandle != 0L) LludpPackets.regionHandleToGridY(newRegionHandle) * 256 else prev.regionY
+            )
+        }
+
+        seqCounter.set(1)
+        packetsTx.set(0L)
+        packetsRx.set(0L)
+        consecutiveSendErrors.set(0)
+        lastRxTimestampMs.set(0L)
+
+        running.set(true)
+        val gen = circuitGeneration.incrementAndGet()
+        circuitJob = scope.launch {
+            runCircuitWithRecovery(gen)
+        }
+        return true
     }
 
     /**
@@ -222,11 +307,12 @@ class LludpCircuitEngine {
         return true
     }
 
-    private suspend fun runCircuitWithRecovery() {
+    private suspend fun runCircuitWithRecovery(gen: Int) {
         val retryPolicy = RetryPolicy(maxAttempts = MAX_CIRCUIT_RETRIES, initialDelayMs = 1500L, maxDelayMs = 6000L)
         var attempt = 1
 
-        while (running.get() && attempt <= MAX_CIRCUIT_RETRIES) {
+        while (running.get() && circuitGeneration.get() == gen && attempt <= MAX_CIRCUIT_RETRIES) {
+            var openedSocket: DatagramSocket? = null
             try {
                 emitHealth(
                     status = if (attempt == 1) LayerHealthStatus.CONNECTING else LayerHealthStatus.RETRYING,
@@ -234,29 +320,36 @@ class LludpCircuitEngine {
                     retryAttempt = attempt
                 )
 
-                runCatching { socket?.close() }
                 simAddress = InetAddress.getByName(simIpString)
-                socket = DatagramSocket().apply { soTimeout = 250 }
+                openedSocket = DatagramSocket().apply { soTimeout = 250 }
+                if (!running.get() || circuitGeneration.get() != gen) {
+                    runCatching { openedSocket.close() }
+                    return
+                }
+                socket = openedSocket
                 consecutiveSendErrors.set(0)
 
                 sendHandshakeSequence()
-                startHeartbeatLoop()
-                receiveLoop()
+                startHeartbeatLoop(gen)
+                receiveLoop(gen, openedSocket)
 
-                // If receiveLoop exited cleanly while stopped, exit without retrying
-                if (!running.get()) return
+                // If receiveLoop exited cleanly while stopped or superseded, exit without retrying
+                if (!running.get() || circuitGeneration.get() != gen) return
             } catch (e: CancellationException) {
+                runCatching { openedSocket?.close() }
                 throw e
             } catch (e: Exception) {
-                if (!running.get()) return
+                runCatching { openedSocket?.close() }
+                if (!running.get() || circuitGeneration.get() != gen) return
                 val classified = NetworkResilience.classifyException(
                     ProtocolLayer.LLUDP_CIRCUIT,
                     "$simIpString:$simPort",
                     e
                 )
                 heartbeatJob?.cancel()
-                runCatching { socket?.close() }
-                socket = null
+                if (socket === openedSocket) {
+                    socket = null
+                }
 
                 if (attempt < MAX_CIRCUIT_RETRIES && classified.category.isRetryable) {
                     val delayMs = retryPolicy.delayForAttempt(attempt)
@@ -308,14 +401,14 @@ class LludpCircuitEngine {
         sendDirect(LludpPackets.MSG_AGENT_THROTTLE, throttleBody, reliable = true)
     }
 
-    private fun startHeartbeatLoop() {
+    private fun startHeartbeatLoop(gen: Int) {
         heartbeatJob?.cancel()
         heartbeatJob = scope.launch {
             var tick = 0
             val startedMs = System.currentTimeMillis()
             var handshakeRetryCount = 0
 
-            while (isActive && running.get()) {
+            while (isActive && running.get() && circuitGeneration.get() == gen) {
                 // 20Hz AgentUpdate (every 50ms) when moving, or 4Hz idle heartbeat
                 val activeMove = controlFlags != 0
                 if (activeMove || tick % 5 == 0) {
@@ -394,13 +487,13 @@ class LludpCircuitEngine {
         }
     }
 
-    private fun receiveLoop() {
+    private fun receiveLoop(gen: Int, sock: DatagramSocket) {
         val buffer = ByteArray(4096)
         val datagram = DatagramPacket(buffer, buffer.size)
-        while (running.get()) {
-            val sock = socket ?: break
+        while (running.get() && circuitGeneration.get() == gen) {
             try {
                 sock.receive(datagram)
+                if (!running.get() || circuitGeneration.get() != gen) break
                 val rxCount = packetsRx.incrementAndGet()
                 lastRxTimestampMs.set(System.currentTimeMillis())
                 if (rxCount == 1L) {
@@ -428,7 +521,7 @@ class LludpCircuitEngine {
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (running.get()) throw e
+                if (running.get() && circuitGeneration.get() == gen) throw e
                 break
             }
         }
@@ -599,6 +692,46 @@ class LludpCircuitEngine {
                     }
                 }
             }
+            LludpPackets.MSG_TELEPORT_START -> {
+                val flags = if (buf.remaining() >= 4) buf.int else 0
+                _events.tryEmit(SimEvent.TeleportProgressReceived(flags, "Starting teleport..."))
+            }
+            LludpPackets.MSG_TELEPORT_PROGRESS -> {
+                val parsed = LludpPackets.parseTeleportProgress(buf)
+                if (parsed != null) {
+                    _events.tryEmit(
+                        SimEvent.TeleportProgressReceived(
+                            flags = parsed.teleportFlags,
+                            message = parsed.message.ifBlank { "Teleporting..." }
+                        )
+                    )
+                }
+            }
+            LludpPackets.MSG_TELEPORT_FAILED -> {
+                val parsed = LludpPackets.parseTeleportFailed(buf)
+                if (parsed != null) {
+                    _events.tryEmit(
+                        SimEvent.TeleportFailedReceived(
+                            reason = parsed.reason,
+                            alertMessages = parsed.alertMessages
+                        )
+                    )
+                }
+            }
+            LludpPackets.MSG_TELEPORT_LOCAL -> {
+                val parsed = LludpPackets.parseTeleportLocal(buf)
+                if (parsed != null) {
+                    avatarPos = parsed.position
+                    _events.tryEmit(
+                        SimEvent.TeleportLocalReceived(
+                            locationId = parsed.locationId,
+                            position = parsed.position,
+                            lookAt = parsed.lookAt,
+                            flags = parsed.teleportFlags
+                        )
+                    )
+                }
+            }
             LludpPackets.MSG_MAP_BLOCK_REPLY -> {
                 if (buf.remaining() >= 38) {
                     LludpPackets.readUuid(buf)
@@ -615,7 +748,11 @@ class LludpCircuitEngine {
                             if (buf.remaining() >= 1) buf.get()
                             val agents = if (buf.remaining() >= 1) buf.get().toInt() and 0xFF else 0
                             if (buf.remaining() >= 16) LludpPackets.readUuid(buf)
-                            if (name.isNotBlank()) {
+                            if (x == 0 && y == 0 || access == 255) {
+                                if (name.isNotBlank()) {
+                                    _events.tryEmit(SimEvent.MapSearchNotFound(name))
+                                }
+                            } else if (name.isNotBlank()) {
                                 _events.tryEmit(SimEvent.MapBlockReceived(x, y, name, access, agents))
                             }
                         }
@@ -1284,13 +1421,39 @@ class LludpCircuitEngine {
         send(LludpPackets.MSG_AGENT_REQUEST_SIT, LludpPackets.buildAgentRequestSit(agentId, sessionId, targetUuid), reliable = true)
     }
 
-    fun sendTeleportLocation(regionHandle: Long, pos: Vec3) {
+    fun sendTeleportLocation(regionHandle: Long, pos: Vec3, lookAt: Vec3 = Vec3(1f, 0f, 0f)) {
         if (!running.get()) return
         send(
             LludpPackets.MSG_TELEPORT_LOCATION_REQUEST,
-            LludpPackets.buildTeleportLocationRequest(agentId, sessionId, regionHandle, pos),
+            LludpPackets.buildTeleportLocationRequest(agentId, sessionId, regionHandle, pos, lookAt),
             reliable = true
         )
+    }
+
+    fun sendTeleportHome() {
+        if (!running.get()) return
+        send(
+            LludpPackets.MSG_TELEPORT_HOME_REQUEST,
+            LludpPackets.buildTeleportHomeRequest(agentId, sessionId),
+            reliable = true,
+            zeroCode = true
+        )
+    }
+
+    fun sendTeleportLandmark(landmarkId: UUID) {
+        if (!running.get()) return
+        send(
+            LludpPackets.MSG_TELEPORT_LANDMARK_REQUEST,
+            LludpPackets.buildTeleportLandmarkRequest(agentId, sessionId, landmarkId),
+            reliable = true,
+            zeroCode = true
+        )
+    }
+
+    fun requestMapName(name: String, flags: Int = 0) {
+        if (!running.get() || name.isBlank()) return
+        val body = LludpPackets.buildMapNameRequest(agentId, sessionId, name, flags = flags)
+        send(LludpPackets.MSG_MAP_NAME_REQUEST, body, reliable = true)
     }
 
     fun requestMapBlocks(centerX: Int, centerY: Int) {
@@ -1393,6 +1556,7 @@ class LludpCircuitEngine {
             scope.launch { transmitRaw(framed) }
         }
         running.set(false)
+        circuitGeneration.incrementAndGet()
         handshakeCompleted.set(false)
         heartbeatJob?.cancel()
         circuitJob?.cancel()

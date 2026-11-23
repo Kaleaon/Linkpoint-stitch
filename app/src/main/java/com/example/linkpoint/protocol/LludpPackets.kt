@@ -34,8 +34,13 @@ object LludpPackets {
     // Low frequency message IDs (0xFFFF + 2 bytes)
     const val MSG_USE_CIRCUIT_CODE: Int = 0xFFFF0003.toInt()
     const val MSG_OBJECT_PROPERTIES: Int = 0xFFFF0009.toInt()
-    const val MSG_TELEPORT_LOCATION_REQUEST: Int = 0xFFFF003F.toInt()
-    const val MSG_TELEPORT_LANDMARK_REQUEST: Int = 0xFFFF0041.toInt()
+    const val MSG_TELEPORT_LOCATION_REQUEST: Int = 0xFFFF003F.toInt() // Low 63
+    const val MSG_TELEPORT_LOCAL: Int = 0xFFFF0040.toInt()            // Low 64
+    const val MSG_TELEPORT_LANDMARK_REQUEST: Int = 0xFFFF0041.toInt() // Low 65
+    const val MSG_TELEPORT_HOME_REQUEST: Int = MSG_TELEPORT_LANDMARK_REQUEST // Low 65 with null LandmarkID
+    const val MSG_TELEPORT_PROGRESS: Int = 0xFFFF0042.toInt()         // Low 66
+    const val MSG_TELEPORT_START: Int = 0xFFFF0049.toInt()            // Low 73
+    const val MSG_TELEPORT_FAILED: Int = 0xFFFF004A.toInt()           // Low 74
     const val MSG_CHAT_FROM_VIEWER: Int = 0xFFFF0050.toInt()
     const val MSG_AGENT_THROTTLE: Int = 0xFFFF0051.toInt()
     const val MSG_OBJECT_GRAB: Int = 0xFFFF0075.toInt()
@@ -59,6 +64,7 @@ object LludpPackets {
     const val MSG_REZ_SINGLE_ATTACHMENT: Int = 0xFFFF018B.toInt()
     const val MSG_DETACH_ATTACHMENT: Int = 0xFFFF018D.toInt()
     const val MSG_MAP_BLOCK_REQUEST: Int = 0xFFFF0197.toInt()
+    const val MSG_MAP_NAME_REQUEST: Int = 0xFFFF0198.toInt()          // Low 408
     const val MSG_MAP_BLOCK_REPLY: Int = 0xFFFF0199.toInt()
     const val MSG_PACKET_ACK: Int = 0xFFFFFFFB.toInt()
 
@@ -507,6 +513,104 @@ object LludpPackets {
         return buf.array()
     }
 
+    /**
+     * Encodes grid tile coordinates (e.g. gridX=1000, gridY=1000) into a 64-bit Second Life
+     * RegionHandle: `((gridX * 256L) shl 32) or ((gridY * 256L) and 0xFFFFFFFFL)`.
+     */
+    fun toRegionHandle(gridX: Int, gridY: Int): Long {
+        val globalX = gridX.toLong() * 256L
+        val globalY = gridY.toLong() * 256L
+        return (globalX shl 32) or (globalY and 0xFFFFFFFFL)
+    }
+
+    fun regionHandleToGridX(regionHandle: Long): Int = ((regionHandle ushr 32) / 256L).toInt()
+
+    fun regionHandleToGridY(regionHandle: Long): Int = ((regionHandle and 0xFFFFFFFFL) / 256L).toInt()
+
+    data class ParsedTeleportProgress(
+        val agentId: UUID,
+        val teleportFlags: Int,
+        val message: String
+    )
+
+    data class ParsedTeleportFailed(
+        val agentId: UUID,
+        val reason: String,
+        val alertMessages: List<String> = emptyList()
+    )
+
+    data class ParsedTeleportLocal(
+        val agentId: UUID,
+        val locationId: Int,
+        val position: Vec3,
+        val lookAt: Vec3,
+        val teleportFlags: Int
+    )
+
+    fun parseTeleportProgress(bytes: ByteArray): ParsedTeleportProgress? =
+        parseTeleportProgress(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseTeleportProgress(buf: ByteBuffer): ParsedTeleportProgress? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 21) return null
+        val agentId = readUuid(buf)
+        val teleportFlags = buf.int
+        val msgLen = buf.get().toInt() and 0xFF
+        val message = readCString(buf, msgLen)
+        return ParsedTeleportProgress(agentId = agentId, teleportFlags = teleportFlags, message = message)
+    }
+
+    fun parseTeleportFailed(bytes: ByteArray): ParsedTeleportFailed? =
+        parseTeleportFailed(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseTeleportFailed(buf: ByteBuffer): ParsedTeleportFailed? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 17) return null
+        val agentId = readUuid(buf)
+        val reasonLen = buf.get().toInt() and 0xFF
+        val reason = readCString(buf, reasonLen)
+        val alerts = mutableListOf<String>()
+        if (buf.remaining() >= 1) {
+            val alertCount = buf.get().toInt() and 0xFF
+            repeat(alertCount) {
+                if (buf.remaining() >= 1) {
+                    val msgLen = buf.get().toInt() and 0xFF
+                    val alertMsg = readCString(buf, msgLen)
+                    if (alertMsg.isNotBlank()) alerts.add(alertMsg)
+                    if (buf.remaining() >= 1) {
+                        val extraLen = buf.get().toInt() and 0xFF
+                        readCString(buf, extraLen)
+                    }
+                }
+            }
+        }
+        return ParsedTeleportFailed(
+            agentId = agentId,
+            reason = reason.ifBlank { alerts.firstOrNull() ?: "Teleport failed" },
+            alertMessages = alerts
+        )
+    }
+
+    fun parseTeleportLocal(bytes: ByteArray): ParsedTeleportLocal? =
+        parseTeleportLocal(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseTeleportLocal(buf: ByteBuffer): ParsedTeleportLocal? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 48) return null
+        val agentId = readUuid(buf)
+        val locationId = buf.int
+        val position = Vec3(buf.float, buf.float, buf.float)
+        val lookAt = Vec3(buf.float, buf.float, buf.float)
+        val teleportFlags = buf.int
+        return ParsedTeleportLocal(
+            agentId = agentId,
+            locationId = locationId,
+            position = position,
+            lookAt = lookAt,
+            teleportFlags = teleportFlags
+        )
+    }
+
     fun buildTeleportLocationRequest(
         agentId: UUID,
         sessionId: UUID,
@@ -520,6 +624,60 @@ object LludpPackets {
         buf.putLong(regionHandle)
         putVec3(buf, position)
         putVec3(buf, lookAt)
+        return buf.array()
+    }
+
+    /**
+     * Builds `TeleportLandmarkRequest` (Low 65 / 0xFFFF0041):
+     * Info block: AgentID (16B UUID) + SessionID (16B UUID) + LandmarkID (16B UUID).
+     */
+    fun buildTeleportLandmarkRequest(
+        agentId: UUID,
+        sessionId: UUID,
+        landmarkId: UUID
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, agentId)
+        putUuid(buf, sessionId)
+        putUuid(buf, landmarkId)
+        return buf.array()
+    }
+
+    /**
+     * Builds a Second Life / OpenSimulator Home Teleport request (`TeleportLandmarkRequest` with
+     * `UUID(0L, 0L)` as `LandmarkID`, per canonical `message_template.msg`).
+     */
+    fun buildTeleportHomeRequest(
+        agentId: UUID,
+        sessionId: UUID
+    ): ByteArray = buildTeleportLandmarkRequest(agentId, sessionId, UUID(0L, 0L))
+
+    /**
+     * Builds `MapNameRequest` (Low 408 / 0xFFFF0198):
+     * AgentData: AgentID (16B) + SessionID (16B) + Flags (U32 LE) + EstateID (U32 LE) + Godlike (BOOL 1B)
+     * NameData: Name (Variable 1 null-terminated UTF-8 string).
+     */
+    fun buildMapNameRequest(
+        agentId: UUID,
+        sessionId: UUID,
+        name: String,
+        flags: Int = 0,
+        estateId: Int = 0,
+        godlike: Boolean = false
+    ): ByteArray {
+        val trimmed = name.trim()
+        val rawUtf8 = trimmed.toByteArray(Charsets.UTF_8)
+        val cappedLen = rawUtf8.size.coerceAtMost(254)
+        val cStrLen = cappedLen + 1 // null terminator
+        val buf = ByteBuffer.allocate(16 + 16 + 4 + 4 + 1 + 1 + cStrLen).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, agentId)
+        putUuid(buf, sessionId)
+        buf.putInt(flags)
+        buf.putInt(estateId)
+        buf.put(if (godlike) 1.toByte() else 0.toByte())
+        buf.put(cStrLen.toByte())
+        buf.put(rawUtf8, 0, cappedLen)
+        buf.put(0.toByte())
         return buf.array()
     }
 

@@ -35,7 +35,23 @@ data class CapsAttachmentTransform(
 )
 
 sealed class CapsEvent {
-    data class TeleportFinish(val simIp: String, val simPort: Int, val seedCap: String, val regionHandle: Long) : CapsEvent()
+    data class TeleportFinish(
+        val simIp: String,
+        val simPort: Int,
+        val seedCap: String,
+        val regionHandle: Long,
+        val locationId: Int = 0,
+        val teleportFlags: Int = 0
+    ) : CapsEvent()
+    data class CrossedRegion(
+        val simIp: String,
+        val simPort: Int,
+        val seedCap: String,
+        val regionHandle: Long,
+        val position: com.example.linkpoint.scene.Vec3? = null,
+        val lookAt: com.example.linkpoint.scene.Vec3? = null
+    ) : CapsEvent()
+    data class TeleportFailed(val reason: String) : CapsEvent()
     data class ParcelProperties(val parcelName: String, val parcelDesc: String) : CapsEvent()
     data class ScriptDialog(val objectName: String, val message: String, val buttons: List<String>, val channel: Int) : CapsEvent()
     data class AttachmentsUpdated(val updates: List<CapsAttachmentTransform>) : CapsEvent()
@@ -67,7 +83,8 @@ data class FetchedInventoryItem(
     val parentId: UUID,
     val name: String,
     val assetType: Int,
-    val description: String
+    val description: String,
+    val assetId: UUID? = null
 )
 
 /**
@@ -250,6 +267,7 @@ class CapabilityManager(
         retryPolicy: RetryPolicy = RetryPolicy(maxAttempts = 2, initialDelayMs = 800L, maxDelayMs = 2500L),
         onAttemptStatus: suspend (attempt: Int, maxAttempts: Int, detail: String) -> Unit = { _, _, _ -> }
     ): CapsNegotiationResult = withContext(Dispatchers.IO) {
+        eventQueueJob?.cancel()
         capabilities.clear()
         lastSeedUrl = seedUrl.trim()
         val diagnostics = mutableListOf<String>()
@@ -553,19 +571,87 @@ class CapabilityManager(
         }
     }
 
+    internal fun dispatchCapsEventForTesting(message: String, body: LlsdValue) {
+        dispatchCapsEvent(message, body)
+    }
+
+    private fun extractSimIp(node: LlsdValue): String {
+        val raw = node["SimIP"].takeIf { it !is LlsdValue.Undef } ?: node["sim_ip"]
+        val ipBytes = (raw as? LlsdValue.Binary)?.bytes
+        return when {
+            ipBytes != null && ipBytes.size == 4 ->
+                ipBytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
+            raw !is LlsdValue.Undef -> raw.asString().trim()
+            else -> ""
+        }
+    }
+
+    private fun extractRegionHandle(node: LlsdValue): Long {
+        val handleVal = node["RegionHandle"].takeIf { it !is LlsdValue.Undef } ?: node["region_handle"]
+        return handleVal.asLong(0L)
+    }
+
     private fun dispatchCapsEvent(message: String, body: LlsdValue) {
         when (message) {
             "TeleportFinish" -> {
-                val info = body["Info"].asList().firstOrNull() ?: return
-                val seed = info["SeedCapability"].asString()
+                val info = body["Info"].asList().firstOrNull()
+                    ?: body["Info"].takeIf { it is LlsdValue.MapVal }
+                    ?: body.takeIf { it is LlsdValue.MapVal }
+                    ?: return
+                val seed = info["SeedCapability"].asString().trim()
                 val port = info["SimPort"].asInt(13000)
-                val ipBytes = (info["SimIP"] as? LlsdValue.Binary)?.bytes
-                val ip = if (ipBytes != null && ipBytes.size == 4) {
-                    ipBytes.joinToString(".") { (it.toInt() and 0xFF).toString() }
-                } else ""
-                if (ip.isNotBlank() && seed.isNotBlank()) {
-                    _capsEvents.tryEmit(CapsEvent.TeleportFinish(ip, port, seed, 0L))
+                val ip = extractSimIp(info)
+                val regionHandle = extractRegionHandle(info)
+                val locationId = info["LocationID"].asInt(0)
+                val teleportFlags = info["TeleportFlags"].asInt(0)
+                if (ip.isNotBlank() && port in 1..65535) {
+                    _capsEvents.tryEmit(
+                        CapsEvent.TeleportFinish(
+                            simIp = ip,
+                            simPort = port,
+                            seedCap = seed,
+                            regionHandle = regionHandle,
+                            locationId = locationId,
+                            teleportFlags = teleportFlags
+                        )
+                    )
                 }
+            }
+            "CrossedRegion" -> {
+                val regionData = body["RegionData"].asList().firstOrNull()
+                    ?: body["RegionData"].takeIf { it is LlsdValue.MapVal }
+                    ?: body.takeIf { it is LlsdValue.MapVal }
+                    ?: return
+                val info = body["Info"].asList().firstOrNull()
+                    ?: body["Info"].takeIf { it is LlsdValue.MapVal }
+                    ?: LlsdValue.Undef
+                val seed = regionData["SeedCapability"].asString().trim()
+                val port = regionData["SimPort"].asInt(13000)
+                val ip = extractSimIp(regionData)
+                val regionHandle = extractRegionHandle(regionData)
+                val position = info["Position"].asVec3OrNull()
+                val lookAt = info["LookAt"].asVec3OrNull()
+                if (ip.isNotBlank() && port in 1..65535) {
+                    _capsEvents.tryEmit(
+                        CapsEvent.CrossedRegion(
+                            simIp = ip,
+                            simPort = port,
+                            seedCap = seed,
+                            regionHandle = regionHandle,
+                            position = position,
+                            lookAt = lookAt
+                        )
+                    )
+                }
+            }
+            "TeleportFailed" -> {
+                val info = body["Info"].asList().firstOrNull()
+                    ?: body["Info"].takeIf { it is LlsdValue.MapVal }
+                    ?: body
+                val alertMsg = body["AlertInfo"].asList().firstOrNull()?.get("Message")?.asString().orEmpty()
+                val reason = info["Reason"].asString().trim()
+                    .ifBlank { alertMsg.trim().ifBlank { "Teleport failed" } }
+                _capsEvents.tryEmit(CapsEvent.TeleportFailed(reason))
             }
             "ParcelProperties" -> {
                 val parcelData = body["ParcelData"].asList().firstOrNull() ?: return
@@ -673,7 +759,8 @@ class CapabilityManager(
                                             parentId = folderId,
                                             name = item["name"].asString("Unnamed Item"),
                                             assetType = item["type"].asInt(0),
-                                            description = item["desc"].asString()
+                                            description = item["desc"].asString(),
+                                            assetId = item["asset_id"].asUuidOrNull()
                                         )
                                     )
                                 }

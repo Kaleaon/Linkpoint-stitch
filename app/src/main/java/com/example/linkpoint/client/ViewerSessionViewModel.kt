@@ -34,6 +34,7 @@ import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
 import com.example.linkpoint.protocol.SlBinaryParsers
+import com.example.linkpoint.protocol.SlurlParser
 import com.example.linkpoint.protocol.XmlRpcLoginClient
 import com.example.linkpoint.render.LinkpointGlRenderer
 import com.example.linkpoint.render.RenderSceneSnapshot
@@ -139,10 +140,26 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val savedAccount: SavedAccountEntity?,
         val mfaHash: String = ""
     )
+    private data class PendingRegionTeleport(
+        val targetRegionName: String,
+        val position: Vec3,
+        val requestedAtMs: Long = System.currentTimeMillis()
+    )
+
     private var lastLoginAttempt: LoginAttemptSpec? = null
     private var loginJob: Job? = null
+    private var handoffJob: Job? = null
+    private var pendingTeleportTimeoutJob: Job? = null
+    @Volatile private var pendingRegionTeleport: PendingRegionTeleport? = null
     private var lastRegionGridX: Int = 1000
     private var lastRegionGridY: Int = 1000
+
+    private val sandboxMapRegions = listOf(
+        MapRegionTile(1000, 1000, "Linkpoint Archipelago", "PG", 3),
+        MapRegionTile(1001, 1000, "Harbor Reach", "PG", 1),
+        MapRegionTile(1000, 1001, "Obsidian Spire", "Mature", 2),
+        MapRegionTile(999, 1000, "Emerald Cove", "PG", 0)
+    )
 
     init {
         viewModelScope.launch {
@@ -199,6 +216,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             } else conn
                             s.copy(
                                 connection = updatedConn,
+                                isTeleporting = false,
+                                teleportStatusMessage = null,
                                 localChat = (s.localChat + ChatMessage(
                                     speaker = "Region",
                                     text = "Connected to ${evt.regionName} (Water ${evt.waterHeight}m)",
@@ -525,11 +544,89 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             else -> "Region"
                         }
                         val tile = MapRegionTile(evt.x, evt.y, evt.name, accessLabel, evt.agents)
+                        if (evt.name.equals(currentRegionName(), ignoreCase = true)) {
+                            lastRegionGridX = evt.x
+                            lastRegionGridY = evt.y
+                        }
                         _state.update { s ->
-                            val next = (s.mapRegions.filterNot { it.gridX == evt.x && it.gridY == evt.y } + tile)
-                                .takeLast(48)
+                            val next = (s.mapRegions.filterNot {
+                                (it.gridX == evt.x && it.gridY == evt.y) || it.name.equals(evt.name, ignoreCase = true)
+                            } + tile).takeLast(64)
                             s.copy(mapRegions = next)
                         }
+                        val pending = pendingRegionTeleport
+                        if (pending != null && evt.name.equals(pending.targetRegionName, ignoreCase = true)) {
+                            pendingRegionTeleport = null
+                            pendingTeleportTimeoutJob?.cancel()
+                            val handle = LludpPackets.toRegionHandle(evt.x, evt.y)
+                            _state.update {
+                                it.copy(
+                                    isTeleporting = true,
+                                    teleportStatusMessage = "Teleporting to ${evt.name} <${pending.position.x.toInt()}, ${pending.position.y.toInt()}, ${pending.position.z.toInt()}>..."
+                                )
+                            }
+                            lludpEngine.sendTeleportLocation(handle, pending.position)
+                            scheduleTeleportWatchdog(evt.name)
+                        }
+                    }
+                    is SimEvent.MapSearchNotFound -> {
+                        val pending = pendingRegionTeleport
+                        if (pending != null && evt.queryName.equals(pending.targetRegionName, ignoreCase = true)) {
+                            pendingRegionTeleport = null
+                            pendingTeleportTimeoutJob?.cancel()
+                            failTeleport("Region \"${pending.targetRegionName}\" was not found on the grid.")
+                        }
+                    }
+                    is SimEvent.TeleportProgressReceived -> {
+                        _state.update {
+                            it.copy(
+                                isTeleporting = true,
+                                teleportStatusMessage = evt.message.ifBlank { "Teleporting..." }
+                            )
+                        }
+                    }
+                    is SimEvent.TeleportFailedReceived -> {
+                        val detail = if (evt.alertMessages.isNotEmpty()) {
+                            "${evt.reason} (${evt.alertMessages.joinToString("; ")})"
+                        } else {
+                            evt.reason
+                        }
+                        failTeleport(detail)
+                    }
+                    is SimEvent.TeleportLocalReceived -> {
+                        pendingRegionTeleport = null
+                        pendingTeleportTimeoutJob?.cancel()
+                        val currentSelf = avatars[selfAgentId]
+                        val nextYaw = if (hypot(evt.lookAt.x, evt.lookAt.y) > 1e-3f) {
+                            atan2(evt.lookAt.y, evt.lookAt.x)
+                        } else {
+                            currentSelf?.yaw ?: 0f
+                        }
+                        if (currentSelf != null) {
+                            avatars[selfAgentId] = currentSelf.copy(
+                                position = evt.position,
+                                yaw = nextYaw,
+                                isSitting = false
+                            )
+                        }
+                        lludpEngine.avatarPos = evt.position
+                        lludpEngine.avatarYaw = nextYaw
+                        hasServerSelfPosition = true
+                        lastServerSelfZ = evt.position.z
+                        verticalVelocityZ = 0f
+                        renderer.focusOverride = null
+                        renderer.resetOrbitView(alignYaw = nextYaw)
+                        _state.update {
+                            it.copy(
+                                avatarPosition = evt.position,
+                                isSitting = false,
+                                isTeleporting = false,
+                                teleportStatusMessage = null
+                            )
+                        }
+                        refreshNearbyRadar()
+                        pushSceneSnapshot()
+                        showToast("Teleported to <${evt.position.x.toInt()}, ${evt.position.y.toInt()}, ${evt.position.z.toInt()}>")
                     }
                     is SimEvent.PingUpdated -> {
                         _state.update { s ->
@@ -575,7 +672,29 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         ChatMessage(speaker = evt.title, text = evt.message, isSystem = true)
                     )
                     is CapsEvent.TeleportFinish -> {
-                        showToast("Arrived at simulator ${evt.simIp}:${evt.simPort}")
+                        performSimulatorHandoff(
+                            simIp = evt.simIp,
+                            simPort = evt.simPort,
+                            seedCap = evt.seedCap,
+                            regionHandle = evt.regionHandle,
+                            isTeleport = true,
+                            newPosition = null,
+                            newLookAt = null
+                        )
+                    }
+                    is CapsEvent.CrossedRegion -> {
+                        performSimulatorHandoff(
+                            simIp = evt.simIp,
+                            simPort = evt.simPort,
+                            seedCap = evt.seedCap,
+                            regionHandle = evt.regionHandle,
+                            isTeleport = false,
+                            newPosition = evt.position,
+                            newLookAt = evt.lookAt
+                        )
+                    }
+                    is CapsEvent.TeleportFailed -> {
+                        failTeleport(evt.reason)
                     }
                     is CapsEvent.HealthChanged -> {
                         _state.update { s ->
@@ -1188,16 +1307,13 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             InventoryEntry(manualHudAttachments[9034]!!.uuid, hudsFolder, "EEP Atmosphere HUD", false, 6, isWorn = true, attachmentPoint = 34),
             InventoryEntry(manualHudAttachments[9036]!!.uuid, hudsFolder, "Avatar Outfit & Tint HUD", false, 6, isWorn = true, attachmentPoint = 36),
             InventoryEntry(UUID.randomUUID(), outfitsFolder, "Obsidian Telemetry Jacket", false, 5, isWorn = true, attachmentPoint = 5),
-            InventoryEntry(UUID.randomUUID(), landmarksFolder, "Linkpoint Welcome Deck", false, 3),
-            InventoryEntry(UUID.randomUUID(), landmarksFolder, "Harbor Signal Spire", false, 3)
+            InventoryEntry(UUID.randomUUID(), landmarksFolder, "Linkpoint Welcome Deck", false, 3, assetId = UUID.randomUUID()),
+            InventoryEntry(UUID.randomUUID(), landmarksFolder, "Harbor Signal Spire", false, 3, assetId = UUID.randomUUID())
         )
 
-        val sandboxMap = listOf(
-            MapRegionTile(1000, 1000, "Linkpoint Archipelago", "PG", 3),
-            MapRegionTile(1001, 1000, "Harbor Reach", "PG", 1),
-            MapRegionTile(1000, 1001, "Obsidian Spire", "Mature", 2),
-            MapRegionTile(999, 1000, "Emerald Cove", "PG", 0)
-        )
+        pendingRegionTeleport = null
+        pendingTeleportTimeoutJob?.cancel()
+        handoffJob?.cancel()
 
         _state.update { s ->
             s.copy(
@@ -1206,9 +1322,11 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 parcelName = "Linkpoint Welcome Deck (Local Preview)",
                 isFlying = false,
                 isSitting = false,
+                isTeleporting = false,
+                teleportStatusMessage = null,
                 inventoryEntries = sandboxInventory,
                 expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
-                mapRegions = sandboxMap,
+                mapRegions = sandboxMapRegions,
                 localChat = listOf(
                     ChatMessage(
                         speaker = "Linkpoint Sandbox",
@@ -1228,6 +1346,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
     override fun disconnect() {
         simLoopJob?.cancel()
+        handoffJob?.cancel()
+        pendingTeleportTimeoutJob?.cancel()
+        pendingRegionTeleport = null
         lludpEngine.disconnect(sendLogout = true)
         capabilityManager.shutdown()
         assetManager.clearSession()
@@ -1250,7 +1371,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 projectedNametags = emptyList(),
                 activeKeyboardHint = null,
                 scriptDialog = null,
-                hudEditMode = false
+                hudEditMode = false,
+                isTeleporting = false,
+                teleportStatusMessage = null
             )
         }
     }
@@ -1942,42 +2065,373 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         appendImMessage(sessionId, convo.peerAgentId, convo.peerName, selfAvatarName, trimmed)
     }
 
-    override fun searchMapRegions(query: String) {
-        val conn = _state.value.connection
-        if (conn is ConnectionState.Connected) {
-            lludpEngine.requestMapBlocks(1000, 1000)
-            showToast("Requested map blocks for \"$query\"")
+    private fun scheduleTeleportWatchdog(destinationLabel: String) {
+        pendingTeleportTimeoutJob?.cancel()
+        pendingTeleportTimeoutJob = viewModelScope.launch {
+            delay(20000L)
+            if (_state.value.isTeleporting) {
+                failTeleport("Teleport to $destinationLabel timed out waiting for simulator response.")
+            }
+        }
+    }
+
+    private fun failTeleport(reason: String) {
+        pendingRegionTeleport = null
+        pendingTeleportTimeoutJob?.cancel()
+        val msg = reason.trim().ifBlank { "Teleport failed." }
+        _state.update {
+            it.copy(
+                isTeleporting = false,
+                teleportStatusMessage = null
+            )
+        }
+        appendLocalChat(ChatMessage(speaker = "Teleport", text = "Teleport failed: $msg", isSystem = true))
+        showToast("Teleport failed: $msg")
+    }
+
+    private fun performSimulatorHandoff(
+        simIp: String,
+        simPort: Int,
+        seedCap: String,
+        regionHandle: Long,
+        isTeleport: Boolean,
+        newPosition: Vec3?,
+        newLookAt: Vec3?
+    ) {
+        pendingRegionTeleport = null
+        pendingTeleportTimeoutJob?.cancel()
+        handoffJob?.cancel()
+
+        if (regionHandle != 0L) {
+            lastRegionGridX = LludpPackets.regionHandleToGridX(regionHandle)
+            lastRegionGridY = LludpPackets.regionHandleToGridY(regionHandle)
+        }
+
+        val cachedTile = _state.value.mapRegions.lastOrNull {
+            it.gridX == lastRegionGridX && it.gridY == lastRegionGridY
+        }
+
+        val selfAv = avatars[selfAgentId]
+        val resolvedYaw = if (newLookAt != null && hypot(newLookAt.x, newLookAt.y) > 1e-3f) {
+            atan2(newLookAt.y, newLookAt.x)
         } else {
-            showToast("Showing local sandbox regions matching \"$query\"")
+            selfAv?.yaw ?: 0f
+        }
+        val resolvedPos = newPosition ?: selfAv?.position ?: _state.value.avatarPosition
+
+        // Clear region-scoped prims, localId overrides, and non-self avatars from departing simulator
+        allSceneObjects.clear()
+        capsAttachmentOverridesByLocalId.clear()
+        requestedProfiles.clear()
+        avatars.clear()
+        if (selfAv != null) {
+            avatars[selfAgentId] = selfAv.copy(
+                position = resolvedPos,
+                yaw = resolvedYaw,
+                isSitting = if (isTeleport) false else selfAv.isSitting
+            )
+        }
+        if (isTeleport) {
+            terrain = TerrainGrid(gridSize = 65, waterHeight = terrain.waterHeight)
+            hasServerSelfPosition = false
+            verticalVelocityZ = 0f
+            renderer.focusOverride = null
+            renderer.resetOrbitView(alignYaw = resolvedYaw)
+        } else if (newPosition != null) {
+            lludpEngine.avatarPos = newPosition
+            lludpEngine.avatarYaw = resolvedYaw
+            hasServerSelfPosition = true
+            lastServerSelfZ = newPosition.z
+        }
+
+        lludpEngine.switchSimulator(
+            newSimIp = simIp,
+            newSimPort = simPort,
+            newSeedCapability = seedCap,
+            newRegionHandle = regionHandle
+        )
+
+        _state.update { s ->
+            val conn = s.connection
+            val updatedConn = if (conn is ConnectionState.Connected) {
+                conn.copy(
+                    simIp = simIp,
+                    simPort = simPort,
+                    regionName = cachedTile?.name ?: conn.regionName
+                )
+            } else conn
+            s.copy(
+                connection = updatedConn,
+                avatarPosition = resolvedPos,
+                isSitting = if (isTeleport) false else s.isSitting,
+                selectedObject = null,
+                selectedAvatarId = null,
+                nearbyAvatars = emptyList(),
+                projectedNametags = emptyList(),
+                isTeleporting = isTeleport,
+                teleportStatusMessage = if (isTeleport) "Connecting to ${cachedTile?.name ?: "$simIp:$simPort"}..." else null,
+                connectionHealth = s.connectionHealth.copy(
+                    lludpStatus = LayerHealthStatus.CONNECTING,
+                    lludpDetail = "Handshaking $simIp:$simPort...",
+                    capsStatus = if (seedCap.isNotBlank()) LayerHealthStatus.CONNECTING else LayerHealthStatus.DEGRADED,
+                    capsDetail = if (seedCap.isNotBlank()) "Negotiating destination CAPS..." else "No destination Seed CAPS"
+                )
+            )
+        }
+        pushSceneSnapshot()
+
+        handoffJob = viewModelScope.launch {
+            if (seedCap.isNotBlank()) {
+                val capsRes = capabilityManager.requestSeedCapabilities(seedCap)
+                assetManager.configureCapabilities(capsRes.capabilities)
+                capsRes.diagnostics.forEach { appendDiagnostic(it) }
+                if (capsRes.capabilities.containsKey("AttachmentResources")) {
+                    launch { capabilityManager.fetchAttachmentResources() }
+                }
+            } else {
+                capabilityManager.shutdown()
+                assetManager.configureCapabilities(emptyMap())
+            }
+
+            val destName = (_state.value.connection as? ConnectionState.Connected)?.regionName ?: "$simIp:$simPort"
+            _state.update { s ->
+                s.copy(
+                    isTeleporting = false,
+                    teleportStatusMessage = null
+                )
+            }
+            val actionVerb = if (isTeleport) "Arrived at" else "Crossed into"
+            appendLocalChat(
+                ChatMessage(
+                    speaker = "Region Handoff",
+                    text = "$actionVerb $destName ($simIp:$simPort)",
+                    isSystem = true
+                )
+            )
+            showToast("$actionVerb $destName")
+            refreshNearbyRadar()
+            pushSceneSnapshot()
+        }
+    }
+
+    override fun openSlurl(slurl: String) {
+        val parsed = SlurlParser.parse(slurl)
+        if (parsed == null) {
+            showToast("Invalid SLURL: ${slurl.take(48)}")
+            return
+        }
+        _state.update { s ->
+            s.copy(
+                mapTargetRegion = parsed.regionName,
+                mapTargetX = parsed.x,
+                mapTargetY = parsed.y,
+                mapTargetZ = parsed.z,
+                mapTargetRevision = s.mapTargetRevision + 1
+            )
+        }
+        val conn = _state.value.connection
+        if (conn is ConnectionState.Connected || conn is ConnectionState.LocalSandbox) {
+            teleportToRegion(parsed.regionName, parsed.x, parsed.y, parsed.z)
+        } else {
+            showToast("SLURL ready: ${parsed.regionName} <${parsed.x}, ${parsed.y}, ${parsed.z}>")
+        }
+    }
+
+    override fun searchMapRegions(query: String) {
+        val trimmed = query.trim()
+        val conn = _state.value.connection
+
+        if (SlurlParser.isPotentialSlurl(trimmed)) {
+            val parsed = SlurlParser.parse(trimmed)
+            if (parsed == null) {
+                showToast("Invalid SLURL format")
+                return
+            }
+            _state.update { s ->
+                s.copy(
+                    mapTargetRegion = parsed.regionName,
+                    mapTargetX = parsed.x,
+                    mapTargetY = parsed.y,
+                    mapTargetZ = parsed.z,
+                    mapTargetRevision = s.mapTargetRevision + 1
+                )
+            }
+            if (conn is ConnectionState.Connected) {
+                lludpEngine.requestMapName(parsed.regionName)
+                showToast("SLURL target: ${parsed.regionName} <${parsed.x}, ${parsed.y}, ${parsed.z}>")
+            } else {
+                val matching = sandboxMapRegions.filter { it.name.contains(parsed.regionName, ignoreCase = true) }
+                val nextTiles = matching.ifEmpty {
+                    listOf(MapRegionTile(1000, 1000, parsed.regionName, "PG", 1)) + sandboxMapRegions
+                }
+                _state.update { it.copy(mapRegions = nextTiles) }
+                showToast("SLURL target: ${parsed.regionName} <${parsed.x}, ${parsed.y}, ${parsed.z}>")
+            }
+            return
+        }
+
+        if (conn is ConnectionState.Connected) {
+            if (trimmed.isBlank()) {
+                lludpEngine.requestMapBlocks(lastRegionGridX, lastRegionGridY)
+                showToast("Refreshing nearby map regions...")
+            } else {
+                lludpEngine.requestMapName(trimmed)
+                showToast("Searching world map for \"$trimmed\"...")
+            }
+        } else {
+            val filtered = if (trimmed.isBlank()) {
+                sandboxMapRegions
+            } else {
+                sandboxMapRegions.filter { it.name.contains(trimmed, ignoreCase = true) }
+            }
+            _state.update { it.copy(mapRegions = filtered) }
+            showToast(
+                if (trimmed.isBlank()) "Showing all local sandbox regions"
+                else "Found ${filtered.size} sandbox region(s) matching \"$trimmed\""
+            )
         }
     }
 
     override fun teleportToRegion(regionName: String, x: Int, y: Int, z: Int) {
-        val clampedX = x.coerceIn(4, 252).toFloat()
-        val clampedY = y.coerceIn(4, 252).toFloat()
-        val clampedZ = z.coerceIn(18, 240).toFloat()
-        if (_state.value.connection is ConnectionState.Connected) {
-            val handle = (1000L shl 32) or 1000L
-            lludpEngine.sendTeleportLocation(handle, Vec3(clampedX, clampedY, clampedZ))
-            showToast("Teleporting to $regionName <$x, $y, $z>...")
+        val slurlOverride = if (SlurlParser.isPotentialSlurl(regionName)) SlurlParser.parse(regionName) else null
+        val targetRegion = (slurlOverride?.regionName ?: regionName).trim().ifBlank { currentRegionName() }
+        val effX = slurlOverride?.x ?: x
+        val effY = slurlOverride?.y ?: y
+        val effZ = slurlOverride?.z ?: z
+
+        val clampedX = effX.coerceIn(0, 256).toFloat()
+        val clampedY = effY.coerceIn(0, 256).toFloat()
+        val clampedZ = effZ.coerceIn(0, 4096).toFloat()
+        val targetVec = Vec3(clampedX, clampedY, clampedZ)
+
+        val conn = _state.value.connection
+        if (conn is ConnectionState.Connected) {
+            pendingTeleportTimeoutJob?.cancel()
+            val knownTile = _state.value.mapRegions.lastOrNull {
+                it.name.equals(targetRegion, ignoreCase = true)
+            }
+            when {
+                knownTile != null -> {
+                    pendingRegionTeleport = null
+                    val handle = LludpPackets.toRegionHandle(knownTile.gridX, knownTile.gridY)
+                    _state.update {
+                        it.copy(
+                            isTeleporting = true,
+                            teleportStatusMessage = "Teleporting to ${knownTile.name} <${clampedX.toInt()}, ${clampedY.toInt()}, ${clampedZ.toInt()}>..."
+                        )
+                    }
+                    lludpEngine.sendTeleportLocation(handle, targetVec)
+                    scheduleTeleportWatchdog(knownTile.name)
+                    showToast("Teleporting to ${knownTile.name} <${clampedX.toInt()}, ${clampedY.toInt()}, ${clampedZ.toInt()}>...")
+                }
+                targetRegion.equals(conn.regionName, ignoreCase = true) -> {
+                    pendingRegionTeleport = null
+                    val handle = LludpPackets.toRegionHandle(lastRegionGridX, lastRegionGridY)
+                    _state.update {
+                        it.copy(
+                            isTeleporting = true,
+                            teleportStatusMessage = "Teleporting within $targetRegion <${clampedX.toInt()}, ${clampedY.toInt()}, ${clampedZ.toInt()}>..."
+                        )
+                    }
+                    lludpEngine.sendTeleportLocation(handle, targetVec)
+                    scheduleTeleportWatchdog(targetRegion)
+                    showToast("Teleporting to $targetRegion <${clampedX.toInt()}, ${clampedY.toInt()}, ${clampedZ.toInt()}>...")
+                }
+                else -> {
+                    pendingRegionTeleport = PendingRegionTeleport(targetRegion, targetVec)
+                    _state.update {
+                        it.copy(
+                            isTeleporting = true,
+                            teleportStatusMessage = "Resolving region \"$targetRegion\" on world map..."
+                        )
+                    }
+                    lludpEngine.requestMapName(targetRegion)
+                    pendingTeleportTimeoutJob = viewModelScope.launch {
+                        delay(8000L)
+                        val stillPending = pendingRegionTeleport
+                        if (stillPending != null && stillPending.targetRegionName.equals(targetRegion, ignoreCase = true)) {
+                            pendingRegionTeleport = null
+                            failTeleport("Could not resolve region \"$targetRegion\" on the world map.")
+                        }
+                    }
+                    showToast("Resolving region \"$targetRegion\"...")
+                }
+            }
         } else {
             val self = avatars[selfAgentId] ?: return
-            val ground = terrain.sampleWorldHeight(clampedX, clampedY) + self.heightMeters * 0.50f
-            val targetZ = clampedZ.coerceAtLeast(ground)
-            avatars[selfAgentId] = self.copy(position = Vec3(clampedX, clampedY, targetZ), isFlying = targetZ > ground + 1f)
-            _state.update {
-                it.copy(
-                    avatarPosition = Vec3(clampedX, clampedY, targetZ),
-                    parcelName = regionName.ifBlank { it.parcelName }
+            val safeX = clampedX.coerceIn(4f, 252f)
+            val safeY = clampedY.coerceIn(4f, 252f)
+            val ground = terrain.sampleWorldHeight(safeX, safeY) + self.heightMeters * 0.50f
+            val targetZ = clampedZ.coerceIn(ground, 512f)
+            val nextPos = Vec3(safeX, safeY, targetZ)
+            avatars[selfAgentId] = self.copy(position = nextPos, isFlying = targetZ > ground + 1f, isSitting = false)
+            renderer.focusOverride = null
+            renderer.resetOrbitView(alignYaw = self.yaw)
+            _state.update { s ->
+                val updatedConn = (s.connection as? ConnectionState.LocalSandbox)?.copy(
+                    regionName = targetRegion.ifBlank { s.connection.regionName }
+                ) ?: s.connection
+                s.copy(
+                    connection = updatedConn,
+                    avatarPosition = nextPos,
+                    parcelName = targetRegion.ifBlank { s.parcelName },
+                    isSitting = false,
+                    isTeleporting = false,
+                    teleportStatusMessage = null
                 )
             }
             pushSceneSnapshot()
-            showToast("Teleported to $regionName <$x, $y, ${targetZ.toInt()}>")
+            showToast("Teleported to $targetRegion <${safeX.toInt()}, ${safeY.toInt()}, ${targetZ.toInt()}>")
         }
     }
 
     override fun teleportHome() {
-        teleportToRegion(currentRegionName(), 128, 124, 26)
+        val conn = _state.value.connection
+        if (conn is ConnectionState.Connected) {
+            pendingRegionTeleport = null
+            pendingTeleportTimeoutJob?.cancel()
+            _state.update {
+                it.copy(
+                    isTeleporting = true,
+                    teleportStatusMessage = "Teleporting Home..."
+                )
+            }
+            lludpEngine.sendTeleportHome()
+            scheduleTeleportWatchdog("Home")
+            showToast("Teleporting Home...")
+        } else {
+            teleportToRegion("Linkpoint Archipelago", 128, 124, 26)
+        }
+    }
+
+    override fun teleportToLandmark(itemOrAssetId: UUID, name: String) {
+        val entry = _state.value.inventoryEntries.firstOrNull {
+            it.id == itemOrAssetId || it.assetId == itemOrAssetId
+        }
+        val landmarkAssetId = entry?.assetId ?: itemOrAssetId
+        val label = name.trim().ifBlank { entry?.name ?: "Landmark" }
+
+        val conn = _state.value.connection
+        if (conn is ConnectionState.Connected) {
+            pendingRegionTeleport = null
+            pendingTeleportTimeoutJob?.cancel()
+            _state.update {
+                it.copy(
+                    isTeleporting = true,
+                    teleportStatusMessage = "Teleporting to $label..."
+                )
+            }
+            lludpEngine.sendTeleportLandmark(landmarkAssetId)
+            scheduleTeleportWatchdog(label)
+            showToast("Teleporting to $label...")
+        } else {
+            val (lx, ly, lz) = if (label.contains("Spire", ignoreCase = true)) {
+                Triple(148, 152, 34)
+            } else {
+                Triple(128, 124, 26)
+            }
+            teleportToRegion(label, lx, ly, lz)
+        }
     }
 
     override fun saveCurrentLandmark(name: String) {
@@ -2014,7 +2468,14 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     _state.update { s ->
                         val existingIds = s.inventoryEntries.map { it.id }.toSet()
                         val newNodes = fetched.filterNot { it.itemId in existingIds }.map {
-                            InventoryEntry(it.itemId, it.parentId, it.name, false, it.assetType)
+                            InventoryEntry(
+                                id = it.itemId,
+                                parentId = it.parentId,
+                                name = it.name,
+                                isFolder = false,
+                                assetType = it.assetType,
+                                assetId = it.assetId
+                            )
                         }
                         s.copy(inventoryEntries = s.inventoryEntries + newNodes)
                     }

@@ -85,6 +85,8 @@ interface ViewerClient {
     fun searchMapRegions(query: String)
     fun teleportToRegion(regionName: String, x: Int, y: Int, z: Int)
     fun teleportHome()
+    fun teleportToLandmark(itemOrAssetId: UUID, name: String = "Landmark")
+    fun openSlurl(slurl: String)
     fun saveCurrentLandmark(name: String)
     fun deleteLandmark(landmarkId: String)
     fun toggleInventoryFolder(folderId: UUID)
