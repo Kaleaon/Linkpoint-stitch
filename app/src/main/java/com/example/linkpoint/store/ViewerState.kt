@@ -135,6 +135,7 @@ data class ScriptPermissionPrompt(
     val objectName: String,
     val ownerName: String,
     val questions: Int,
+    val experienceId: UUID = UUID(0L, 0L),
     val permissions: List<ScriptAndEconomyProtocol.LslPermissionInfo> =
         ScriptAndEconomyProtocol.decodePermissionFlags(questions),
     val hasDebitPermission: Boolean = ScriptAndEconomyProtocol.hasDebitPermission(questions)

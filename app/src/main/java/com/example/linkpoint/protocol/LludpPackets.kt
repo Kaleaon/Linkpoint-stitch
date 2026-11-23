@@ -88,14 +88,24 @@ object LludpPackets {
     const val CONTROL_TURN_LEFT = 1 shl 25      // 0x02000000 A / Left (Turn Left explicit)
     const val CONTROL_TURN_RIGHT = 1 shl 26     // 0x04000000 D / Right (Turn Right explicit)
 
-    // Standard LSL ScriptQuestion Permission Bitflags
+    // Canonical LSL ScriptQuestion Runtime Permission Bitflags (`secondlife/lsl-definitions`)
     const val PERMISSION_DEBIT: Int = ScriptAndEconomyProtocol.PERMISSION_DEBIT
     const val PERMISSION_TAKE_CONTROLS: Int = ScriptAndEconomyProtocol.PERMISSION_TAKE_CONTROLS
+    const val PERMISSION_REMAP_CONTROLS: Int = ScriptAndEconomyProtocol.PERMISSION_REMAP_CONTROLS
     const val PERMISSION_TRIGGER_ANIMATION: Int = ScriptAndEconomyProtocol.PERMISSION_TRIGGER_ANIMATION
     const val PERMISSION_ATTACH: Int = ScriptAndEconomyProtocol.PERMISSION_ATTACH
+    const val PERMISSION_RELEASE_OWNERSHIP: Int = ScriptAndEconomyProtocol.PERMISSION_RELEASE_OWNERSHIP
+    const val PERMISSION_CHANGE_LINKS: Int = ScriptAndEconomyProtocol.PERMISSION_CHANGE_LINKS
+    const val PERMISSION_CHANGE_JOINTS: Int = ScriptAndEconomyProtocol.PERMISSION_CHANGE_JOINTS
+    const val PERMISSION_CHANGE_PERMISSIONS: Int = ScriptAndEconomyProtocol.PERMISSION_CHANGE_PERMISSIONS
     const val PERMISSION_TRACK_CAMERA: Int = ScriptAndEconomyProtocol.PERMISSION_TRACK_CAMERA
     const val PERMISSION_CONTROL_CAMERA: Int = ScriptAndEconomyProtocol.PERMISSION_CONTROL_CAMERA
     const val PERMISSION_TELEPORT: Int = ScriptAndEconomyProtocol.PERMISSION_TELEPORT
+    const val PERMISSION_EXPERIENCE: Int = ScriptAndEconomyProtocol.PERMISSION_EXPERIENCE
+    const val PERMISSION_SILENT_ESTATE_MANAGEMENT: Int = ScriptAndEconomyProtocol.PERMISSION_SILENT_ESTATE_MANAGEMENT
+    const val PERMISSION_OVERRIDE_ANIMATIONS: Int = ScriptAndEconomyProtocol.PERMISSION_OVERRIDE_ANIMATIONS
+    const val PERMISSION_RETURN_OBJECTS: Int = ScriptAndEconomyProtocol.PERMISSION_RETURN_OBJECTS
+    const val PERMISSION_CONTROL_MUTE_LIST: Int = ScriptAndEconomyProtocol.PERMISSION_CONTROL_MUTE_LIST
 
     // Standard L$ Economy Transaction Types
     const val TRANS_PAY_GIFT: Int = ScriptAndEconomyProtocol.TRANS_PAY_GIFT
@@ -626,6 +636,9 @@ object LludpPackets {
         putUuid(buf, targetAvatarId)
         return buf.array()
     }
+
+    fun isMessageZeroCoded(messageId: Int): Boolean =
+        ScriptAndEconomyProtocol.isMessageZeroCoded(messageId)
 
     fun parseScriptQuestion(buf: ByteBuffer): ScriptAndEconomyProtocol.ParsedScriptQuestion? =
         ScriptAndEconomyProtocol.parseScriptQuestion(buf)

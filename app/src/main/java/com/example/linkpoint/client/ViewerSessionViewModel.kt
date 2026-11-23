@@ -504,6 +504,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                     objectName = evt.objectName,
                                     ownerName = evt.objectOwner,
                                     questions = evt.questions,
+                                    experienceId = evt.experienceId,
                                     permissions = evt.permissions,
                                     hasDebitPermission = evt.hasDebitPermission
                                 )
@@ -2152,7 +2153,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
     override fun respondScriptPermission(grant: Boolean) {
         val prompt = _state.value.scriptQuestion ?: return
-        val answerMask = if (grant) prompt.questions else 0
+        val answerMask = ScriptAndEconomyProtocol.resolveScriptAnswerQuestions(prompt.questions, grant)
         if (_state.value.connection is ConnectionState.Connected) {
             lludpEngine.sendScriptAnswerYes(prompt.taskId, prompt.itemId, answerMask)
         }

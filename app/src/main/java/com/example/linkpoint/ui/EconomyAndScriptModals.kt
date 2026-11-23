@@ -332,7 +332,8 @@ fun ScriptDialogModal(
 
 /**
  * LSL `ScriptQuestion` permission prompt modal.
- * Displays human-readable permission labels and highlights `PERMISSION_DEBIT` in error/warning colors.
+ * Displays human-readable `secondlife/lsl-definitions` permission labels, category badges (`AO`,
+ * `EXPERIENCE`, `ESTATE`, `LAND`, `MUTE LIST`, `EXTENDED`), and highlights `PERMISSION_DEBIT` in error/warning colors.
  */
 @Composable
 fun ScriptPermissionModal(
@@ -341,8 +342,12 @@ fun ScriptPermissionModal(
 ) {
     val tokens = LocalLinkpointDesign.current
     val isDebit = prompt.hasDebitPermission
+    val hasExperience = prompt.experienceId.mostSignificantBits != 0L || prompt.experienceId.leastSignificantBits != 0L
     val headerAccent = if (isDebit) tokens.statusError else tokens.accentPrimary
     val rowShape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(10.dp))
+    val maskHex = remember(prompt.questions) {
+        ScriptAndEconomyProtocol.formatPermissionBitmask(prompt.questions)
+    }
 
     Dialog(
         onDismissRequest = client::dismissScriptPermission,
@@ -384,12 +389,17 @@ fun ScriptPermissionModal(
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis
                     )
-                    Text(
-                        text = if (prompt.ownerName.isNotBlank()) {
-                            "Owned by ${prompt.ownerName} • Requests LSL Permissions"
+                    val subtitleParts = buildList {
+                        if (prompt.ownerName.isNotBlank()) {
+                            add("Owned by ${prompt.ownerName}")
                         } else {
-                            "Scripted object requests LSL permissions"
-                        },
+                            add("Scripted object")
+                        }
+                        add("Mask $maskHex")
+                        if (hasExperience) add("Experience")
+                    }
+                    Text(
+                        text = subtitleParts.joinToString(" • "),
                         style = MaterialTheme.typography.labelSmall.copy(
                             fontFamily = tokens.monoFont,
                             color = tokens.textSecondary,
@@ -433,17 +443,29 @@ fun ScriptPermissionModal(
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(max = 210.dp)
-                    .verticalScroll(rememberScrollState()),
+                    .heightIn(max = 220.dp)
+                    .verticalScroll(rememberScrollState())
+                    .testTag("script_perm_list"),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 prompt.permissions.forEach { perm ->
-                    val highlight = perm.isDebitWarning
-                    val borderCol = if (highlight) tokens.statusWarning else tokens.borderHairline
-                    val bgCol = if (highlight) {
-                        tokens.statusWarning.copy(alpha = 0.14f)
-                    } else {
-                        tokens.surfaceElevated.copy(alpha = 0.78f)
+                    val isDebitRow = perm.isDebitWarning
+                    val isCautionRow = perm.isCaution
+                    val permHex = ScriptAndEconomyProtocol.formatPermissionBitmask(perm.mask)
+                    val borderCol = when {
+                        isDebitRow -> tokens.statusWarning
+                        isCautionRow -> tokens.statusWarning.copy(alpha = 0.65f)
+                        else -> tokens.borderHairline
+                    }
+                    val bgCol = when {
+                        isDebitRow -> tokens.statusWarning.copy(alpha = 0.14f)
+                        isCautionRow -> tokens.statusWarning.copy(alpha = 0.08f)
+                        else -> tokens.surfaceElevated.copy(alpha = 0.78f)
+                    }
+                    val chipColor = when {
+                        isDebitRow -> tokens.statusError
+                        isCautionRow -> tokens.statusWarning
+                        else -> tokens.accentSecondary
                     }
                     Column(
                         modifier = Modifier
@@ -452,25 +474,34 @@ fun ScriptPermissionModal(
                             .background(bgCol)
                             .border(1.dp, borderCol, rowShape)
                             .padding(horizontal = 10.dp, vertical = 8.dp)
+                            .testTag("script_perm_row_$permHex")
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(6.dp)
                         ) {
-                            if (highlight) {
+                            perm.badgeLabel?.let { badge ->
                                 LinkpointStatusChip(
-                                    label = "DEBIT L$",
-                                    color = tokens.statusError
+                                    label = badge,
+                                    color = chipColor
                                 )
                             }
                             Text(
                                 text = perm.label,
                                 style = MaterialTheme.typography.bodyMedium.copy(
-                                    color = if (highlight) tokens.statusWarning else tokens.textPrimary,
+                                    color = if (isDebitRow) tokens.statusWarning else tokens.textPrimary,
                                     fontWeight = FontWeight.SemiBold
                                 )
                             )
                         }
+                        Text(
+                            text = "${perm.constantName} ($permHex)",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = tokens.monoFont,
+                                color = tokens.accentSecondary,
+                                fontSize = 10.sp
+                            )
+                        )
                         Text(
                             text = perm.detail,
                             style = MaterialTheme.typography.labelSmall.copy(

@@ -112,7 +112,8 @@ sealed class SimEvent {
         val objectOwner: String,
         val questions: Int,
         val permissions: List<ScriptAndEconomyProtocol.LslPermissionInfo>,
-        val hasDebitPermission: Boolean
+        val hasDebitPermission: Boolean,
+        val experienceId: UUID = UUID(0L, 0L)
     ) : SimEvent()
 
     data class ScriptDialogReceived(
@@ -523,7 +524,7 @@ class LludpCircuitEngine {
                         LludpPackets.MSG_MONEY_BALANCE_REQUEST,
                         LludpPackets.buildMoneyBalanceRequest(agentId, sessionId, UUID.randomUUID()),
                         reliable = true,
-                        zeroCode = true
+                        zeroCode = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_BALANCE_REQUEST)
                     )
                     handshakeCompleted.set(true)
                     emitHealth(
@@ -687,7 +688,8 @@ class LludpCircuitEngine {
                             objectOwner = parsed.objectOwner,
                             questions = parsed.questions,
                             permissions = parsed.permissions,
-                            hasDebitPermission = parsed.hasDebitPermission
+                            hasDebitPermission = parsed.hasDebitPermission,
+                            experienceId = parsed.experienceId
                         )
                     )
                 }
@@ -1351,7 +1353,12 @@ class LludpCircuitEngine {
     fun sendChat(message: String, chatType: Byte = 1, channel: Int = 0) {
         if (!running.get()) return
         val body = LludpPackets.buildChatFromViewer(agentId, sessionId, message, chatType, channel)
-        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true)
+        send(
+            LludpPackets.MSG_CHAT_FROM_VIEWER,
+            body,
+            reliable = true,
+            zeroCode = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_CHAT_FROM_VIEWER)
+        )
     }
 
     fun sendInstantMessage(toAgentId: UUID, imSessionId: UUID, fromName: String, message: String) {
@@ -1408,13 +1415,23 @@ class LludpCircuitEngine {
     fun sendScriptAnswerYes(taskId: UUID, itemId: UUID, questions: Int) {
         if (!running.get()) return
         val body = LludpPackets.buildScriptAnswerYes(agentId, sessionId, taskId, itemId, questions)
-        send(LludpPackets.MSG_SCRIPT_ANSWER_YES, body, reliable = true, zeroCode = false)
+        send(
+            LludpPackets.MSG_SCRIPT_ANSWER_YES,
+            body,
+            reliable = true,
+            zeroCode = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_SCRIPT_ANSWER_YES)
+        )
     }
 
     fun requestMoneyBalance() {
         if (!running.get()) return
         val body = LludpPackets.buildMoneyBalanceRequest(agentId, sessionId, UUID.randomUUID())
-        send(LludpPackets.MSG_MONEY_BALANCE_REQUEST, body, reliable = true, zeroCode = true)
+        send(
+            LludpPackets.MSG_MONEY_BALANCE_REQUEST,
+            body,
+            reliable = true,
+            zeroCode = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_BALANCE_REQUEST)
+        )
     }
 
     fun sendMoneyTransfer(
@@ -1440,7 +1457,12 @@ class LludpCircuitEngine {
             aggregatePermInventory = aggregatePermInventory,
             description = description
         )
-        send(LludpPackets.MSG_MONEY_TRANSFER_REQUEST, body, reliable = true, zeroCode = true)
+        send(
+            LludpPackets.MSG_MONEY_TRANSFER_REQUEST,
+            body,
+            reliable = true,
+            zeroCode = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_TRANSFER_REQUEST)
+        )
     }
 
     internal fun decodeAndDispatchForTesting(rawBytes: ByteArray, length: Int = rawBytes.size): Boolean {

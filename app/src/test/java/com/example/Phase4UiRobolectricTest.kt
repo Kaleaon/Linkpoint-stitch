@@ -17,6 +17,7 @@ import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
 import androidx.compose.ui.test.performTextReplacement
 import androidx.compose.ui.unit.dp
@@ -388,5 +389,70 @@ class Phase4UiRobolectricTest {
             Triple(residentAvatar.agentId, 250, "Awesome DJ set!"),
             fakeClient.lastPaidAvatar
         )
+    }
+
+    @Test
+    fun `renders AO PERMISSION_OVERRIDE_ANIMATIONS PERMISSION_CHANGE_LINKS and extended 0x02_0x20000 catalog in ScriptPermissionModal`() {
+        val fakeClient = FakeViewerClient()
+        val experienceId = UUID.fromString("eeeeeeee-1111-4222-8333-ffffffffffff")
+        val combinedAoAndExtendedMask =
+            LludpPackets.PERMISSION_OVERRIDE_ANIMATIONS or
+                LludpPackets.PERMISSION_CHANGE_LINKS or
+                LludpPackets.PERMISSION_CHANGE_JOINTS or
+                LludpPackets.PERMISSION_CHANGE_PERMISSIONS or
+                LludpPackets.PERMISSION_EXPERIENCE or
+                LludpPackets.PERMISSION_SILENT_ESTATE_MANAGEMENT or
+                LludpPackets.PERMISSION_RETURN_OBJECTS or
+                LludpPackets.PERMISSION_CONTROL_MUTE_LIST or
+                0x40000 // Unrecognized future Agni permission bit
+
+        val prompt = ScriptPermissionPrompt(
+            taskId = UUID.randomUUID(),
+            itemId = UUID.randomUUID(),
+            objectName = "Bento AO & Linkset Controller HUD",
+            ownerName = "Lyra Resident",
+            questions = combinedAoAndExtendedMask,
+            experienceId = experienceId
+        )
+
+        composeRule.setContent {
+            LinkpointTheme(designState = PersonalDesignState()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(LocalLinkpointDesign.current.canvasVoid)
+                        .padding(16.dp)
+                ) {
+                    ScriptPermissionModal(prompt = prompt, client = fakeClient)
+                }
+            }
+        }
+
+        composeRule.onNodeWithTag("script_permission_modal").assertIsDisplayed()
+        // Must NOT display the red PERMISSION_DEBIT scam banner when debit (0x02) is not requested
+        composeRule.onNodeWithTag("script_debit_warning_banner").assertDoesNotExist()
+
+        // Verify all canonical lsl_definitions.yaml labels & unknown higher bit formatting via scroll
+        val expectedLabels = listOf(
+            "Link and delink objects",
+            "Modify object joints",
+            "Modify object permissions",
+            "Act via region Experience",
+            "Manage estate settings silently",
+            "Override avatar animations (AO)",
+            "Return objects from land",
+            "Manage your mute/block list",
+            "Extended script permission (0x40000)"
+        )
+        for (label in expectedLabels) {
+            composeRule.onNodeWithText(label).performScrollTo().assertIsDisplayed()
+        }
+
+        // Scroll back to highlight AO & Linkset rows for visual verification screenshot
+        composeRule.onNodeWithText("Override avatar animations (AO)").performScrollTo().assertIsDisplayed()
+        saveCompositeWindowsScreenshot("/tmp/phase4_ao_extended_permissions.png")
+
+        composeRule.onNodeWithTag("script_perm_grant_button").performClick()
+        assertEquals(true, fakeClient.lastPermissionAnswer)
     }
 }

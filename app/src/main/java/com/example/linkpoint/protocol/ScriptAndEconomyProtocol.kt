@@ -12,7 +12,7 @@ import java.util.UUID
  */
 object ScriptAndEconomyProtocol {
 
-    // Canonical LSL Permission Bitmask Flags (llRequestPermissions / ScriptQuestion)
+    // Canonical LSL Permission Bitmask Flags (`secondlife/lsl-definitions` `lsl_definitions.yaml` / `ScriptQuestion`)
     const val PERMISSION_DEBIT: Int = 0x0002
     const val PERMISSION_TAKE_CONTROLS: Int = 0x0004
     const val PERMISSION_REMAP_CONTROLS: Int = 0x0008
@@ -29,6 +29,26 @@ object ScriptAndEconomyProtocol {
     const val PERMISSION_SILENT_ESTATE_MANAGEMENT: Int = 0x4000
     const val PERMISSION_OVERRIDE_ANIMATIONS: Int = 0x8000
     const val PERMISSION_RETURN_OBJECTS: Int = 0x10000
+    const val PERMISSION_CONTROL_MUTE_LIST: Int = 0x20000
+
+    const val ALL_LSL_DEFINITIONS_PERMISSIONS_MASK: Int =
+        PERMISSION_DEBIT or
+            PERMISSION_TAKE_CONTROLS or
+            PERMISSION_REMAP_CONTROLS or
+            PERMISSION_TRIGGER_ANIMATION or
+            PERMISSION_ATTACH or
+            PERMISSION_RELEASE_OWNERSHIP or
+            PERMISSION_CHANGE_LINKS or
+            PERMISSION_CHANGE_JOINTS or
+            PERMISSION_CHANGE_PERMISSIONS or
+            PERMISSION_TRACK_CAMERA or
+            PERMISSION_CONTROL_CAMERA or
+            PERMISSION_TELEPORT or
+            PERMISSION_EXPERIENCE or
+            PERMISSION_SILENT_ESTATE_MANAGEMENT or
+            PERMISSION_OVERRIDE_ANIMATIONS or
+            PERMISSION_RETURN_OBJECTS or
+            PERMISSION_CONTROL_MUTE_LIST
 
     // Canonical Second Life Economy Transaction Types (MoneyTransferRequest)
     const val TRANS_PAY_GIFT: Int = 5001
@@ -40,113 +60,189 @@ object ScriptAndEconomyProtocol {
     // Second Life simulator sentinel button label indicating an `llTextBox` prompt
     const val LL_TEXT_BOX_SENTINEL: String = "!!llTextBox!!"
 
+    /**
+     * Returns whether [messageId] is marked `Zerocoded` (`true`) or `Unencoded` (`false`)
+     * in canonical `indra/llmessage/message_template.msg`:
+     * - `ChatFromViewer` (`Low 80 = 0xFFFF0050`): `NotTrusted Zerocoded` (`true`)
+     * - `ScriptAnswerYes` (`Low 132 = 0xFFFF0084`): `NotTrusted Unencoded` (`false`)
+     * - `ScriptQuestion` (`Low 188 = 0xFFFF00BC`): `Trusted Unencoded` (`false`)
+     * - `ScriptDialog` (`Low 190 = 0xFFFF00BE`): `Trusted Zerocoded` (`true`)
+     * - `MoneyTransferRequest` (`Low 311 = 0xFFFF0137`): `NotTrusted Zerocoded` (`true`)
+     * - `MoneyBalanceRequest` (`Low 313 = 0xFFFF0139`): `NotTrusted Zerocoded` (`true`)
+     * - `MoneyBalanceReply` (`Low 314 = 0xFFFF013A`): `Trusted Zerocoded` (`true`)
+     * - `RoutedMoneyBalanceReply` (`Low 315 = 0xFFFF013B`): `Trusted Zerocoded` (`true`)
+     */
+    fun isMessageZeroCoded(messageId: Int): Boolean = when (messageId) {
+        LludpPackets.MSG_SCRIPT_ANSWER_YES,
+        LludpPackets.MSG_SCRIPT_QUESTION -> false
+        LludpPackets.MSG_CHAT_FROM_VIEWER,
+        LludpPackets.MSG_SCRIPT_DIALOG,
+        LludpPackets.MSG_MONEY_TRANSFER_REQUEST,
+        LludpPackets.MSG_MONEY_BALANCE_REQUEST,
+        LludpPackets.MSG_MONEY_BALANCE_REPLY,
+        LludpPackets.MSG_ROUTED_MONEY_BALANCE_REPLY -> true
+        else -> false
+    }
+
     data class LslPermissionInfo(
         val mask: Int,
+        val constantName: String,
         val label: String,
         val detail: String,
-        val isDebitWarning: Boolean = false
+        val isDebitWarning: Boolean = false,
+        val isCaution: Boolean = false,
+        val badgeLabel: String? = null
     )
 
     private val KNOWN_PERMISSIONS: List<LslPermissionInfo> = listOf(
         LslPermissionInfo(
             mask = PERMISSION_DEBIT,
+            constantName = "PERMISSION_DEBIT",
             label = "Debit L$ from your account",
             detail = "Allows this script to take L$ from your balance without asking again until reset.",
-            isDebitWarning = true
+            isDebitWarning = true,
+            isCaution = true,
+            badgeLabel = "DEBIT L$"
         ),
         LslPermissionInfo(
             mask = PERMISSION_TAKE_CONTROLS,
+            constantName = "PERMISSION_TAKE_CONTROLS",
             label = "Take movement & keyboard controls",
             detail = "Allows vehicle, HUD, or combat scripts to read or override movement keys."
         ),
         LslPermissionInfo(
             mask = PERMISSION_REMAP_CONTROLS,
+            constantName = "PERMISSION_REMAP_CONTROLS",
             label = "Remap keyboard controls",
             detail = "Allows this script to remap viewer control bindings."
         ),
         LslPermissionInfo(
             mask = PERMISSION_TRIGGER_ANIMATION,
+            constantName = "PERMISSION_TRIGGER_ANIMATION",
             label = "Animate your avatar",
-            detail = "Allows furniture, dances, or AOs to start and stop animations on your avatar."
+            detail = "Allows furniture, dances, or poseballs to start and stop animations on your avatar."
         ),
         LslPermissionInfo(
             mask = PERMISSION_ATTACH,
+            constantName = "PERMISSION_ATTACH",
             label = "Attach or detach from your avatar",
             detail = "Allows scripted props or HUDs to attach to or detach from your avatar."
         ),
         LslPermissionInfo(
             mask = PERMISSION_RELEASE_OWNERSHIP,
+            constantName = "PERMISSION_RELEASE_OWNERSHIP",
             label = "Release ownership to public",
             detail = "Allows the object to relinquish owner permissions."
         ),
         LslPermissionInfo(
             mask = PERMISSION_CHANGE_LINKS,
-            label = "Link and delink prims",
-            detail = "Allows the script to modify prim linksets."
+            constantName = "PERMISSION_CHANGE_LINKS",
+            label = "Link and delink objects",
+            detail = "Allows the script to link or unlink prims in its linkset."
         ),
         LslPermissionInfo(
             mask = PERMISSION_CHANGE_JOINTS,
-            label = "Modify physics joints",
+            constantName = "PERMISSION_CHANGE_JOINTS",
+            label = "Modify object joints",
             detail = "Allows the script to alter physical joint parameters."
         ),
         LslPermissionInfo(
             mask = PERMISSION_CHANGE_PERMISSIONS,
+            constantName = "PERMISSION_CHANGE_PERMISSIONS",
             label = "Modify object permissions",
-            detail = "Allows the script to alter next-owner permissions."
+            detail = "Allows the script to alter object or inventory permissions.",
+            isCaution = true
         ),
         LslPermissionInfo(
             mask = PERMISSION_TRACK_CAMERA,
+            constantName = "PERMISSION_TRACK_CAMERA",
             label = "Track your camera position",
             detail = "Allows the script to read where your camera is looking."
         ),
         LslPermissionInfo(
             mask = PERMISSION_CONTROL_CAMERA,
+            constantName = "PERMISSION_CONTROL_CAMERA",
             label = "Control your camera",
             detail = "Allows the script to move or lock your camera focus while seated or attached."
         ),
         LslPermissionInfo(
             mask = PERMISSION_TELEPORT,
+            constantName = "PERMISSION_TELEPORT",
             label = "Teleport your avatar",
-            detail = "Allows portals or HUDs to teleport your avatar directly."
+            detail = "Allows portals, Experiences, or HUDs to teleport your avatar directly."
         ),
         LslPermissionInfo(
             mask = PERMISSION_EXPERIENCE,
-            label = "Run Experience actions",
-            detail = "Grants region Experience permissions to this script."
+            constantName = "PERMISSION_EXPERIENCE",
+            label = "Act via region Experience",
+            detail = "Grants region Experience runtime permissions to this script.",
+            badgeLabel = "EXPERIENCE"
         ),
         LslPermissionInfo(
             mask = PERMISSION_SILENT_ESTATE_MANAGEMENT,
-            label = "Manage estate settings",
-            detail = "Allows silent estate management operations."
+            constantName = "PERMISSION_SILENT_ESTATE_MANAGEMENT",
+            label = "Manage estate settings silently",
+            detail = "Allows automated estate management operations without per-action prompts.",
+            isCaution = true,
+            badgeLabel = "ESTATE"
         ),
         LslPermissionInfo(
             mask = PERMISSION_OVERRIDE_ANIMATIONS,
-            label = "Override default animations",
-            detail = "Allows Animation Overriders (AOs) to replace walk, stand, and fly animations."
+            constantName = "PERMISSION_OVERRIDE_ANIMATIONS",
+            label = "Override avatar animations (AO)",
+            detail = "Allows Animation Overriders (AOs) to replace default walk, stand, and fly animations.",
+            badgeLabel = "AO"
         ),
         LslPermissionInfo(
             mask = PERMISSION_RETURN_OBJECTS,
-            label = "Return parcel objects",
-            detail = "Allows automated security orbs to return objects on your land."
+            constantName = "PERMISSION_RETURN_OBJECTS",
+            label = "Return objects from land",
+            detail = "Allows automated parcel/estate security orbs to return objects from land you manage.",
+            isCaution = true,
+            badgeLabel = "LAND"
+        ),
+        LslPermissionInfo(
+            mask = PERMISSION_CONTROL_MUTE_LIST,
+            constantName = "PERMISSION_CONTROL_MUTE_LIST",
+            label = "Manage your mute/block list",
+            detail = "Allows viewer-managed or Experience scripts to update mute list entries.",
+            isCaution = true,
+            badgeLabel = "MUTE LIST"
         )
     )
+
+    fun formatPermissionBitmask(mask: Int): String =
+        "0x" + Integer.toUnsignedString(mask, 16).uppercase(Locale.US)
 
     fun hasDebitPermission(questions: Int): Boolean =
         (questions and PERMISSION_DEBIT) != 0
 
+    /**
+     * Resolves the exact `Questions` S32 bitmask to transmit in `MSG_SCRIPT_ANSWER_YES` (`0xFFFF0084`).
+     * When [grant] is `true`, echoes [requestedQuestions] verbatim (including any new or unknown higher
+     * Agni bits so future simulator permissions are never silently dropped). When `false`, returns `0`.
+     */
+    fun resolveScriptAnswerQuestions(requestedQuestions: Int, grant: Boolean): Int =
+        if (grant) requestedQuestions else 0
+
     fun decodePermissionFlags(questions: Int): List<LslPermissionInfo> {
         if (questions == 0) return emptyList()
         val matched = KNOWN_PERMISSIONS.filter { (questions and it.mask) != 0 }.toMutableList()
-        val knownMask = KNOWN_PERMISSIONS.fold(0) { acc, info -> acc or info.mask }
-        val unknownBits = questions and knownMask.inv()
-        if (unknownBits != 0) {
+        var unknownBits = questions and ALL_LSL_DEFINITIONS_PERMISSIONS_MASK.inv()
+        while (unknownBits != 0) {
+            val singleBit = Integer.lowestOneBit(unknownBits)
+            val hex = formatPermissionBitmask(singleBit)
             matched.add(
                 LslPermissionInfo(
-                    mask = unknownBits,
-                    label = "Extended script permission (0x${Integer.toHexString(unknownBits).uppercase(Locale.US)})",
-                    detail = "Unrecognized LSL permission bitmask requested by simulator."
+                    mask = singleBit,
+                    constantName = "PERMISSION_UNKNOWN_$hex",
+                    label = "Extended script permission ($hex)",
+                    detail = "Unrecognized Agni/OpenSim runtime permission bit ($hex); preserved verbatim if granted.",
+                    isCaution = true,
+                    badgeLabel = "EXTENDED"
                 )
             )
+            unknownBits = unknownBits xor singleBit
         }
         return matched
     }
@@ -173,6 +269,7 @@ object ScriptAndEconomyProtocol {
         val objectName: String,
         val objectOwner: String,
         val questions: Int,
+        val experienceId: UUID = UUID(0L, 0L),
         val permissions: List<LslPermissionInfo> = decodePermissionFlags(questions),
         val hasDebitPermission: Boolean = hasDebitPermission(questions)
     )
@@ -239,8 +336,9 @@ object ScriptAndEconomyProtocol {
     }
 
     /**
-     * Decodes `MSG_SCRIPT_QUESTION` (`0xFFFF00BC` Low 188).
-     * Wire layout: TaskID (16B), ItemID (16B), ObjectName (Var 1), ObjectOwner (Var 1), Questions (S32 LE).
+     * Decodes `MSG_SCRIPT_QUESTION` (`0xFFFF00BC` Low 188 `Trusted Unencoded`).
+     * Wire layout: TaskID (16B), ItemID (16B), ObjectName (Var 1), ObjectOwner (Var 1), Questions (S32 LE),
+     * plus optional `Experience` block (`ExperienceID` 16B LLUUID on SL Agni simulators).
      */
     fun parseScriptQuestion(buf: ByteBuffer): ParsedScriptQuestion? {
         if (buf.remaining() < 38) return null
@@ -257,12 +355,14 @@ object ScriptAndEconomyProtocol {
             if (buf.remaining() < ownerLen + 4) return null
             val objectOwner = LludpPackets.readCString(buf, ownerLen)
             val questions = buf.int
+            val experienceId = if (buf.remaining() >= 16) LludpPackets.readUuid(buf) else UUID(0L, 0L)
             ParsedScriptQuestion(
                 taskId = taskId,
                 itemId = itemId,
                 objectName = objectName,
                 objectOwner = objectOwner,
-                questions = questions
+                questions = questions,
+                experienceId = experienceId
             )
         } finally {
             buf.order(prevOrder)
@@ -270,9 +370,10 @@ object ScriptAndEconomyProtocol {
     }
 
     /**
-     * Builds `MSG_SCRIPT_ANSWER_YES` (`0xFFFF0084` Low 132).
+     * Builds `MSG_SCRIPT_ANSWER_YES` (`0xFFFF0084` Low 132 `NotTrusted Unencoded`).
      * Wire layout (68 bytes): AgentID (16B), SessionID (16B), TaskID (16B), ItemID (16B), Questions (S32 LE).
-     * Pass `questions = 0` to explicitly deny requested permissions.
+     * Pass `questions = 0` to explicitly deny requested permissions, or the full `ScriptQuestion.Questions`
+     * bitmask to grant without dropping unrecognized higher Agni bits.
      */
     fun buildScriptAnswerYes(
         agentId: UUID,

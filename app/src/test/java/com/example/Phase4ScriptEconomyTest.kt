@@ -397,4 +397,217 @@ class Phase4ScriptEconomyTest {
         assertTrue(parsedObjPay.description.startsWith("TipJar-★"))
         assertTrue(parsedObjPay.description.toByteArray(Charsets.UTF_8).size <= 254)
     }
+
+    @Test
+    fun `decodes full lsl_definitions runtime permission catalog 0x02 through 0x20000 and preserves unknown Agni bits in ScriptAnswerYes`() = runBlocking {
+        val agentId = UUID.fromString("11111111-2222-4333-8444-555555555555")
+        val sessionId = UUID.fromString("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        val taskId = UUID.fromString("22222222-3333-4444-8555-666666666666")
+        val itemId = UUID.fromString("33333333-4444-4555-8666-777777777777")
+        val experienceId = UUID.fromString("44444444-5555-4666-8777-888888888888")
+
+        // Verify canonical secondlife/lsl-definitions hex constants on LludpPackets & ScriptAndEconomyProtocol
+        assertEquals(0x0002, LludpPackets.PERMISSION_DEBIT)
+        assertEquals(0x0004, LludpPackets.PERMISSION_TAKE_CONTROLS)
+        assertEquals(0x0008, LludpPackets.PERMISSION_REMAP_CONTROLS)
+        assertEquals(0x0010, LludpPackets.PERMISSION_TRIGGER_ANIMATION)
+        assertEquals(0x0020, LludpPackets.PERMISSION_ATTACH)
+        assertEquals(0x0040, LludpPackets.PERMISSION_RELEASE_OWNERSHIP)
+        assertEquals(0x0080, LludpPackets.PERMISSION_CHANGE_LINKS)
+        assertEquals(0x0100, LludpPackets.PERMISSION_CHANGE_JOINTS)
+        assertEquals(0x0200, LludpPackets.PERMISSION_CHANGE_PERMISSIONS)
+        assertEquals(0x0400, LludpPackets.PERMISSION_TRACK_CAMERA)
+        assertEquals(0x0800, LludpPackets.PERMISSION_CONTROL_CAMERA)
+        assertEquals(0x1000, LludpPackets.PERMISSION_TELEPORT)
+        assertEquals(0x2000, LludpPackets.PERMISSION_EXPERIENCE)
+        assertEquals(0x4000, LludpPackets.PERMISSION_SILENT_ESTATE_MANAGEMENT)
+        assertEquals(0x8000, LludpPackets.PERMISSION_OVERRIDE_ANIMATIONS)
+        assertEquals(0x10000, LludpPackets.PERMISSION_RETURN_OBJECTS)
+        assertEquals(0x20000, LludpPackets.PERMISSION_CONTROL_MUTE_LIST)
+
+        // Verify full 0x02..0x10000 catalog (16 bits) + 0x20000 (17th canonical bit)
+        val mask02To10000 =
+            LludpPackets.PERMISSION_DEBIT or
+                LludpPackets.PERMISSION_TAKE_CONTROLS or
+                LludpPackets.PERMISSION_REMAP_CONTROLS or
+                LludpPackets.PERMISSION_TRIGGER_ANIMATION or
+                LludpPackets.PERMISSION_ATTACH or
+                LludpPackets.PERMISSION_RELEASE_OWNERSHIP or
+                LludpPackets.PERMISSION_CHANGE_LINKS or
+                LludpPackets.PERMISSION_CHANGE_JOINTS or
+                LludpPackets.PERMISSION_CHANGE_PERMISSIONS or
+                LludpPackets.PERMISSION_TRACK_CAMERA or
+                LludpPackets.PERMISSION_CONTROL_CAMERA or
+                LludpPackets.PERMISSION_TELEPORT or
+                LludpPackets.PERMISSION_EXPERIENCE or
+                LludpPackets.PERMISSION_SILENT_ESTATE_MANAGEMENT or
+                LludpPackets.PERMISSION_OVERRIDE_ANIMATIONS or
+                LludpPackets.PERMISSION_RETURN_OBJECTS
+        assertEquals(0x1FFFE, mask02To10000)
+
+        val decodedCatalog = ScriptAndEconomyProtocol.decodePermissionFlags(mask02To10000)
+        assertEquals(16, decodedCatalog.size)
+        assertEquals(mask02To10000, decodedCatalog.fold(0) { acc, info -> acc or info.mask })
+
+        val byMask = decodedCatalog.associateBy { it.mask }
+        assertEquals("Link and delink objects", byMask.getValue(LludpPackets.PERMISSION_CHANGE_LINKS).label)
+        assertEquals("Modify object joints", byMask.getValue(LludpPackets.PERMISSION_CHANGE_JOINTS).label)
+        assertEquals("Modify object permissions", byMask.getValue(LludpPackets.PERMISSION_CHANGE_PERMISSIONS).label)
+        assertEquals("Act via region Experience", byMask.getValue(LludpPackets.PERMISSION_EXPERIENCE).label)
+        assertEquals("Manage estate settings silently", byMask.getValue(LludpPackets.PERMISSION_SILENT_ESTATE_MANAGEMENT).label)
+        assertEquals("Override avatar animations (AO)", byMask.getValue(LludpPackets.PERMISSION_OVERRIDE_ANIMATIONS).label)
+        assertEquals("Return objects from land", byMask.getValue(LludpPackets.PERMISSION_RETURN_OBJECTS).label)
+
+        // Test AO + Linkset + Experience ScriptQuestion packet (including trailing 16B ExperienceID block)
+        val aoAndLinkMask =
+            LludpPackets.PERMISSION_OVERRIDE_ANIMATIONS or
+                LludpPackets.PERMISSION_TRIGGER_ANIMATION or
+                LludpPackets.PERMISSION_TAKE_CONTROLS or
+                LludpPackets.PERMISSION_CHANGE_LINKS or
+                LludpPackets.PERMISSION_EXPERIENCE
+        val objNameBytes = "Vista Bento AO HUD\u0000".toByteArray(Charsets.UTF_8)
+        val ownerBytes = "Lyra Resident\u0000".toByteArray(Charsets.UTF_8)
+        val aoBuf = ByteBuffer.allocate(16 + 16 + 1 + objNameBytes.size + 1 + ownerBytes.size + 4 + 16)
+            .order(ByteOrder.LITTLE_ENDIAN)
+        LludpPackets.putUuid(aoBuf, taskId)
+        LludpPackets.putUuid(aoBuf, itemId)
+        aoBuf.put(objNameBytes.size.toByte()); aoBuf.put(objNameBytes)
+        aoBuf.put(ownerBytes.size.toByte()); aoBuf.put(ownerBytes)
+        aoBuf.putInt(aoAndLinkMask)
+        LludpPackets.putUuid(aoBuf, experienceId)
+
+        val framedAoQuestion = LludpPackets.framePacket(
+            sequenceNumber = 88,
+            reliable = true,
+            messageId = LludpPackets.MSG_SCRIPT_QUESTION,
+            body = aoBuf.array(),
+            useZeroCoding = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_SCRIPT_QUESTION)
+        )
+        val engine = LludpCircuitEngine()
+        val deferredAo = async {
+            withTimeout(2000L) {
+                engine.events.first { it is SimEvent.ScriptQuestionReceived } as SimEvent.ScriptQuestionReceived
+            }
+        }
+        kotlinx.coroutines.yield()
+        assertTrue(engine.decodeAndDispatchForTesting(framedAoQuestion))
+        val aoEvt = deferredAo.await()
+        assertFalse("AO + Linkset permissions must not trigger debit warning", aoEvt.hasDebitPermission)
+        assertEquals(experienceId, aoEvt.experienceId)
+        assertEquals(5, aoEvt.permissions.size)
+        assertTrue(aoEvt.permissions.any { it.mask == LludpPackets.PERMISSION_OVERRIDE_ANIMATIONS && it.badgeLabel == "AO" })
+        assertTrue(aoEvt.permissions.any { it.mask == LludpPackets.PERMISSION_CHANGE_LINKS && it.label == "Link and delink objects" })
+
+        // Verify PERMISSION_CONTROL_MUTE_LIST (0x20000) + unknown future Agni bits (0x40000, 0x80000000)
+        // are formatted gracefully and echoed verbatim without dropping bits in ScriptAnswerYes
+        val futureAgniMask =
+            LludpPackets.PERMISSION_OVERRIDE_ANIMATIONS or
+                LludpPackets.PERMISSION_CONTROL_MUTE_LIST or
+                0x40000 or
+                0x80000000.toInt()
+        val decodedFuture = ScriptAndEconomyProtocol.decodePermissionFlags(futureAgniMask)
+        assertEquals(4, decodedFuture.size)
+        assertEquals(futureAgniMask, decodedFuture.fold(0) { acc, info -> acc or info.mask })
+        assertTrue(decodedFuture.any { it.mask == LludpPackets.PERMISSION_CONTROL_MUTE_LIST && it.constantName == "PERMISSION_CONTROL_MUTE_LIST" })
+        assertTrue(decodedFuture.any { it.mask == 0x40000 && it.label.contains("0x40000") })
+        assertTrue(decodedFuture.any { it.mask == 0x80000000.toInt() && it.label.contains("0x80000000") })
+
+        val resolvedGrantMask = ScriptAndEconomyProtocol.resolveScriptAnswerQuestions(futureAgniMask, grant = true)
+        assertEquals(futureAgniMask, resolvedGrantMask)
+        val answerBody = LludpPackets.buildScriptAnswerYes(agentId, sessionId, taskId, itemId, resolvedGrantMask)
+        val framedAnswer = LludpPackets.framePacket(
+            sequenceNumber = 89,
+            reliable = true,
+            messageId = LludpPackets.MSG_SCRIPT_ANSWER_YES,
+            body = answerBody,
+            useZeroCoding = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_SCRIPT_ANSWER_YES)
+        )
+        val decodedAnswer = LludpPackets.decodePacket(framedAnswer, framedAnswer.size)
+        assertNotNull(decodedAnswer)
+        assertEquals(agentId, LludpPackets.readUuid(decodedAnswer!!.payload))
+        assertEquals(sessionId, LludpPackets.readUuid(decodedAnswer.payload))
+        assertEquals(taskId, LludpPackets.readUuid(decodedAnswer.payload))
+        assertEquals(itemId, LludpPackets.readUuid(decodedAnswer.payload))
+        assertEquals("Unknown higher Agni bits must never be dropped in ScriptAnswerYes", futureAgniMask, decodedAnswer.payload.int)
+        assertEquals(0, ScriptAndEconomyProtocol.resolveScriptAnswerQuestions(futureAgniMask, grant = false))
+    }
+
+    @Test
+    fun `verifies message_template zero-coding flags for ScriptAnswerYes MoneyBalanceRequest and MoneyTransferRequest`() {
+        // Canonical message_template.msg encoding check:
+        // - ScriptAnswerYes (Low 132 = 0xFFFF0084): NotTrusted Unencoded (false)
+        // - ScriptQuestion  (Low 188 = 0xFFFF00BC): Trusted Unencoded (false)
+        // - ScriptDialog    (Low 190 = 0xFFFF00BE): Trusted Zerocoded (true)
+        // - ChatFromViewer  (Low 80  = 0xFFFF0050): NotTrusted Zerocoded (true)
+        // - MoneyTransferRequest (Low 311 = 0xFFFF0137): NotTrusted Zerocoded (true)
+        // - MoneyBalanceRequest  (Low 313 = 0xFFFF0139): NotTrusted Zerocoded (true)
+        // - MoneyBalanceReply    (Low 314 = 0xFFFF013A): Trusted Zerocoded (true)
+        assertEquals(0xFFFF0084.toInt(), LludpPackets.MSG_SCRIPT_ANSWER_YES)
+        assertEquals(0xFFFF0139.toInt(), LludpPackets.MSG_MONEY_BALANCE_REQUEST)
+        assertEquals(0xFFFF0137.toInt(), LludpPackets.MSG_MONEY_TRANSFER_REQUEST)
+
+        assertFalse("ScriptAnswerYes is Unencoded in message_template.msg", LludpPackets.isMessageZeroCoded(LludpPackets.MSG_SCRIPT_ANSWER_YES))
+        assertFalse("ScriptQuestion is Unencoded in message_template.msg", LludpPackets.isMessageZeroCoded(LludpPackets.MSG_SCRIPT_QUESTION))
+        assertTrue("ScriptDialog is Zerocoded in message_template.msg", LludpPackets.isMessageZeroCoded(LludpPackets.MSG_SCRIPT_DIALOG))
+        assertTrue("ChatFromViewer is Zerocoded in message_template.msg", LludpPackets.isMessageZeroCoded(LludpPackets.MSG_CHAT_FROM_VIEWER))
+        assertTrue("MoneyBalanceRequest is Zerocoded in message_template.msg", LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_BALANCE_REQUEST))
+        assertTrue("MoneyTransferRequest is Zerocoded in message_template.msg", LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_TRANSFER_REQUEST))
+        assertTrue("MoneyBalanceReply is Zerocoded in message_template.msg", LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_BALANCE_REPLY))
+
+        val zeroHeavyUuid = UUID(0L, 1L)
+
+        // 1. ScriptAnswerYes (Unencoded): even with zero-heavy UUIDs + Questions=0, FLAG_ZEROCODED (0x80) must NOT be set
+        val answerBody = LludpPackets.buildScriptAnswerYes(zeroHeavyUuid, zeroHeavyUuid, zeroHeavyUuid, zeroHeavyUuid, 0)
+        val framedAnswer = LludpPackets.framePacket(
+            sequenceNumber = 1,
+            reliable = true,
+            messageId = LludpPackets.MSG_SCRIPT_ANSWER_YES,
+            body = answerBody,
+            useZeroCoding = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_SCRIPT_ANSWER_YES)
+        )
+        assertEquals("Unencoded ScriptAnswerYes must only set FLAG_RELIABLE (0x40)", LludpPackets.FLAG_RELIABLE, framedAnswer[0].toInt() and 0xFF)
+        assertEquals(6 + 4 + 68, framedAnswer.size)
+
+        // 2. MoneyBalanceRequest (Zerocoded): zero-heavy TransactionID(0,0) must compress and set FLAG_ZEROCODED (0x80)
+        val balReqBody = LludpPackets.buildMoneyBalanceRequest(zeroHeavyUuid, zeroHeavyUuid, UUID(0L, 0L))
+        val framedBalReq = LludpPackets.framePacket(
+            sequenceNumber = 2,
+            reliable = true,
+            messageId = LludpPackets.MSG_MONEY_BALANCE_REQUEST,
+            body = balReqBody,
+            useZeroCoding = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_BALANCE_REQUEST)
+        )
+        assertTrue("Zerocoded MoneyBalanceRequest must set FLAG_ZEROCODED", (framedBalReq[0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0)
+        assertTrue("Zerocoded MoneyBalanceRequest must compress zero runs", framedBalReq.size < 6 + 4 + 48)
+        val decodedBalReq = LludpPackets.decodePacket(framedBalReq, framedBalReq.size)
+        assertNotNull(decodedBalReq)
+        assertEquals(LludpPackets.MSG_MONEY_BALANCE_REQUEST, decodedBalReq!!.messageId)
+        assertEquals(48, decodedBalReq.payload.remaining())
+
+        // 3. MoneyTransferRequest (Zerocoded): zero-run fields compress and set FLAG_ZEROCODED (0x80)
+        val transferBody = LludpPackets.buildMoneyTransferRequest(
+            agentId = zeroHeavyUuid,
+            sessionId = zeroHeavyUuid,
+            sourceId = zeroHeavyUuid,
+            destId = zeroHeavyUuid,
+            amount = 50,
+            transactionType = LludpPackets.TRANS_PAY_OBJECT,
+            description = ""
+        )
+        val framedTransfer = LludpPackets.framePacket(
+            sequenceNumber = 3,
+            reliable = true,
+            messageId = LludpPackets.MSG_MONEY_TRANSFER_REQUEST,
+            body = transferBody,
+            useZeroCoding = LludpPackets.isMessageZeroCoded(LludpPackets.MSG_MONEY_TRANSFER_REQUEST)
+        )
+        assertTrue("Zerocoded MoneyTransferRequest must set FLAG_ZEROCODED", (framedTransfer[0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0)
+        assertTrue("Zerocoded MoneyTransferRequest must compress zero runs", framedTransfer.size < 6 + 4 + transferBody.size)
+        val decodedTransfer = LludpPackets.decodePacket(framedTransfer, framedTransfer.size)
+        assertNotNull(decodedTransfer)
+        val parsedTransfer = ScriptAndEconomyProtocol.parseMoneyTransferRequest(decodedTransfer!!.payload)
+        assertNotNull(parsedTransfer)
+        assertEquals(50, parsedTransfer!!.amount)
+        assertEquals(LludpPackets.TRANS_PAY_OBJECT, parsedTransfer.transactionType)
+    }
 }
