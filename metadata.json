@@ -1,0 +1,6 @@
+{
+  "name": "Linkpoint",
+  "description": "Native Android 3D Second Life and OpenSimulator viewer with XML-RPC/LLUDP/CAPS protocols, OpenGL ES 3.0 rendering, dual-layer Avatar Attachment HUDs, four switchable design languages, and personalizable layouts.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

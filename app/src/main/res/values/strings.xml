@@ -1,0 +1,12 @@
+<resources>
+    <string name="app_name">Linkpoint</string>
+    <string name="gateway_subtitle">Second Life &amp; OpenSimulator 3D Viewer</string>
+    <string name="gateway_login_button">Connect to Grid</string>
+    <string name="gateway_sandbox_button">3D &amp; HUD Sandbox (Local Preview)</string>
+    <string name="gateway_manage_grids">Manage Grids</string>
+    <string name="cd_gateway_hero">Linkpoint virtual world horizon</string>
+    <string name="cd_close_panel">Close panel</string>
+    <string name="cd_disconnect">Disconnect from grid</string>
+    <string name="cd_layout_studio">Open Layout and Design Studio</string>
+    <string name="cd_hud_tray">Toggle Avatar Attachment HUD Tray</string>
+</resources>
