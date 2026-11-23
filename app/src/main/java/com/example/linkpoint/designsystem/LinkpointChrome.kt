@@ -1,7 +1,6 @@
 package com.example.linkpoint.designsystem
 
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -12,7 +11,6 @@ import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -24,6 +22,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -40,7 +39,6 @@ import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
@@ -49,9 +47,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Multi-language surface container adapting geometry, chrome framing, and texture
- * across Polished (spatial glass), Terminal (scanlines + 1dp phosphor border),
- * Sweep Console / LCARS (L-shaped curved elbow spine), and Metro (sharp 0dp flat block).
+ * Multi-language surface container adapting geometry, chrome framing, and texture across
+ * all 6 `linkpoint-design` layout packs:
+ * - POLISHED (spatial glass + top specular hairline)
+ * - TERMINAL (CRT scanlines + 1dp phosphor frame)
+ * - LCARS (CleverFerret pure #000000 black-field split-frame opposing elbows)
+ * - METRO (sharp 0dp flat block + bold top accent bar)
+ * - RULE_AND_RAIL (Deco hairline top/bottom rules + stepped rail ticks, no heavy box)
+ * - PRESS (Editorial double masthead rule + quiet 3dp border)
  */
 @Composable
 fun LinkpointPanelSurface(
@@ -68,52 +71,21 @@ fun LinkpointPanelSurface(
 
     when (tokens.language) {
         DesignLanguage.LCARS -> {
-            // Authentic LCARS curved sweeping elbow frame wrapping left spine + top header rail
-            Box(
-                modifier = modifier
-                    .clip(RoundedCornerShape(topStart = 28.dp, bottomStart = 20.dp, topEnd = 8.dp, bottomEnd = 8.dp))
-                    .background(bg)
-            ) {
-                Canvas(modifier = Modifier.matchParentSize()) {
-                    val spineW = 16.dp.toPx()
-                    val topH = 8.dp.toPx()
-                    val innerR = 14.dp.toPx()
-                    // Sweeping L-elbow path
-                    val path = Path().apply {
-                        moveTo(0f, size.height)
-                        lineTo(0f, 0f)
-                        lineTo(size.width, 0f)
-                        lineTo(size.width, topH)
-                        lineTo(spineW + innerR, topH)
-                        quadraticTo(spineW, topH, spineW, topH + innerR)
-                        lineTo(spineW, size.height)
-                        close()
-                    }
-                    drawPath(path, color = accent)
-                    // Secondary LCARS lilac lower spine segment
-                    drawRect(
-                        color = tokens.accentSecondary,
-                        topLeft = Offset(0f, size.height * 0.56f),
-                        size = Size(spineW, size.height * 0.28f)
-                    )
-                    // Tertiary periwinkle bottom cap
-                    drawRect(
-                        color = tokens.accentTertiary,
-                        topLeft = Offset(0f, size.height * 0.87f),
-                        size = Size(spineW, size.height * 0.13f)
-                    )
-                }
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(start = 24.dp, top = 14.dp, end = 12.dp, bottom = 12.dp),
-                    content = content
-                )
-            }
+            LcarsOpposingElbowsFrame(
+                modifier = modifier,
+                codeTag = "LCARS-24C",
+                primaryColor = accent,
+                secondaryColor = tokens.accentSecondary,
+                tertiaryColor = tokens.accentTertiary,
+                onAccentColor = tokens.onAccent,
+                elbowArmWidth = if (elevated) 16.dp else 22.dp,
+                topBarHeight = if (elevated) 20.dp else 26.dp,
+                bottomBarHeight = if (elevated) 10.dp else 14.dp,
+                content = content
+            )
         }
 
         DesignLanguage.TERMINAL -> {
-            // Crisp phosphor-bordered console with subtle CRT scanlines
             Box(
                 modifier = modifier
                     .clip(shape)
@@ -143,7 +115,6 @@ fun LinkpointPanelSurface(
         }
 
         DesignLanguage.METRO -> {
-            // Pure sharp 0dp flat geometric blade with crisp top accent bar
             Column(
                 modifier = modifier
                     .background(bg)
@@ -164,8 +135,91 @@ fun LinkpointPanelSurface(
             }
         }
 
+        DesignLanguage.RULE_AND_RAIL -> {
+            // Deco discipline: 0dp corners, top & bottom hairline rules, left rail tick, stepped corner accents
+            Box(
+                modifier = modifier
+                    .background(bg)
+                    .drawBehind {
+                        val ruleStroke = 1.dp.toPx()
+                        val tickLen = 14.dp.toPx().coerceAtMost(size.width * 0.25f)
+                        val railW = 2.dp.toPx()
+                        // Top and bottom full hairline rules
+                        drawLine(
+                            color = tokens.borderHairline,
+                            start = Offset(0f, 0f),
+                            end = Offset(size.width, 0f),
+                            strokeWidth = ruleStroke
+                        )
+                        drawLine(
+                            color = tokens.borderHairline,
+                            start = Offset(0f, size.height - ruleStroke),
+                            end = Offset(size.width, size.height - ruleStroke),
+                            strokeWidth = ruleStroke
+                        )
+                        // Left vertical Deco rail accent
+                        drawRect(
+                            color = accent,
+                            topLeft = Offset(0f, 0f),
+                            size = Size(railW, size.height)
+                        )
+                        // Stepped Deco corner gold/accent ticks
+                        drawLine(
+                            color = accent,
+                            start = Offset(0f, 3.dp.toPx()),
+                            end = Offset(tickLen, 3.dp.toPx()),
+                            strokeWidth = ruleStroke
+                        )
+                        drawLine(
+                            color = accent,
+                            start = Offset(size.width - tickLen, size.height - 4.dp.toPx()),
+                            end = Offset(size.width, size.height - 4.dp.toPx()),
+                            strokeWidth = ruleStroke
+                        )
+                    }
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(contentPadding),
+                    content = content
+                )
+            }
+        }
+
+        DesignLanguage.PRESS -> {
+            // Editorial Press: quiet 3dp paper/slate surface with classic double masthead rule
+            Surface(
+                modifier = modifier,
+                shape = shape,
+                color = bg,
+                border = BorderStroke(tokens.borderWidth, tokens.borderHairline)
+            ) {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(2.dp)
+                            .background(tokens.textPrimary.copy(alpha = 0.8f))
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(1.dp)
+                            .background(accent.copy(alpha = 0.7f))
+                    )
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(contentPadding),
+                        content = content
+                    )
+                }
+            }
+        }
+
         DesignLanguage.POLISHED -> {
-            // Refined linkpoint-design translucent glass with top-edge specular hairline
             Surface(
                 modifier = modifier.drawBehind {
                     drawRoundRect(
@@ -204,8 +258,14 @@ fun LinkpointActionButton(
     val label = tokens.formatAction(text)
     val shape = RoundedCornerShape(tokens.buttonRadius)
     val mod = modifier
-        .heightIn(min = 48.dp)
+        .heightIn(min = 44.dp)
         .let { if (testTag != null) it.testTag(testTag) else it }
+
+    val letterSpacing = when (tokens.language) {
+        DesignLanguage.RULE_AND_RAIL -> 1.8.sp
+        DesignLanguage.LCARS -> 1.sp
+        else -> 0.2.sp
+    }
 
     if (primary) {
         Button(
@@ -228,7 +288,7 @@ fun LinkpointActionButton(
                 style = MaterialTheme.typography.labelLarge.copy(
                     fontFamily = tokens.displayFont,
                     fontWeight = FontWeight.Bold,
-                    letterSpacing = if (tokens.language == DesignLanguage.LCARS) 1.sp else 0.2.sp
+                    letterSpacing = letterSpacing
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -241,7 +301,8 @@ fun LinkpointActionButton(
             shape = shape,
             border = BorderStroke(tokens.borderWidth, tokens.borderHairline),
             colors = ButtonDefaults.outlinedButtonColors(
-                containerColor = tokens.surfaceElevated.copy(alpha = 0.72f),
+                containerColor = if (tokens.language == DesignLanguage.LCARS) LcarsBlackField
+                else tokens.surfaceElevated.copy(alpha = 0.72f),
                 contentColor = tokens.textPrimary
             ),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 10.dp),
@@ -255,7 +316,8 @@ fun LinkpointActionButton(
                 text = label,
                 style = MaterialTheme.typography.labelLarge.copy(
                     fontFamily = tokens.displayFont,
-                    fontWeight = FontWeight.SemiBold
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = letterSpacing
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
@@ -275,23 +337,31 @@ fun LinkpointStatusChip(
     val shape = RoundedCornerShape(
         when (tokens.language) {
             DesignLanguage.LCARS -> 99.dp
-            DesignLanguage.METRO -> 0.dp
-            DesignLanguage.TERMINAL -> 2.dp
+            DesignLanguage.METRO, DesignLanguage.RULE_AND_RAIL -> 0.dp
+            DesignLanguage.TERMINAL, DesignLanguage.PRESS -> 2.dp
             DesignLanguage.POLISHED -> 10.dp
         }
     )
     val formatted = when (tokens.language) {
-        DesignLanguage.LCARS -> label.uppercase()
+        DesignLanguage.LCARS, DesignLanguage.RULE_AND_RAIL -> label.uppercase()
         DesignLanguage.TERMINAL -> "[$label]"
         DesignLanguage.METRO -> label.lowercase()
-        DesignLanguage.POLISHED -> label
+        DesignLanguage.PRESS, DesignLanguage.POLISHED -> label
     }
     val clickMod = if (onClick != null) modifier.clickable(onClick = onClick) else modifier
+    val solidPill = tokens.language == DesignLanguage.LCARS
+    val bgFill = if (solidPill) color.copy(alpha = 0.94f) else color.copy(alpha = 0.16f)
+    val effectiveChipBg = LinkpointContrast.compositeOver(bgFill, tokens.canvasVoid)
+    val chipInk = if (solidPill) {
+        LinkpointContrast.inkOn(color, listOf(Color.Black, Color.White))
+    } else {
+        LinkpointContrast.ensureMinContrast(color, effectiveChipBg, 4.5)
+    }
 
     Row(
         modifier = clickMod
             .clip(shape)
-            .background(color.copy(alpha = if (tokens.language == DesignLanguage.LCARS) 0.92f else 0.16f))
+            .background(bgFill)
             .border(1.dp, color.copy(alpha = 0.75f), shape)
             .padding(horizontal = 10.dp, vertical = 5.dp),
         verticalAlignment = Alignment.CenterVertically,
@@ -300,15 +370,21 @@ fun LinkpointStatusChip(
         Box(
             modifier = Modifier
                 .size(7.dp)
-                .clip(RoundedCornerShape(if (tokens.language == DesignLanguage.METRO) 0.dp else 99.dp))
-                .background(if (tokens.language == DesignLanguage.LCARS) Color.Black else color)
+                .clip(
+                    RoundedCornerShape(
+                        if (tokens.language == DesignLanguage.METRO || tokens.language == DesignLanguage.RULE_AND_RAIL) 0.dp
+                        else 99.dp
+                    )
+                )
+                .background(chipInk)
         )
         Text(
             text = formatted,
             style = MaterialTheme.typography.labelSmall.copy(
                 fontFamily = tokens.monoFont,
                 fontWeight = FontWeight.Bold,
-                color = if (tokens.language == DesignLanguage.LCARS) Color.Black else color
+                color = chipInk,
+                letterSpacing = if (tokens.language == DesignLanguage.RULE_AND_RAIL) 1.2.sp else 0.sp
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis
@@ -318,7 +394,8 @@ fun LinkpointStatusChip(
 
 /**
  * Adaptive Linkpoint Floater Header — renders LCARS capsule band, Metro oversized lowercase
- * panorama title, Terminal monospace banner, or Polished glass title bar with close control.
+ * panorama title, Terminal monospace banner, Rule & Rail wide-tracked Deco hairline header,
+ * Press editorial masthead, or Polished glass title bar with close control.
  */
 @Composable
 fun LinkpointFloaterHeader(
@@ -328,77 +405,97 @@ fun LinkpointFloaterHeader(
     onClose: () -> Unit
 ) {
     val tokens = LocalLinkpointDesign.current
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(bottom = 8.dp),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.SpaceBetween
-    ) {
-        Column(modifier = Modifier.weight(1f)) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                if (tokens.language == DesignLanguage.LCARS) {
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(99.dp))
-                            .background(tokens.accentSecondary)
-                            .padding(horizontal = 8.dp, vertical = 2.dp)
-                    ) {
-                        Text(
-                            text = lcarsCode,
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                color = Color.Black,
-                                fontWeight = FontWeight.Bold,
-                                fontFamily = tokens.monoFont
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (tokens.language == DesignLanguage.LCARS) {
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(99.dp))
+                                .background(tokens.accentSecondary)
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
+                        ) {
+                            Text(
+                                text = lcarsCode,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    color = LinkpointContrast.inkOn(tokens.accentSecondary, listOf(Color.Black, Color.White)),
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = tokens.monoFont
+                                )
                             )
-                        )
+                        }
                     }
+                    Text(
+                        text = tokens.formatHeader(title),
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontFamily = tokens.displayFont,
+                            fontSize = when (tokens.language) {
+                                DesignLanguage.METRO -> 24.sp
+                                DesignLanguage.RULE_AND_RAIL -> 15.sp
+                                else -> 18.sp
+                            },
+                            fontWeight = if (tokens.language == DesignLanguage.METRO) FontWeight.Light else FontWeight.Bold,
+                            color = if (tokens.language == DesignLanguage.LCARS) tokens.accentPrimary else tokens.textPrimary,
+                            letterSpacing = when (tokens.language) {
+                                DesignLanguage.RULE_AND_RAIL -> 2.8.sp
+                                DesignLanguage.LCARS -> 1.4.sp
+                                DesignLanguage.PRESS -> 0.5.sp
+                                else -> 0.sp
+                            }
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
-                Text(
-                    text = tokens.formatHeader(title),
-                    style = MaterialTheme.typography.titleLarge.copy(
-                        fontFamily = tokens.displayFont,
-                        fontSize = if (tokens.language == DesignLanguage.METRO) 24.sp else 18.sp,
-                        fontWeight = if (tokens.language == DesignLanguage.METRO) FontWeight.Light else FontWeight.Bold,
-                        color = if (tokens.language == DesignLanguage.LCARS) tokens.accentPrimary else tokens.textPrimary,
-                        letterSpacing = if (tokens.language == DesignLanguage.LCARS) 1.4.sp else 0.sp
-                    ),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
+                if (!subtitle.isNullOrBlank()) {
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = if (tokens.language == DesignLanguage.PRESS) tokens.bodyFont else tokens.monoFont,
+                            color = tokens.textSecondary
+                        ),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
-            if (!subtitle.isNullOrBlank()) {
-                Text(
-                    text = subtitle,
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontFamily = tokens.monoFont,
-                        color = tokens.textSecondary
-                    ),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier
+                    .minimumInteractiveComponentSize()
+                    .testTag("close_floater_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Close panel",
+                    tint = tokens.textSecondary
                 )
             }
         }
-        IconButton(
-            onClick = onClose,
-            modifier = Modifier
-                .minimumInteractiveComponentSize()
-                .testTag("close_floater_button")
-        ) {
-            Icon(
-                imageVector = Icons.Default.Close,
-                contentDescription = "Close panel",
-                tint = tokens.textSecondary
+        if (tokens.language == DesignLanguage.RULE_AND_RAIL || tokens.language == DesignLanguage.PRESS) {
+            HorizontalDivider(
+                thickness = 1.dp,
+                color = if (tokens.language == DesignLanguage.RULE_AND_RAIL) tokens.accentPrimary.copy(alpha = 0.55f)
+                else tokens.borderHairline,
+                modifier = Modifier.padding(bottom = 8.dp)
             )
         }
     }
 }
 
 /**
- * Metro-style Live Telemetry Tile (adapts cleanly to all 4 Design Languages when used in dashboards/docks).
+ * Adaptive Live Telemetry Tile across all 6 Design Languages.
+ * Uses unboxed pure-black readout styling in LCARS mode and hairline framing in Rule & Rail.
  */
 @Composable
 fun LinkpointLiveTile(
@@ -414,20 +511,36 @@ fun LinkpointLiveTile(
     val shape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(14.dp))
     val fill = when (tokens.language) {
         DesignLanguage.METRO -> accent
-        DesignLanguage.LCARS -> accent.copy(alpha = 0.20f)
-        DesignLanguage.TERMINAL -> tokens.surfaceElevated
+        DesignLanguage.LCARS -> LcarsBlackField
+        DesignLanguage.RULE_AND_RAIL -> tokens.canvasVoid
+        DesignLanguage.TERMINAL, DesignLanguage.PRESS -> tokens.surfaceElevated
         DesignLanguage.POLISHED -> tokens.surfaceElevated.copy(alpha = 0.85f)
     }
-    val fg = if (tokens.language == DesignLanguage.METRO) Color.White else tokens.textPrimary
-    val subFg = if (tokens.language == DesignLanguage.METRO) Color.White.copy(alpha = 0.85f) else tokens.textSecondary
+    val effectiveFill = LinkpointContrast.compositeOver(fill, tokens.canvasVoid)
+    val fg = if (tokens.language == DesignLanguage.METRO) {
+        LinkpointContrast.inkOn(accent, listOf(Color.White, Color.Black))
+    } else {
+        LinkpointContrast.ensureMinContrast(tokens.textPrimary, effectiveFill, 4.5)
+    }
+    val subFg = if (tokens.language == DesignLanguage.METRO) {
+        fg.copy(alpha = 0.88f)
+    } else {
+        LinkpointContrast.ensureMinContrast(tokens.textSecondary, effectiveFill, 4.5)
+    }
 
     Column(
         modifier = modifier
             .clip(shape)
             .background(fill)
             .border(
-                width = if (tokens.language == DesignLanguage.METRO) 0.dp else 1.dp,
-                color = if (tokens.language == DesignLanguage.LCARS) accent else tokens.borderHairline,
+                width = when (tokens.language) {
+                    DesignLanguage.METRO, DesignLanguage.LCARS -> 0.dp
+                    else -> 1.dp
+                },
+                color = when (tokens.language) {
+                    DesignLanguage.RULE_AND_RAIL -> accent.copy(alpha = 0.7f)
+                    else -> tokens.borderHairline
+                },
                 shape = shape
             )
             .clickable(onClick = onClick)
@@ -442,7 +555,8 @@ fun LinkpointLiveTile(
             Icon(
                 imageVector = icon,
                 contentDescription = null,
-                tint = if (tokens.language == DesignLanguage.METRO) Color.White else accent,
+                tint = if (tokens.language == DesignLanguage.METRO) fg
+                else LinkpointContrast.ensureMinContrast(accent, effectiveFill, 3.0),
                 modifier = Modifier.size(18.dp)
             )
             Text(
@@ -450,7 +564,9 @@ fun LinkpointLiveTile(
                 style = MaterialTheme.typography.titleMedium.copy(
                     fontFamily = tokens.monoFont,
                     fontWeight = FontWeight.Bold,
-                    color = fg
+                    color = if (tokens.language == DesignLanguage.LCARS) {
+                        LinkpointContrast.ensureMinContrast(accent, LcarsBlackField, 4.5)
+                    } else fg
                 )
             )
         }
@@ -460,7 +576,8 @@ fun LinkpointLiveTile(
             style = MaterialTheme.typography.labelLarge.copy(
                 fontFamily = tokens.displayFont,
                 fontWeight = FontWeight.Bold,
-                color = fg
+                color = fg,
+                letterSpacing = if (tokens.language == DesignLanguage.RULE_AND_RAIL) 1.6.sp else 0.sp
             ),
             maxLines = 1,
             overflow = TextOverflow.Ellipsis

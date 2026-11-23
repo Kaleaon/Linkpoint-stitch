@@ -22,11 +22,13 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Block
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Checkroom
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
+import com.example.linkpoint.management.MuteType
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -357,6 +359,9 @@ fun AvatarProfileSheetContent(
         Spacer(Modifier.height(8.dp))
 
         // Action Buttons Row
+        val isMuted = state.worldManagement.muteList.any {
+            it.muteId == avatar.agentId || it.name.equals(avatar.displayName, ignoreCase = true)
+        }
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -371,6 +376,17 @@ fun AvatarProfileSheetContent(
                     },
                     primary = true,
                     testTag = "avatar_profile_im_button",
+                    modifier = Modifier.weight(1f)
+                )
+                LinkpointActionButton(
+                    text = if (isMuted) "Unmute" else "Mute",
+                    icon = Icons.Default.Block,
+                    onClick = {
+                        if (isMuted) client.unmuteEntity(avatar.agentId, avatar.displayName)
+                        else client.muteEntity(avatar.agentId, avatar.displayName, MuteType.AGENT)
+                    },
+                    primary = false,
+                    testTag = "avatar_profile_mute_button",
                     modifier = Modifier.weight(1f)
                 )
             }

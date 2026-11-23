@@ -7,6 +7,7 @@ import com.example.linkpoint.designsystem.DockPosition
 import com.example.linkpoint.designsystem.DockToolId
 import com.example.linkpoint.designsystem.PersonalDesignState
 import com.example.linkpoint.designsystem.TelemetryPosition
+import com.example.linkpoint.management.WorldManagementState
 import com.example.linkpoint.protocol.AssetStreamStats
 import com.example.linkpoint.protocol.ConnectionHealthSnapshot
 import com.example.linkpoint.protocol.NetworkDiagnosticReport
@@ -169,6 +170,8 @@ data class ViewerState(
     val inventoryEntries: List<InventoryEntry> = emptyList(),
     val expandedFolderIds: Set<UUID> = emptySet(),
     val mapRegions: List<MapRegionTile> = emptyList(),
+    val worldManagement: WorldManagementState = WorldManagementState(),
+    val lindenBalance: Int = 2500,
     val scriptDialog: ScriptDialogPrompt? = null,
     val toastMessage: String? = null
 )

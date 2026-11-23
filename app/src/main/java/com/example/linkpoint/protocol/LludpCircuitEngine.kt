@@ -1,5 +1,16 @@
 package com.example.linkpoint.protocol
 
+import com.example.linkpoint.management.DirectoryCategory
+import com.example.linkpoint.management.DirectorySearchResult
+import com.example.linkpoint.management.GroupMembershipInfo
+import com.example.linkpoint.management.GroupProfileInfo
+import com.example.linkpoint.management.GroupRoleInfo
+import com.example.linkpoint.management.GroupTitleInfo
+import com.example.linkpoint.management.MuteEntry
+import com.example.linkpoint.management.ParcelManagementInfo
+import com.example.linkpoint.management.ParcelReturnType
+import com.example.linkpoint.management.PayPriceInfo
+import com.example.linkpoint.management.WorldManagementPackets
 import com.example.linkpoint.scene.PrimShape
 import com.example.linkpoint.scene.Quat
 import com.example.linkpoint.scene.SceneObject
@@ -108,6 +119,19 @@ sealed class SimEvent {
     data class CoarseLocationsUpdated(val locations: List<Vec3>) : SimEvent()
     data class TerrainPatchReceived(val patchX: Int, val patchY: Int, val avgHeight: Float) : SimEvent()
     data class MapBlockReceived(val x: Int, val y: Int, val name: String, val access: Int, val agents: Int) : SimEvent()
+    data class DirectoryResultsReceived(
+        val queryId: UUID,
+        val category: DirectoryCategory,
+        val results: List<DirectorySearchResult>
+    ) : SimEvent()
+    data class AgentGroupsUpdated(val groups: List<GroupMembershipInfo>) : SimEvent()
+    data class GroupProfileReceived(val profile: GroupProfileInfo) : SimEvent()
+    data class GroupTitlesReceived(val groupId: UUID, val titles: List<GroupTitleInfo>) : SimEvent()
+    data class GroupRolesReceived(val groupId: UUID, val roles: List<GroupRoleInfo>) : SimEvent()
+    data class ParcelInfoReceived(val parcel: ParcelManagementInfo) : SimEvent()
+    data class ParcelPropertiesReceived(val parcel: ParcelManagementInfo) : SimEvent()
+    data class MuteListSyncReceived(val filename: String, val cached: Boolean) : SimEvent()
+    data class PayPriceReceived(val payPrice: PayPriceInfo) : SimEvent()
     data class PingUpdated(val pingMs: Int) : SimEvent()
     data class CircuitHealthChanged(
         val status: LayerHealthStatus,
@@ -644,6 +668,68 @@ class LludpCircuitEngine {
             }
             LludpPackets.MSG_LOGOUT_REPLY -> {
                 _events.tryEmit(SimEvent.LoggedOut)
+            }
+            WorldManagementPackets.MSG_DIR_PEOPLE_REPLY -> {
+                val (queryId, results) = WorldManagementPackets.parseDirPeopleReply(buf)
+                _events.tryEmit(SimEvent.DirectoryResultsReceived(queryId, DirectoryCategory.PEOPLE, results))
+            }
+            WorldManagementPackets.MSG_DIR_PLACES_REPLY -> {
+                val (queryId, results) = WorldManagementPackets.parseDirPlacesReply(buf)
+                _events.tryEmit(SimEvent.DirectoryResultsReceived(queryId, DirectoryCategory.PLACES, results))
+            }
+            WorldManagementPackets.MSG_DIR_GROUPS_REPLY -> {
+                val (queryId, results) = WorldManagementPackets.parseDirGroupsReply(buf)
+                _events.tryEmit(SimEvent.DirectoryResultsReceived(queryId, DirectoryCategory.GROUPS, results))
+            }
+            WorldManagementPackets.MSG_DIR_EVENTS_REPLY -> {
+                val (queryId, results) = WorldManagementPackets.parseDirEventsReply(buf)
+                _events.tryEmit(SimEvent.DirectoryResultsReceived(queryId, DirectoryCategory.EVENTS, results))
+            }
+            WorldManagementPackets.MSG_AGENT_GROUP_DATA_UPDATE -> {
+                val groups = WorldManagementPackets.parseAgentGroupDataUpdate(buf)
+                if (groups.isNotEmpty()) {
+                    _events.tryEmit(SimEvent.AgentGroupsUpdated(groups))
+                }
+            }
+            WorldManagementPackets.MSG_GROUP_PROFILE_REPLY -> {
+                WorldManagementPackets.parseGroupProfileReply(buf)?.let {
+                    _events.tryEmit(SimEvent.GroupProfileReceived(it))
+                }
+            }
+            WorldManagementPackets.MSG_GROUP_TITLES_REPLY -> {
+                val (groupId, titles) = WorldManagementPackets.parseGroupTitlesReply(buf)
+                if (groupId != ZERO_UUID) {
+                    _events.tryEmit(SimEvent.GroupTitlesReceived(groupId, titles))
+                }
+            }
+            WorldManagementPackets.MSG_GROUP_ROLE_DATA_REPLY -> {
+                val (groupId, roles) = WorldManagementPackets.parseGroupRoleDataReply(buf)
+                if (groupId != ZERO_UUID) {
+                    _events.tryEmit(SimEvent.GroupRolesReceived(groupId, roles))
+                }
+            }
+            WorldManagementPackets.MSG_PARCEL_INFO_REPLY -> {
+                WorldManagementPackets.parseParcelInfoReply(buf)?.let {
+                    _events.tryEmit(SimEvent.ParcelInfoReceived(it))
+                }
+            }
+            WorldManagementPackets.MSG_PARCEL_PROPERTIES -> {
+                WorldManagementPackets.parseParcelProperties(buf)?.let {
+                    _events.tryEmit(SimEvent.ParcelPropertiesReceived(it))
+                }
+            }
+            WorldManagementPackets.MSG_MUTE_LIST_UPDATE -> {
+                WorldManagementPackets.parseMuteListUpdate(buf)?.let { (_, filename) ->
+                    _events.tryEmit(SimEvent.MuteListSyncReceived(filename = filename, cached = false))
+                }
+            }
+            WorldManagementPackets.MSG_USE_CACHED_MUTE_LIST -> {
+                _events.tryEmit(SimEvent.MuteListSyncReceived(filename = "", cached = true))
+            }
+            WorldManagementPackets.MSG_PAY_PRICE_REPLY -> {
+                WorldManagementPackets.parsePayPriceReply(buf)?.let {
+                    _events.tryEmit(SimEvent.PayPriceReceived(it))
+                }
             }
         }
     }
@@ -1309,6 +1395,186 @@ class LludpCircuitEngine {
         if (!running.get()) return
         val body = LludpPackets.buildDetachAttachment(agentId, sessionId, itemId)
         send(LludpPackets.MSG_DETACH_ATTACHMENT, body, reliable = true)
+    }
+
+    // ── Phase 10 World Management Outbound Senders ──────────────────────
+
+    fun sendDirectorySearch(queryId: UUID, queryText: String, category: DirectoryCategory) {
+        if (!running.get()) return
+        if (category == DirectoryCategory.PLACES) {
+            val body = WorldManagementPackets.buildDirPlacesQuery(
+                agentId = agentId,
+                sessionId = sessionId,
+                queryId = queryId,
+                queryText = queryText,
+                queryFlags = category.defaultFlags
+            )
+            send(WorldManagementPackets.MSG_DIR_PLACES_QUERY, body, reliable = true, zeroCode = true)
+        } else {
+            val body = WorldManagementPackets.buildDirFindQuery(
+                agentId = agentId,
+                sessionId = sessionId,
+                queryId = queryId,
+                queryText = queryText,
+                queryFlags = category.defaultFlags
+            )
+            send(WorldManagementPackets.MSG_DIR_FIND_QUERY, body, reliable = true, zeroCode = true)
+        }
+    }
+
+    fun sendActivateGroup(groupId: UUID) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildActivateGroup(agentId, sessionId, groupId)
+        send(WorldManagementPackets.MSG_ACTIVATE_GROUP, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendGroupDetailsRequests(groupId: UUID) {
+        if (!running.get()) return
+        send(
+            WorldManagementPackets.MSG_GROUP_PROFILE_REQUEST,
+            WorldManagementPackets.buildGroupProfileRequest(agentId, sessionId, groupId),
+            reliable = true
+        )
+        send(
+            WorldManagementPackets.MSG_GROUP_TITLES_REQUEST,
+            WorldManagementPackets.buildGroupTitlesRequest(agentId, sessionId, groupId),
+            reliable = true
+        )
+        send(
+            WorldManagementPackets.MSG_GROUP_ROLE_DATA_REQUEST,
+            WorldManagementPackets.buildGroupRoleDataRequest(agentId, sessionId, groupId),
+            reliable = true
+        )
+    }
+
+    fun sendGroupTitleUpdate(groupId: UUID, titleRoleId: UUID) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildGroupTitleUpdate(agentId, sessionId, groupId, titleRoleId)
+        send(WorldManagementPackets.MSG_GROUP_TITLE_UPDATE, body, reliable = true)
+    }
+
+    fun sendGroupNotice(groupId: UUID, fromAgentName: String, subject: String, message: String) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildGroupNoticePacket(
+            agentId = agentId,
+            sessionId = sessionId,
+            groupId = groupId,
+            fromAgentName = fromAgentName,
+            subject = subject,
+            message = message
+        )
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendParcelPropertiesAt(pos: Vec3) {
+        if (!running.get()) return
+        val west = (pos.x - 2f).coerceIn(0f, 252f)
+        val south = (pos.y - 2f).coerceIn(0f, 252f)
+        val body = WorldManagementPackets.buildParcelPropertiesRequest(
+            agentId = agentId,
+            sessionId = sessionId,
+            west = west,
+            south = south,
+            east = (west + 4f).coerceAtMost(256f),
+            north = (south + 4f).coerceAtMost(256f)
+        )
+        send(WorldManagementPackets.MSG_PARCEL_PROPERTIES_REQUEST, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendParcelInfoRequest(parcelId: UUID) {
+        if (!running.get() || parcelId == ZERO_UUID) return
+        val body = WorldManagementPackets.buildParcelInfoRequest(agentId, sessionId, parcelId)
+        send(WorldManagementPackets.MSG_PARCEL_INFO_REQUEST, body, reliable = true)
+    }
+
+    fun sendParcelReturnObjects(localId: Int, returnType: ParcelReturnType) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildParcelReturnObjects(
+            agentId = agentId,
+            sessionId = sessionId,
+            localId = localId,
+            returnType = returnType
+        )
+        send(WorldManagementPackets.MSG_PARCEL_RETURN_OBJECTS, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendParcelBuyPass(localId: Int) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildParcelBuyPass(agentId, sessionId, localId)
+        send(WorldManagementPackets.MSG_PARCEL_BUY_PASS, body, reliable = true)
+    }
+
+    fun sendCreateInventoryFolder(folderId: UUID, parentId: UUID, type: Int, name: String) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildCreateInventoryFolder(
+            agentId = agentId,
+            sessionId = sessionId,
+            folderId = folderId,
+            parentId = parentId,
+            type = type,
+            name = name
+        )
+        send(WorldManagementPackets.MSG_CREATE_INVENTORY_FOLDER, body, reliable = true)
+    }
+
+    fun sendLinkInventoryItem(
+        callbackId: Int = 0,
+        folderId: UUID,
+        oldItemId: UUID,
+        assetType: Int,
+        invType: Int,
+        name: String,
+        description: String
+    ) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildLinkInventoryItem(
+            agentId = agentId,
+            sessionId = sessionId,
+            callbackId = callbackId,
+            folderId = folderId,
+            oldItemId = oldItemId,
+            assetType = assetType,
+            invType = invType,
+            name = name,
+            description = description
+        )
+        send(WorldManagementPackets.MSG_LINK_INVENTORY_ITEM, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendMuteListRequest(muteCrc: Int = 0) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildMuteListRequest(agentId, sessionId, muteCrc)
+        send(WorldManagementPackets.MSG_MUTE_LIST_REQUEST, body, reliable = true)
+    }
+
+    fun sendUpdateMuteListEntry(entry: MuteEntry) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildUpdateMuteListEntry(agentId, sessionId, entry)
+        send(WorldManagementPackets.MSG_UPDATE_MUTE_LIST_ENTRY, body, reliable = true)
+    }
+
+    fun sendRemoveMuteListEntry(muteId: UUID, muteName: String) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildRemoveMuteListEntry(agentId, sessionId, muteId, muteName)
+        send(WorldManagementPackets.MSG_REMOVE_MUTE_LIST_ENTRY, body, reliable = true)
+    }
+
+    fun sendRequestPayPrice(objectId: UUID) {
+        if (!running.get() || objectId == ZERO_UUID) return
+        val body = WorldManagementPackets.buildRequestPayPrice(objectId)
+        send(WorldManagementPackets.MSG_REQUEST_PAY_PRICE, body, reliable = true)
+    }
+
+    fun sendMoneyTransferRequest(destId: UUID, amount: Int, description: String = "") {
+        if (!running.get() || amount <= 0) return
+        val body = WorldManagementPackets.buildMoneyTransferRequest(
+            agentId = agentId,
+            sessionId = sessionId,
+            destId = destId,
+            amount = amount,
+            description = description
+        )
+        send(WorldManagementPackets.MSG_MONEY_TRANSFER_REQUEST, body, reliable = true, zeroCode = true)
     }
 
     private fun flushPendingAcks() {

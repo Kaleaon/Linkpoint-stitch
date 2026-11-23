@@ -1,5 +1,6 @@
 package com.example.linkpoint.ui
 
+import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
@@ -22,6 +23,7 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Chair
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.TouchApp
@@ -30,6 +32,8 @@ import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
@@ -38,6 +42,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -55,12 +60,17 @@ import com.example.linkpoint.designsystem.DesignPresets
 import com.example.linkpoint.designsystem.DockPosition
 import com.example.linkpoint.designsystem.DockToolId
 import com.example.linkpoint.designsystem.JoystickSide
+import com.example.linkpoint.designsystem.KthemeCatalog
+import com.example.linkpoint.designsystem.KthemeFamily
+import com.example.linkpoint.designsystem.LcarsUnboxedReadout
 import com.example.linkpoint.designsystem.LinkpointActionButton
+import com.example.linkpoint.designsystem.LinkpointContrast
 import com.example.linkpoint.designsystem.LinkpointFloaterHeader
 import com.example.linkpoint.designsystem.LinkpointStatusChip
 import com.example.linkpoint.designsystem.LocalLinkpointDesign
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.designsystem.UiDensity
+import com.example.linkpoint.management.PayPriceInfo
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.EnvironmentPreset
 import com.example.linkpoint.scene.HudAttachmentPoint
@@ -94,76 +104,175 @@ fun ObjectInspectorContent(
         }
 
         val shape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(12.dp))
+        val payPrice = state.worldManagement.payPrices[obj.uuid] ?: PayPriceInfo(obj.uuid)
+        val quickButtons = payPrice.resolvedQuickButtons()
+        var customPayText by remember(obj.uuid, payPrice.effectiveDefaultPrice) {
+            mutableStateOf((payPrice.effectiveDefaultPrice ?: 10).toString())
+        }
+
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(shape)
-                .background(tokens.surfaceElevated.copy(alpha = 0.78f))
-                .border(1.dp, tokens.borderHairline, shape)
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
+                .heightIn(max = 320.dp)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(shape)
+                    .background(tokens.surfaceElevated.copy(alpha = 0.78f))
+                    .border(1.dp, tokens.borderHairline, shape)
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = obj.name,
+                        style = MaterialTheme.typography.titleMedium.copy(color = tokens.textPrimary),
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = { clipboard.setText(AnnotatedString(obj.uuid.toString())) }) {
+                        Icon(Icons.Default.ContentCopy, contentDescription = "Copy Object UUID", tint = tokens.accentPrimary)
+                    }
+                }
+                if (obj.description.isNotBlank()) {
+                    Text(
+                        text = obj.description,
+                        style = MaterialTheme.typography.bodySmall.copy(color = tokens.textSecondary)
+                    )
+                }
                 Text(
-                    text = obj.name,
-                    style = MaterialTheme.typography.titleMedium.copy(color = tokens.textPrimary),
-                    modifier = Modifier.weight(1f)
+                    text = "UUID: ${obj.uuid}",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = tokens.monoFont, color = tokens.textMuted)
                 )
-                IconButton(onClick = { clipboard.setText(AnnotatedString(obj.uuid.toString())) }) {
-                    Icon(Icons.Default.ContentCopy, contentDescription = "Copy Object UUID", tint = tokens.accentPrimary)
+                Text(
+                    text = "POS: <${"%.2f".format(obj.position.x)}, ${"%.2f".format(obj.position.y)}, ${"%.2f".format(obj.position.z)}>  •  SIZE: <${"%.2f".format(obj.scale.x)}, ${"%.2f".format(obj.scale.y)}, ${"%.2f".format(obj.scale.z)}>",
+                    style = MaterialTheme.typography.labelSmall.copy(fontFamily = tokens.monoFont, color = tokens.accentSecondary)
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    if (obj.isScripted) LinkpointStatusChip("Scripted", tokens.accentTertiary)
+                    if (obj.isFullbright) LinkpointStatusChip("Fullbright", tokens.accentPrimary)
+                    if (obj.isPhantom) LinkpointStatusChip("Phantom", tokens.textSecondary)
+                    if (obj.isHudAttachment) LinkpointStatusChip("HUD Slot ${obj.attachmentPoint}", tokens.statusOnline)
                 }
             }
-            if (obj.description.isNotBlank()) {
-                Text(
-                    text = obj.description,
-                    style = MaterialTheme.typography.bodySmall.copy(color = tokens.textSecondary)
+
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                LinkpointActionButton(
+                    text = "Touch",
+                    icon = Icons.Default.TouchApp,
+                    onClick = client::touchSelectedObject,
+                    primary = true,
+                    testTag = "inspector_touch_button",
+                    modifier = Modifier.weight(1f)
+                )
+                LinkpointActionButton(
+                    text = if (state.isSitting) "Stand" else "Sit",
+                    icon = Icons.Default.Chair,
+                    onClick = client::toggleSitOnSelected,
+                    primary = false,
+                    modifier = Modifier.weight(0.9f)
+                )
+                LinkpointActionButton(
+                    text = "Focus",
+                    icon = Icons.Default.CenterFocusStrong,
+                    onClick = { client.focusCameraOn(obj.position) },
+                    primary = false,
+                    modifier = Modifier.weight(0.9f)
                 )
             }
-            Text(
-                text = "UUID: ${obj.uuid}",
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = tokens.monoFont, color = tokens.textMuted)
-            )
-            Text(
-                text = "POS: <${"%.2f".format(obj.position.x)}, ${"%.2f".format(obj.position.y)}, ${"%.2f".format(obj.position.z)}>  •  SIZE: <${"%.2f".format(obj.scale.x)}, ${"%.2f".format(obj.scale.y)}, ${"%.2f".format(obj.scale.z)}>",
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = tokens.monoFont, color = tokens.accentSecondary)
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (obj.isScripted) LinkpointStatusChip("Scripted", tokens.accentTertiary)
-                if (obj.isFullbright) LinkpointStatusChip("Fullbright", tokens.accentPrimary)
-                if (obj.isPhantom) LinkpointStatusChip("Phantom", tokens.textSecondary)
-                if (obj.isHudAttachment) LinkpointStatusChip("HUD Slot ${obj.attachmentPoint}", tokens.statusOnline)
+
+            // Vendor / Object Quick-Pay (PayPriceReply + MoneyTransferRequest)
+            if (quickButtons.isNotEmpty() || payPrice.allowCustomAmount) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(shape)
+                        .background(tokens.surfaceElevated.copy(alpha = 0.76f))
+                        .border(1.dp, tokens.borderHairline, shape)
+                        .padding(10.dp)
+                        .testTag("vendor_quick_pay_panel"),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Vendor Quick-Pay",
+                            style = MaterialTheme.typography.labelMedium.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = tokens.textPrimary
+                            )
+                        )
+                        Text(
+                            text = "Balance: L$${state.lindenBalance}",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = tokens.monoFont,
+                                color = tokens.statusOnline
+                            )
+                        )
+                    }
+
+                    if (quickButtons.isNotEmpty()) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            quickButtons.forEach { amount ->
+                                LinkpointStatusChip(
+                                    label = "L$$amount",
+                                    color = tokens.accentPrimary,
+                                    onClick = { client.payObject(obj.uuid, obj.name, amount) },
+                                    modifier = Modifier.testTag("quick_pay_$amount")
+                                )
+                            }
+                        }
+                    }
+
+                    if (payPrice.allowCustomAmount) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            OutlinedTextField(
+                                value = customPayText,
+                                onValueChange = { customPayText = it.filter { ch -> ch.isDigit() } },
+                                singleLine = true,
+                                placeholder = { Text("L$ amount", color = tokens.textMuted) },
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = tokens.textPrimary,
+                                    unfocusedTextColor = tokens.textPrimary,
+                                    focusedBorderColor = tokens.accentPrimary,
+                                    unfocusedBorderColor = tokens.borderHairline
+                                ),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("custom_pay_input")
+                            )
+                            LinkpointActionButton(
+                                text = "Pay L$",
+                                icon = Icons.Default.Payments,
+                                onClick = {
+                                    val amt = customPayText.toIntOrNull() ?: 0
+                                    client.payObject(obj.uuid, obj.name, amt)
+                                },
+                                primary = true,
+                                testTag = "custom_pay_button"
+                            )
+                        }
+                    }
+                }
             }
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            LinkpointActionButton(
-                text = "Touch",
-                icon = Icons.Default.TouchApp,
-                onClick = client::touchSelectedObject,
-                primary = true,
-                testTag = "inspector_touch_button",
-                modifier = Modifier.weight(1f)
-            )
-            LinkpointActionButton(
-                text = if (state.isSitting) "Stand" else "Sit",
-                icon = Icons.Default.Chair,
-                onClick = client::toggleSitOnSelected,
-                primary = false,
-                modifier = Modifier.weight(0.9f)
-            )
-            LinkpointActionButton(
-                text = "Focus",
-                icon = Icons.Default.CenterFocusStrong,
-                onClick = { client.focusCameraOn(obj.position) },
-                primary = false,
-                modifier = Modifier.weight(0.9f)
-            )
         }
     }
 }
@@ -300,10 +409,18 @@ fun AvatarHudManagerContent(
     }
 }
 
+@Composable
+fun DesignStudioContent(
+    state: ViewerState,
+    client: ViewerClient,
+    onClose: () -> Unit
+) = LayoutDesignStudioContent(state = state, client = client, onClose = onClose)
+
 /**
- * Live Personal Layout & Design Studio — lets residents switch between
- * Polished, Terminal, Sweep Console (LCARS), and Metro, edit chrome placement,
- * reorder pinned Dock tools, tune opacity/scale, and save personal presets live over 3D.
+ * Live Personal Layout & Design Studio — lets residents switch between all 6
+ * `linkpoint-design` layout packs (Polished, Terminal, Sweep Console / LCARS, Metro,
+ * Rule & Rail, and Press), browse 32 WCAG-verified Ktheme palettes across 4 aesthetic
+ * families, edit chrome placement, reorder pinned Dock tools, and save personal presets.
  */
 @Composable
 fun LayoutDesignStudioContent(
@@ -312,18 +429,21 @@ fun LayoutDesignStudioContent(
     onClose: () -> Unit
 ) {
     val tokens = LocalLinkpointDesign.current
-    var tab by remember { mutableIntStateOf(0) } // 0 = Design Language, 1 = Layout & Chrome, 2 = Tools & World
+    var tab by remember { mutableIntStateOf(0) } // 0 = Layouts & Kthemes, 1 = Layout & Chrome, 2 = Tools & World
+    val audit = remember(tokens) { LinkpointContrast.auditTokens(tokens) }
+    val activeKtheme = remember(state.design.kthemeId) { KthemeCatalog.findById(state.design.kthemeId) }
+    val bodyScroll = remember(tab) { ScrollState(0) }
 
     Column(
         modifier = Modifier
             .fillMaxWidth()
-            .heightIn(max = 380.dp)
-            .verticalScroll(rememberScrollState()),
+            .heightIn(max = 395.dp)
+            .testTag("design_studio_floater"),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         LinkpointFloaterHeader(
             title = "Personal Layout & Design Studio",
-            subtitle = "${state.design.designLanguage.displayName} • ${state.design.dockPosition.label} • Live Preview",
+            subtitle = "${state.design.designLanguage.displayName} • ${activeKtheme?.name ?: state.design.accentPreset.label} • WCAG ${"%.1f".format(audit.textOnFloater)}:1",
             lcarsCode = "07-SYS",
             onClose = onClose
         )
@@ -334,14 +454,43 @@ fun LayoutDesignStudioContent(
                 .horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            LinkpointStatusChip("Theme & Presets", if (tab == 0) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 0 })
+            LinkpointStatusChip("Layouts & Kthemes", if (tab == 0) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 0 })
             LinkpointStatusChip("Layout & Ergonomics", if (tab == 1) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 1 })
             LinkpointStatusChip("Dock Tools & Sky", if (tab == 2) tokens.accentPrimary else tokens.textMuted, onClick = { tab = 2 })
         }
 
-        when (tab) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .verticalScroll(bodyScroll),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            when (tab) {
             0 -> {
-                Text("Design Language", style = MaterialTheme.typography.titleSmall.copy(color = tokens.textPrimary))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("6 Layout Languages", style = MaterialTheme.typography.titleSmall.copy(color = tokens.textPrimary))
+                    LinkpointStatusChip(
+                        label = if (audit.passesAllAA) "WCAG AA PASS (${"%.1f".format(audit.textOnFloater)}:1)" else "Contrast ${"%.1f".format(audit.textOnFloater)}:1",
+                        color = if (audit.passesAllAA) tokens.statusOnline else tokens.statusWarning,
+                        modifier = Modifier.testTag("wcag_audit_badge")
+                    )
+                }
+
+                if (tokens.language == DesignLanguage.LCARS) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        LcarsUnboxedReadout(label = "FIELD", value = "#000000", accentColor = tokens.accentPrimary)
+                        LcarsUnboxedReadout(label = "CONTRAST", value = "${"%.1f".format(audit.textOnCanvas)}:1", accentColor = tokens.accentSecondary)
+                        LcarsUnboxedReadout(label = "KTHEME", value = (activeKtheme?.id ?: "DEFAULT").take(10).uppercase(), accentColor = tokens.accentTertiary)
+                    }
+                }
+
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                     DesignLanguage.entries.forEach { lang ->
                         val active = state.design.designLanguage == lang
@@ -370,7 +519,39 @@ fun LayoutDesignStudioContent(
                     }
                 }
 
-                Text("Accent Palette", style = MaterialTheme.typography.titleSmall.copy(color = tokens.textPrimary))
+                Text(
+                    text = "Ktheme Palettes (${KthemeCatalog.ALL.size} across 4 Families)",
+                    style = MaterialTheme.typography.titleSmall.copy(color = tokens.textPrimary)
+                )
+                KthemeFamily.entries.forEach { family ->
+                    val familyPalettes = KthemeCatalog.byFamily(family)
+                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text(
+                            text = "${family.displayName} — ${family.subtitle}",
+                            style = MaterialTheme.typography.labelSmall.copy(
+                                fontFamily = tokens.monoFont,
+                                color = tokens.accentSecondary,
+                                fontWeight = FontWeight.Bold
+                            )
+                        )
+                        Row(
+                            modifier = Modifier.horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            familyPalettes.forEach { palette ->
+                                val selected = state.design.kthemeId.equals(palette.id, ignoreCase = true)
+                                LinkpointStatusChip(
+                                    label = palette.name,
+                                    color = if (selected) tokens.statusOnline else palette.accentPrimary,
+                                    onClick = { client.setKthemePalette(palette.id) },
+                                    modifier = Modifier.testTag("ktheme_chip_${palette.id}")
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Text("Quick Accent Override", style = MaterialTheme.typography.titleSmall.copy(color = tokens.textPrimary))
                 Row(
                     modifier = Modifier.horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -378,13 +559,13 @@ fun LayoutDesignStudioContent(
                     AccentPreset.entries.forEach { preset ->
                         LinkpointStatusChip(
                             label = preset.label,
-                            color = if (state.design.accentPreset == preset) tokens.accentPrimary else tokens.textMuted,
+                            color = if (state.design.kthemeId.isBlank() && state.design.accentPreset == preset) tokens.accentPrimary else tokens.textMuted,
                             onClick = { client.setAccentPreset(preset) }
                         )
                     }
                 }
 
-                if (state.design.designLanguage == DesignLanguage.POLISHED || state.design.designLanguage == DesignLanguage.METRO) {
+                if (state.design.designLanguage != DesignLanguage.LCARS) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -560,6 +741,7 @@ fun LayoutDesignStudioContent(
                         }
                     }
                 }
+            }
             }
         }
     }

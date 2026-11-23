@@ -52,6 +52,7 @@ import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Inventory2
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.Palette
+import androidx.compose.material.icons.filled.Public
 import androidx.compose.material.icons.filled.Radar
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Videocam
@@ -103,6 +104,7 @@ import com.example.linkpoint.scene.HudAttachmentPoint
 import com.example.linkpoint.scene.ProjectedNametag
 import com.example.linkpoint.store.ConnectionState
 import com.example.linkpoint.store.ViewerState
+import com.example.linkpoint.ui.floaters.WorldManagementFloaterContent
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -413,6 +415,7 @@ fun InWorldCockpitScreen(
                                 DockToolId.CHAT -> ChatFloaterContent(state, client) { client.toggleFloater(null) }
                                 DockToolId.RADAR -> RadarFloaterContent(state, client) { client.toggleFloater(null) }
                                 DockToolId.MAP -> MapFloaterContent(state, client) { client.toggleFloater(null) }
+                                DockToolId.WORLD -> WorldManagementFloaterContent(state, client) { client.toggleFloater(null) }
                                 DockToolId.INVENTORY -> InventoryFloaterContent(state, client) { client.toggleFloater(null) }
                                 DockToolId.INSPECTOR -> ObjectInspectorContent(state, client) { client.toggleFloater(null) }
                                 DockToolId.HUDS -> AvatarHudManagerContent(state, client) { client.toggleFloater(null) }
@@ -752,6 +755,8 @@ private fun FloatingAvatarNametagsOverlay(
             DesignLanguage.LCARS -> 99.dp
             DesignLanguage.METRO -> 0.dp
             DesignLanguage.TERMINAL -> 2.dp
+            DesignLanguage.RULE_AND_RAIL -> 2.dp
+            DesignLanguage.PRESS -> 4.dp
             DesignLanguage.POLISHED -> 12.dp
         }
     )
@@ -914,6 +919,8 @@ private fun CompactTelemetryPill(
             DesignLanguage.LCARS -> 99.dp
             DesignLanguage.METRO -> 0.dp
             DesignLanguage.TERMINAL -> 2.dp
+            DesignLanguage.RULE_AND_RAIL -> 2.dp
+            DesignLanguage.PRESS -> 4.dp
             DesignLanguage.POLISHED -> 20.dp
         }
     )
@@ -993,6 +1000,8 @@ private fun TopRightMiniControls(
             DesignLanguage.LCARS -> 99.dp
             DesignLanguage.METRO -> 0.dp
             DesignLanguage.TERMINAL -> 2.dp
+            DesignLanguage.RULE_AND_RAIL -> 2.dp
+            DesignLanguage.PRESS -> 4.dp
             DesignLanguage.POLISHED -> 20.dp
         }
     )
@@ -1061,6 +1070,8 @@ private fun SlimActionDock(
             DesignLanguage.LCARS -> 99.dp
             DesignLanguage.METRO -> 0.dp
             DesignLanguage.TERMINAL -> 2.dp
+            DesignLanguage.RULE_AND_RAIL -> 3.dp
+            DesignLanguage.PRESS -> 4.dp
             DesignLanguage.POLISHED -> 22.dp
         }
     )
@@ -1112,6 +1123,7 @@ private fun SlimDockToolButton(
         DockToolId.CHAT -> Icons.AutoMirrored.Filled.Chat
         DockToolId.RADAR -> Icons.Default.Radar
         DockToolId.MAP -> Icons.Default.Explore
+        DockToolId.WORLD -> Icons.Default.Public
         DockToolId.INVENTORY -> Icons.Default.Inventory2
         DockToolId.INSPECTOR -> Icons.Default.Info
         DockToolId.HUDS -> Icons.Default.Layers
@@ -1122,6 +1134,8 @@ private fun SlimDockToolButton(
             DesignLanguage.LCARS -> 99.dp
             DesignLanguage.METRO -> 0.dp
             DesignLanguage.TERMINAL -> 2.dp
+            DesignLanguage.RULE_AND_RAIL -> 2.dp
+            DesignLanguage.PRESS -> 4.dp
             DesignLanguage.POLISHED -> 16.dp
         }
     )

@@ -1,5 +1,8 @@
 package com.example.linkpoint.protocol
 
+import com.example.linkpoint.management.LindenNotecardCodec
+import com.example.linkpoint.management.NotecardCapProtocol
+import com.example.linkpoint.management.NotecardUploadResult
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -116,7 +119,11 @@ class CapabilityManager(
             "UpdateAgentInformation",
             "ChatSessionRequest",
             "MapLayer",
-            "EnvironmentSettings"
+            "EnvironmentSettings",
+            "UpdateNotecardAgentInventory",
+            "UpdateNotecardTaskInventory",
+            "CopyInventoryFromNotecard",
+            "ParcelPropertiesUpdate"
         )
 
         /**
@@ -704,6 +711,96 @@ class CapabilityManager(
             }
             emptyList()
         }
+
+    /**
+     * Two-stage Second Life `UpdateNotecardAgentInventory` (or `UpdateNotecardTaskInventory`)
+     * Seed CAP upload:
+     * 1. POST LLSD XML `{ item_id: <uuid> }` to capability URL to obtain `uploader` URL.
+     * 2. POST `Linden text version 2` payload (`application/vnd.ll.notecard`) to `uploader` URL
+     *    and parse `{ state: "complete", new_asset: <uuid> }`.
+     */
+    suspend fun updateNotecardAgentInventory(
+        itemId: UUID,
+        bodyText: String,
+        taskId: UUID? = null
+    ): NotecardUploadResult = withContext(Dispatchers.IO) {
+        val capName = if (taskId == null) {
+            NotecardCapProtocol.CAP_UPDATE_NOTECARD_AGENT
+        } else {
+            NotecardCapProtocol.CAP_UPDATE_NOTECARD_TASK
+        }
+        val capUrl = capabilities[capName]
+            ?: return@withContext NotecardUploadResult(
+                success = false,
+                newAssetId = null,
+                statusMessage = "Capability $capName not negotiated on region"
+            )
+
+        try {
+            val initXml = NotecardCapProtocol.buildRequestXml(itemId = itemId, taskId = taskId)
+            val initReq = Request.Builder()
+                .url(capUrl)
+                .header("Accept", "application/llsd+xml")
+                .post(initXml.toRequestBody(LLSD_XML_MEDIA))
+                .build()
+
+            val uploaderUrl = httpClient.newCall(initReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return@withContext NotecardUploadResult(
+                        success = false,
+                        newAssetId = null,
+                        statusMessage = "Notecard uploader init HTTP ${resp.code}"
+                    )
+                }
+                val xml = resp.body?.string().orEmpty()
+                NotecardCapProtocol.parseUploaderUrl(xml, lastSeedUrl.ifBlank { capUrl })
+            } ?: return@withContext NotecardUploadResult(
+                success = false,
+                newAssetId = null,
+                statusMessage = "Missing uploader URL in $capName reply"
+            )
+
+            val notecardBytes = LindenNotecardCodec.encode(bodyText)
+            val uploadMedia = LindenNotecardCodec.MIME_TYPE.toMediaType()
+            val uploadReq = Request.Builder()
+                .url(uploaderUrl)
+                .header("Accept", "application/llsd+xml")
+                .post(notecardBytes.toRequestBody(uploadMedia))
+                .build()
+
+            httpClient.newCall(uploadReq).execute().use { uploadResp ->
+                if (!uploadResp.isSuccessful) {
+                    return@withContext NotecardUploadResult(
+                        success = false,
+                        newAssetId = null,
+                        statusMessage = "Notecard asset upload HTTP ${uploadResp.code}"
+                    )
+                }
+                NotecardCapProtocol.parseUploadReply(uploadResp.body?.string().orEmpty())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val classified = NetworkResilience.classifyException(ProtocolLayer.CAPS_SEED, capName, e)
+            _capsEvents.tryEmit(
+                CapsEvent.CapsError(
+                    classified.layer,
+                    classified.category,
+                    classified.userMessage,
+                    classified.technicalDetail
+                )
+            )
+            NotecardUploadResult(
+                success = false,
+                newAssetId = null,
+                statusMessage = classified.userMessage
+            )
+        }
+    }
+
+    fun registerCapabilityUrl(name: String, url: String) {
+        capabilities[name] = url
+    }
 
     fun getCapabilityUrl(name: String): String? = capabilities[name]
 

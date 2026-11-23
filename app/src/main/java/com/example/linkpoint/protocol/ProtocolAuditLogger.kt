@@ -13,9 +13,11 @@ import java.util.UUID
  * 3. Incoming Seed CAPS responses & capability endpoint tokens
  * 4. LLUDP circuit & RegionHandshake / RegionHandshakeReply tokens
  */
+val ZERO_UUID: UUID = UUID(0L, 0L)
+
 object ProtocolAuditLogger {
     const val LOG_TAG = "LinkpointProtocol"
-    val ZERO_UUID: UUID = UUID(0L, 0L)
+    val ZERO_UUID: UUID = com.example.linkpoint.protocol.ZERO_UUID
 
     private val CANONICAL_UUID_REGEX = Regex(
         "^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"

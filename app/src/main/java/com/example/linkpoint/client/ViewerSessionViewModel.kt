@@ -17,9 +17,30 @@ import com.example.linkpoint.designsystem.DesignStarterPreset
 import com.example.linkpoint.designsystem.DockPosition
 import com.example.linkpoint.designsystem.DockToolId
 import com.example.linkpoint.designsystem.JoystickSide
+import com.example.linkpoint.designsystem.KthemeCatalog
 import com.example.linkpoint.designsystem.PersonalDesignState
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.designsystem.UiDensity
+import com.example.linkpoint.management.DirectoryCategory
+import com.example.linkpoint.management.DirectorySearchResult
+import com.example.linkpoint.management.EditableNotecard
+import com.example.linkpoint.management.GroupMembershipInfo
+import com.example.linkpoint.management.GroupNoticeRecord
+import com.example.linkpoint.management.GroupPowers
+import com.example.linkpoint.management.GroupProfileInfo
+import com.example.linkpoint.management.GroupRoleInfo
+import com.example.linkpoint.management.GroupTitleInfo
+import com.example.linkpoint.management.MuteEntry
+import com.example.linkpoint.management.MuteFlags
+import com.example.linkpoint.management.MuteType
+import com.example.linkpoint.management.OutfitFolderPlanner
+import com.example.linkpoint.management.OutfitInventoryConstants
+import com.example.linkpoint.management.ParcelFlags
+import com.example.linkpoint.management.ParcelManagementInfo
+import com.example.linkpoint.management.ParcelReturnType
+import com.example.linkpoint.management.PayPriceInfo
+import com.example.linkpoint.management.SavedOutfitRecord
+import com.example.linkpoint.management.WorldManagementState
 import com.example.linkpoint.protocol.AssetStreamEvent
 import com.example.linkpoint.protocol.CapabilityManager
 import com.example.linkpoint.protocol.CapsAttachmentTransform
@@ -192,6 +213,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     is SimEvent.RegionHandshakeReceived -> {
                         terrain.waterHeight = evt.waterHeight
                         lludpEngine.requestMapBlocks(lastRegionGridX, lastRegionGridY)
+                        lludpEngine.sendMuteListRequest()
+                        lludpEngine.sendParcelPropertiesAt(_state.value.avatarPosition)
                         _state.update { s ->
                             val conn = s.connection
                             val updatedConn = if (conn is ConnectionState.Connected) {
@@ -199,6 +222,11 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             } else conn
                             s.copy(
                                 connection = updatedConn,
+                                worldManagement = s.worldManagement.copy(
+                                    currentParcel = s.worldManagement.currentParcel.copy(
+                                        simName = evt.regionName.ifBlank { s.worldManagement.currentParcel.simName }
+                                    )
+                                ),
                                 localChat = (s.localChat + ChatMessage(
                                     speaker = "Region",
                                     text = "Connected to ${evt.regionName} (Water ${evt.waterHeight}m)",
@@ -209,14 +237,47 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         pushSceneSnapshot()
                     }
                     is SimEvent.ChatReceived -> {
-                        val msg = ChatMessage(speaker = evt.fromName, text = evt.message)
-                        appendLocalChat(msg)
-                        viewModelScope.launch {
-                            cacheRepo.logChat(evt.fromName, evt.message, 0, currentRegionName())
+                        val isMuted = _state.value.worldManagement.muteList.any {
+                            it.muteId == evt.sourceId || it.name.equals(evt.fromName, ignoreCase = true)
+                        }
+                        if (!isMuted) {
+                            val msg = ChatMessage(speaker = evt.fromName, text = evt.message)
+                            appendLocalChat(msg)
+                            viewModelScope.launch {
+                                cacheRepo.logChat(evt.fromName, evt.message, 0, currentRegionName())
+                            }
                         }
                     }
                     is SimEvent.InstantMessageReceived -> {
-                        appendImMessage(evt.imSessionId, evt.fromAgentId, evt.fromName, evt.fromName, evt.message)
+                        val isMuted = _state.value.worldManagement.muteList.any {
+                            it.muteId == evt.fromAgentId || it.name.equals(evt.fromName, ignoreCase = true)
+                        }
+                        if (!isMuted) {
+                            if (evt.dialog == 32 || evt.dialog == 37) {
+                                val parts = evt.message.split("|", limit = 2)
+                                val subj = parts.firstOrNull()?.ifBlank { "Group Notice" } ?: "Group Notice"
+                                val body = parts.getOrNull(1)?.ifBlank { evt.message } ?: evt.message
+                                val matchingGroup = _state.value.worldManagement.groups.firstOrNull {
+                                    it.groupId == evt.imSessionId
+                                }
+                                val notice = GroupNoticeRecord(
+                                    id = UUID.randomUUID().toString(),
+                                    groupId = matchingGroup?.groupId ?: evt.imSessionId,
+                                    groupName = matchingGroup?.name ?: "Group Notice",
+                                    subject = subj,
+                                    message = body,
+                                    senderName = evt.fromName,
+                                    timestampLabel = "Just now"
+                                )
+                                mutateWorldManagement { wm ->
+                                    wm.copy(
+                                        groupNotices = (listOf(notice) + wm.groupNotices).take(30),
+                                        lastManagementStatus = "Group notice: $subj"
+                                    )
+                                }
+                            }
+                            appendImMessage(evt.imSessionId, evt.fromAgentId, evt.fromName, evt.fromName, evt.message)
+                        }
                     }
                     is SimEvent.ObjectUpdated -> {
                         val obj = mergeIncomingObjectWithCaps(evt.sceneObject)
@@ -529,6 +590,106 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             val next = (s.mapRegions.filterNot { it.gridX == evt.x && it.gridY == evt.y } + tile)
                                 .takeLast(48)
                             s.copy(mapRegions = next)
+                        }
+                    }
+                    is SimEvent.DirectoryResultsReceived -> {
+                        mutateWorldManagement { wm ->
+                            val combined = (wm.searchResults.filterNot { res ->
+                                evt.results.any { it.id == res.id }
+                            } + evt.results).takeLast(60)
+                            wm.copy(
+                                isSearching = false,
+                                searchCategory = evt.category,
+                                searchResults = combined,
+                                lastManagementStatus = "Found ${combined.size} ${evt.category.label.lowercase()} result(s)"
+                            )
+                        }
+                    }
+                    is SimEvent.AgentGroupsUpdated -> {
+                        mutateWorldManagement { wm ->
+                            val nextActive = wm.activeGroupId.takeIf { id -> evt.groups.any { it.groupId == id } }
+                                ?: evt.groups.firstOrNull()?.groupId
+                                ?: wm.activeGroupId
+                            val nextSelected = wm.selectedGroupId.takeIf { id -> evt.groups.any { it.groupId == id } }
+                                ?: nextActive
+                            wm.copy(
+                                groups = evt.groups,
+                                activeGroupId = nextActive,
+                                selectedGroupId = nextSelected,
+                                lastManagementStatus = "Synced ${evt.groups.size} group membership(s)"
+                            )
+                        }
+                    }
+                    is SimEvent.GroupProfileReceived -> {
+                        mutateWorldManagement { wm ->
+                            wm.copy(
+                                groupProfiles = wm.groupProfiles + (evt.profile.groupId to evt.profile),
+                                lastManagementStatus = "Loaded group profile: ${evt.profile.name}"
+                            )
+                        }
+                    }
+                    is SimEvent.GroupTitlesReceived -> {
+                        mutateWorldManagement { wm ->
+                            val activeTitle = evt.titles.firstOrNull { it.selected }?.title
+                            val updatedGroups = if (activeTitle != null) {
+                                wm.groups.map { g ->
+                                    if (g.groupId == evt.groupId) g.copy(activeTitle = activeTitle) else g
+                                }
+                            } else wm.groups
+                            wm.copy(
+                                groups = updatedGroups,
+                                groupTitles = wm.groupTitles + (evt.groupId to evt.titles)
+                            )
+                        }
+                    }
+                    is SimEvent.GroupRolesReceived -> {
+                        mutateWorldManagement { wm ->
+                            wm.copy(
+                                groupRoles = wm.groupRoles + (evt.groupId to evt.roles)
+                            )
+                        }
+                    }
+                    is SimEvent.ParcelInfoReceived -> {
+                        _state.update { s ->
+                            s.copy(
+                                parcelName = evt.parcel.name.ifBlank { s.parcelName },
+                                worldManagement = s.worldManagement.copy(
+                                    currentParcel = evt.parcel,
+                                    lastManagementStatus = "Parcel info updated: ${evt.parcel.name}"
+                                )
+                            )
+                        }
+                    }
+                    is SimEvent.ParcelPropertiesReceived -> {
+                        _state.update { s ->
+                            s.copy(
+                                parcelName = evt.parcel.name.ifBlank { s.parcelName },
+                                worldManagement = s.worldManagement.copy(
+                                    currentParcel = evt.parcel,
+                                    lastManagementStatus = "Parcel synced: ${evt.parcel.name} (${evt.parcel.totalPrims}/${evt.parcel.maxPrims} LI)"
+                                )
+                            )
+                        }
+                        if (evt.parcel.parcelId.mostSignificantBits != 0L || evt.parcel.parcelId.leastSignificantBits != 0L) {
+                            lludpEngine.sendParcelInfoRequest(evt.parcel.parcelId)
+                        }
+                    }
+                    is SimEvent.MuteListSyncReceived -> {
+                        mutateWorldManagement { wm ->
+                            wm.copy(
+                                lastManagementStatus = if (evt.cached) {
+                                    "Mute list up to date (cached)"
+                                } else {
+                                    "Mute list synced (${evt.filename})"
+                                }
+                            )
+                        }
+                    }
+                    is SimEvent.PayPriceReceived -> {
+                        mutateWorldManagement { wm ->
+                            wm.copy(
+                                payPrices = wm.payPrices + (evt.payPrice.objectId to evt.payPrice)
+                            )
                         }
                     }
                     is SimEvent.PingUpdated -> {
@@ -1178,16 +1339,25 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val hudsFolder = UUID.fromString("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         val landmarksFolder = UUID.fromString("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
         val outfitsFolder = UUID.fromString("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+        val notecardsFolder = UUID.fromString("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+        val currentOutfitFolder = UUID.fromString("ffffffff-ffff-4fff-8fff-ffffffffffff")
+
+        val welcomeNoteId = UUID.fromString("70707070-1111-4111-8111-111111111111")
+        val builderChecklistId = UUID.fromString("70707070-2222-4222-8222-222222222222")
 
         val sandboxInventory = listOf(
             InventoryEntry(rootId, UUID(0L, 0L), "My Inventory (Local Sandbox)", true, 8),
             InventoryEntry(hudsFolder, rootId, "Avatar HUD Attachments", true, 6),
             InventoryEntry(landmarksFolder, rootId, "Landmarks", true, 3),
-            InventoryEntry(outfitsFolder, rootId, "Outfits & Accessories", true, 5),
+            InventoryEntry(outfitsFolder, rootId, "My Outfits", true, OutfitInventoryConstants.FT_MY_OUTFITS),
+            InventoryEntry(currentOutfitFolder, rootId, "Current Outfit", true, OutfitInventoryConstants.FT_CURRENT_OUTFIT),
+            InventoryEntry(notecardsFolder, rootId, "Notecards", true, OutfitInventoryConstants.AT_NOTECARD),
             InventoryEntry(manualHudAttachments[9032]!!.uuid, hudsFolder, "AO & Flight Booster HUD", false, 6, isWorn = true, attachmentPoint = 32),
             InventoryEntry(manualHudAttachments[9034]!!.uuid, hudsFolder, "EEP Atmosphere HUD", false, 6, isWorn = true, attachmentPoint = 34),
             InventoryEntry(manualHudAttachments[9036]!!.uuid, hudsFolder, "Avatar Outfit & Tint HUD", false, 6, isWorn = true, attachmentPoint = 36),
             InventoryEntry(UUID.randomUUID(), outfitsFolder, "Obsidian Telemetry Jacket", false, 5, isWorn = true, attachmentPoint = 5),
+            InventoryEntry(welcomeNoteId, notecardsFolder, "Linkpoint Welcome Guide", false, OutfitInventoryConstants.AT_NOTECARD),
+            InventoryEntry(builderChecklistId, notecardsFolder, "Parcel & Vendor Quick-Pay Notes", false, OutfitInventoryConstants.AT_NOTECARD),
             InventoryEntry(UUID.randomUUID(), landmarksFolder, "Linkpoint Welcome Deck", false, 3),
             InventoryEntry(UUID.randomUUID(), landmarksFolder, "Harbor Signal Spire", false, 3)
         )
@@ -1199,20 +1369,30 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             MapRegionTile(999, 1000, "Emerald Cove", "PG", 0)
         )
 
+        val sandboxWorldManagement = buildSandboxWorldManagement(
+            selfId = self.agentId,
+            selfName = self.displayName,
+            welcomeNoteId = welcomeNoteId,
+            builderChecklistId = builderChecklistId,
+            wornItems = sandboxInventory.filter { it.isWorn }
+        )
+
         _state.update { s ->
             s.copy(
                 connection = ConnectionState.LocalSandbox(),
                 avatarPosition = self.position,
-                parcelName = "Linkpoint Welcome Deck (Local Preview)",
+                parcelName = sandboxWorldManagement.currentParcel.name,
                 isFlying = false,
                 isSitting = false,
+                lindenBalance = 2500,
                 inventoryEntries = sandboxInventory,
-                expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
+                expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder, notecardsFolder),
                 mapRegions = sandboxMap,
+                worldManagement = sandboxWorldManagement,
                 localChat = listOf(
                     ChatMessage(
                         speaker = "Linkpoint Sandbox",
-                        text = "Offline 3D & HUD Engine Preview active. Drag to orbit, use joystick to walk/fly, tap the 3 Avatar Attachment HUDs (slots 32, 34, 36), or open Design Studio to switch Polished / Terminal / LCARS / Metro!",
+                        text = "Offline 3D, Design System & World Management Preview active. Open World (04-WLD) for Search, Groups, Land, Outfits/Notecards & Mute, or Design Studio (07-SYS) for all 6 layouts & 32 Kthemes!",
                         isSystem = true
                     )
                 ),
@@ -1730,6 +1910,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         }
         if (obj != null && _state.value.connection is ConnectionState.Connected) {
             lludpEngine.sendObjectSelect(obj.localId)
+            lludpEngine.sendRequestPayPrice(obj.uuid)
         }
         pushSceneSnapshot()
     }
@@ -2087,11 +2268,29 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             DesignLanguage.TERMINAL -> AccentPreset.PHOSPHOR_GREEN
             DesignLanguage.LCARS -> AccentPreset.LCARS_APRICOT
             DesignLanguage.METRO -> AccentPreset.METRO_COBALT
+            DesignLanguage.RULE_AND_RAIL -> AccentPreset.BEACON_AMBER
+            DesignLanguage.PRESS -> AccentPreset.AZURE_CYAN
         }
-        mutateDesign { it.copy(designLanguage = language, accentPreset = defaultAccent) }
+        mutateDesign { s ->
+            val defaultPosture = if (language == DesignLanguage.PRESS && s.kthemeId.isBlank()) true else s.useLightPosture
+            s.copy(designLanguage = language, accentPreset = defaultAccent, useLightPosture = defaultPosture)
+        }
     }
 
-    override fun setAccentPreset(preset: AccentPreset) = mutateDesign { it.copy(accentPreset = preset) }
+    override fun setAccentPreset(preset: AccentPreset) = mutateDesign { it.copy(accentPreset = preset, kthemeId = "") }
+
+    override fun setKthemePalette(kthemeId: String) {
+        val palette = KthemeCatalog.findById(kthemeId)
+        mutateDesign { s ->
+            s.copy(
+                kthemeId = palette?.id.orEmpty(),
+                useLightPosture = palette?.isDaylight ?: s.useLightPosture
+            )
+        }
+        if (palette != null) {
+            showToast("Applied Ktheme: ${palette.name}")
+        }
+    }
     override fun setLightPosture(light: Boolean) = mutateDesign { it.copy(useLightPosture = light) }
     override fun setDockPosition(position: DockPosition) = mutateDesign { it.copy(dockPosition = position) }
     override fun setTelemetryPosition(position: TelemetryPosition) = mutateDesign { it.copy(telemetryPosition = position) }
@@ -2148,6 +2347,805 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     override fun resetDesignToDefault() {
         mutateDesign { PersonalDesignState() }
         showToast("Reset design & layout to default")
+    }
+
+    // --- Phase 10: Directory Search, Group Admin, Parcel Management, Outfits/Notecards, Mute & Quick-Pay ---
+
+    override fun setSearchCategory(category: DirectoryCategory) {
+        mutateWorldManagement { wm ->
+            wm.copy(searchCategory = category)
+        }
+        if (_state.value.connection !is ConnectionState.Connected) {
+            searchDirectory(_state.value.worldManagement.searchQuery, category)
+        }
+    }
+
+    override fun searchDirectory(query: String, category: DirectoryCategory?) {
+        val targetCat = category ?: _state.value.worldManagement.searchCategory
+        val trimmed = query.trim()
+        if (_state.value.connection is ConnectionState.Connected) {
+            mutateWorldManagement { wm ->
+                wm.copy(
+                    searchQuery = query,
+                    searchCategory = targetCat,
+                    isSearching = true,
+                    searchResults = emptyList(),
+                    lastManagementStatus = "Searching ${targetCat.label} for \"${trimmed.ifBlank { "*" }}\"..."
+                )
+            }
+            lludpEngine.sendDirectorySearch(UUID.randomUUID(), trimmed.ifBlank { "a" }, targetCat)
+        } else {
+            val catalog = sandboxDirectoryCatalog()
+            val filtered = catalog.filter { item ->
+                item.category == targetCat && (
+                    trimmed.isEmpty() ||
+                        item.title.contains(trimmed, ignoreCase = true) ||
+                        item.subtitle.contains(trimmed, ignoreCase = true) ||
+                        item.regionName.contains(trimmed, ignoreCase = true)
+                    )
+            }
+            mutateWorldManagement { wm ->
+                wm.copy(
+                    searchQuery = query,
+                    searchCategory = targetCat,
+                    isSearching = false,
+                    searchResults = filtered,
+                    lastManagementStatus = "Found ${filtered.size} ${targetCat.label.lowercase()} result(s)"
+                )
+            }
+        }
+    }
+
+    override fun activateGroup(groupId: UUID) {
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendActivateGroup(groupId)
+            lludpEngine.sendGroupDetailsRequests(groupId)
+        }
+        val groupName = _state.value.worldManagement.groups.firstOrNull { it.groupId == groupId }?.name ?: "None"
+        mutateWorldManagement { wm ->
+            wm.copy(
+                activeGroupId = groupId,
+                selectedGroupId = groupId,
+                lastManagementStatus = "Activated group tag: $groupName"
+            )
+        }
+        showToast("Active group: $groupName")
+    }
+
+    override fun inspectGroup(groupId: UUID) {
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendGroupDetailsRequests(groupId)
+        }
+        val groupName = _state.value.worldManagement.groups.firstOrNull { it.groupId == groupId }?.name ?: "Group"
+        mutateWorldManagement { wm ->
+            wm.copy(
+                selectedGroupId = groupId,
+                lastManagementStatus = "Inspecting $groupName"
+            )
+        }
+    }
+
+    override fun selectGroupTitle(groupId: UUID, roleId: UUID) {
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendGroupTitleUpdate(groupId, roleId)
+        }
+        mutateWorldManagement { wm ->
+            val updatedTitles = wm.groupTitles[groupId]?.map { t ->
+                t.copy(selected = t.roleId == roleId)
+            }.orEmpty()
+            val chosenTitle = updatedTitles.firstOrNull { it.selected }?.title
+            val updatedGroups = if (chosenTitle != null) {
+                wm.groups.map { g -> if (g.groupId == groupId) g.copy(activeTitle = chosenTitle) else g }
+            } else wm.groups
+            wm.copy(
+                groups = updatedGroups,
+                groupTitles = if (updatedTitles.isNotEmpty()) wm.groupTitles + (groupId to updatedTitles) else wm.groupTitles,
+                lastManagementStatus = "Updated group title${chosenTitle?.let { ": $it" }.orEmpty()}"
+            )
+        }
+        showToast("Updated group role title")
+    }
+
+    override fun sendGroupNotice(groupId: UUID, subject: String, message: String) {
+        val cleanSubject = subject.trim()
+        val cleanBody = message.trim()
+        if (cleanSubject.isEmpty() || cleanBody.isEmpty()) {
+            showToast("Enter both notice subject and message")
+            return
+        }
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendGroupNotice(groupId, selfAvatarName, cleanSubject, cleanBody)
+        }
+        val groupName = _state.value.worldManagement.groups.firstOrNull { it.groupId == groupId }?.name ?: "Group"
+        val record = GroupNoticeRecord(
+            id = UUID.randomUUID().toString(),
+            groupId = groupId,
+            groupName = groupName,
+            subject = cleanSubject,
+            message = cleanBody,
+            senderName = selfAvatarName,
+            timestampLabel = "Sent now"
+        )
+        mutateWorldManagement { wm ->
+            wm.copy(
+                groupNotices = (listOf(record) + wm.groupNotices).take(30),
+                lastManagementStatus = "Sent notice to $groupName: $cleanSubject"
+            )
+        }
+        showToast("Group notice sent to $groupName")
+    }
+
+    override fun refreshParcelDetails() {
+        val pos = _state.value.avatarPosition
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendParcelPropertiesAt(pos)
+            val parcelId = _state.value.worldManagement.currentParcel.parcelId
+            if (parcelId.mostSignificantBits != 0L || parcelId.leastSignificantBits != 0L) {
+                lludpEngine.sendParcelInfoRequest(parcelId)
+            }
+            showToast("Refreshing parcel properties...")
+        } else {
+            mutateWorldManagement { wm ->
+                wm.copy(lastManagementStatus = "Parcel synced: ${wm.currentParcel.name}")
+            }
+            showToast("Parcel details up to date")
+        }
+    }
+
+    override fun returnParcelObjects(returnType: ParcelReturnType) {
+        val parcel = _state.value.worldManagement.currentParcel
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendParcelReturnObjects(parcel.localId, returnType)
+            mutateWorldManagement { wm ->
+                wm.copy(lastManagementStatus = "Requested ${returnType.label} on ${parcel.name}")
+            }
+            showToast("Sent ${returnType.label} for ${parcel.name}")
+        } else {
+            mutateWorldManagement { wm ->
+                val p = wm.currentParcel
+                val updatedParcel = when (returnType) {
+                    ParcelReturnType.OWNER -> p.copy(
+                        totalPrims = (p.totalPrims - p.ownerPrims).coerceAtLeast(0),
+                        ownerPrims = 0
+                    )
+                    ParcelReturnType.GROUP -> p.copy(
+                        totalPrims = (p.totalPrims - p.groupPrims).coerceAtLeast(0),
+                        groupPrims = 0
+                    )
+                    ParcelReturnType.OTHER, ParcelReturnType.LIST -> p.copy(
+                        totalPrims = (p.totalPrims - p.otherPrims).coerceAtLeast(0),
+                        otherPrims = 0
+                    )
+                }
+                wm.copy(
+                    currentParcel = updatedParcel,
+                    lastManagementStatus = "Returned objects (${returnType.label}) on ${p.name}"
+                )
+            }
+            showToast("${returnType.label} completed on ${parcel.name}")
+        }
+    }
+
+    override fun buyParcelPass() {
+        val parcel = _state.value.worldManagement.currentParcel
+        if (!parcel.canBuyPass) {
+            showToast("No parcel pass available on ${parcel.name}")
+            return
+        }
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendParcelBuyPass(parcel.localId)
+        }
+        _state.update { s ->
+            s.copy(
+                lindenBalance = (s.lindenBalance - parcel.passPrice).coerceAtLeast(0),
+                worldManagement = s.worldManagement.copy(
+                    lastManagementStatus = "Purchased parcel pass (L$${parcel.passPrice} for ${parcel.passHours}h)"
+                )
+            )
+        }
+        showToast("Purchased parcel pass for L$${parcel.passPrice}")
+    }
+
+    override fun selectNotecard(itemId: UUID) {
+        mutateWorldManagement { wm ->
+            wm.copy(activeNotecardId = itemId)
+        }
+    }
+
+    override fun createNewNotecard(title: String, initialBody: String) {
+        val cleanTitle = title.trim().ifBlank { "New Notecard" }
+        val newItemId = UUID.randomUUID()
+        val newAssetId = UUID.randomUUID()
+        val noteFolderId = _state.value.inventoryEntries.firstOrNull {
+            it.isFolder && (it.assetType == OutfitInventoryConstants.AT_NOTECARD || it.name.contains("Notecard", ignoreCase = true))
+        }?.id ?: _state.value.inventoryEntries.firstOrNull { it.isFolder }?.id ?: UUID(0L, 0L)
+
+        val note = EditableNotecard(
+            itemId = newItemId,
+            assetId = newAssetId,
+            title = cleanTitle,
+            description = "Created in Linkpoint",
+            bodyText = initialBody,
+            lastSavedStatus = "Draft"
+        )
+        _state.update { s ->
+            s.copy(
+                inventoryEntries = s.inventoryEntries + InventoryEntry(
+                    id = newItemId,
+                    parentId = noteFolderId,
+                    name = cleanTitle,
+                    isFolder = false,
+                    assetType = OutfitInventoryConstants.AT_NOTECARD
+                ),
+                worldManagement = s.worldManagement.copy(
+                    notecards = s.worldManagement.notecards + note,
+                    activeNotecardId = newItemId,
+                    lastManagementStatus = "Created notecard: $cleanTitle"
+                )
+            )
+        }
+        showToast("Created notecard: $cleanTitle")
+    }
+
+    override fun saveNotecard(itemId: UUID, bodyText: String) {
+        val isLive = _state.value.connection is ConnectionState.Connected
+        mutateWorldManagement { wm ->
+            wm.copy(
+                isSavingNotecard = true,
+                notecards = wm.notecards.map { n ->
+                    if (n.itemId == itemId) n.copy(bodyText = bodyText, lastSavedStatus = "Uploading...") else n
+                }
+            )
+        }
+        if (isLive) {
+            viewModelScope.launch {
+                val res = capabilityManager.updateNotecardAgentInventory(itemId = itemId, bodyText = bodyText)
+                mutateWorldManagement { wm ->
+                    wm.copy(
+                        isSavingNotecard = false,
+                        notecards = wm.notecards.map { n ->
+                            if (n.itemId == itemId) {
+                                n.copy(
+                                    bodyText = bodyText,
+                                    assetId = res.newAssetId ?: n.assetId,
+                                    lastSavedStatus = if (res.success) "Saved via CAPS" else res.statusMessage
+                                )
+                            } else n
+                        },
+                        lastManagementStatus = res.statusMessage
+                    )
+                }
+                showToast(res.statusMessage)
+            }
+        } else {
+            val updatedAsset = UUID.randomUUID()
+            mutateWorldManagement { wm ->
+                val targetTitle = wm.notecards.firstOrNull { it.itemId == itemId }?.title ?: "Notecard"
+                wm.copy(
+                    isSavingNotecard = false,
+                    notecards = wm.notecards.map { n ->
+                        if (n.itemId == itemId) {
+                            n.copy(
+                                bodyText = bodyText,
+                                assetId = updatedAsset,
+                                lastSavedStatus = "Saved (Linden text v2)"
+                            )
+                        } else n
+                    },
+                    lastManagementStatus = "Saved notecard: $targetTitle"
+                )
+            }
+            showToast("Saved notecard (Linden text version 2)")
+        }
+    }
+
+    override fun saveCurrentOutfit(outfitName: String) {
+        val cleanName = outfitName.trim().ifBlank { "Saved Outfit ${_state.value.worldManagement.savedOutfits.size + 1}" }
+        val entries = _state.value.inventoryEntries
+        val wornItems = entries.filter { !it.isFolder && it.isWorn }
+        val myOutfitsFolderId = entries.firstOrNull {
+            it.isFolder && (it.assetType == OutfitInventoryConstants.FT_MY_OUTFITS || it.name.contains("Outfit", ignoreCase = true))
+        }?.id ?: entries.firstOrNull { it.isFolder }?.id ?: UUID.randomUUID()
+        val cofId = entries.firstOrNull {
+            it.isFolder && it.assetType == OutfitInventoryConstants.FT_CURRENT_OUTFIT
+        }?.id
+
+        val plan = OutfitFolderPlanner.buildSaveOutfitPlan(
+            outfitName = cleanName,
+            wornItems = wornItems,
+            myOutfitsFolderId = myOutfitsFolderId,
+            currentOutfitFolderId = cofId
+        )
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendCreateInventoryFolder(
+                folderId = plan.outfitFolderId,
+                parentId = plan.parentMyOutfitsId,
+                type = OutfitInventoryConstants.FT_OUTFIT,
+                name = plan.outfitName
+            )
+            plan.linksToCreate.forEachIndexed { idx, link ->
+                lludpEngine.sendLinkInventoryItem(
+                    callbackId = idx + 1,
+                    folderId = link.targetFolderId,
+                    oldItemId = link.oldItemId,
+                    assetType = link.assetType,
+                    invType = link.inventoryType,
+                    name = link.name,
+                    description = link.description
+                )
+            }
+        }
+
+        val outfitFolderEntry = InventoryEntry(
+            id = plan.outfitFolderId,
+            parentId = plan.parentMyOutfitsId,
+            name = plan.outfitName,
+            isFolder = true,
+            assetType = OutfitInventoryConstants.FT_OUTFIT
+        )
+        val linkEntries = plan.linksToCreate
+            .filter { it.targetFolderId == plan.outfitFolderId }
+            .map { link ->
+                InventoryEntry(
+                    id = UUID.randomUUID(),
+                    parentId = plan.outfitFolderId,
+                    name = "${link.name} (link)",
+                    isFolder = false,
+                    assetType = link.assetType
+                )
+            }
+
+        val record = SavedOutfitRecord(
+            folderId = plan.outfitFolderId,
+            name = plan.outfitName,
+            linkedItemIds = wornItems.map { it.id },
+            createdAtLabel = "${wornItems.size} worn links"
+        )
+        _state.update { s ->
+            s.copy(
+                inventoryEntries = s.inventoryEntries + outfitFolderEntry + linkEntries,
+                expandedFolderIds = s.expandedFolderIds + plan.parentMyOutfitsId + plan.outfitFolderId,
+                worldManagement = s.worldManagement.copy(
+                    savedOutfits = listOf(record) + s.worldManagement.savedOutfits,
+                    lastManagementStatus = "Saved outfit '${plan.outfitName}' (${wornItems.size} AT_LINK items)"
+                )
+            )
+        }
+        showToast("Saved outfit: ${plan.outfitName} (${wornItems.size} items)")
+    }
+
+    override fun syncMuteList() {
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendMuteListRequest()
+            mutateWorldManagement { wm ->
+                wm.copy(lastManagementStatus = "Requested server MuteList sync...")
+            }
+            showToast("Syncing server mute list...")
+        } else {
+            mutateWorldManagement { wm ->
+                wm.copy(lastManagementStatus = "Mute list synced (${wm.muteList.size} entries)")
+            }
+            showToast("Mute list synced (${_state.value.worldManagement.muteList.size} entries)")
+        }
+    }
+
+    override fun muteEntity(muteId: UUID, name: String, type: MuteType) {
+        val cleanName = name.trim()
+        if (cleanName.isEmpty()) return
+        val resolvedId = if (type == MuteType.BY_NAME) UUID(0L, 0L) else muteId
+        val entry = MuteEntry(
+            muteId = resolvedId,
+            name = cleanName,
+            type = type,
+            flags = MuteFlags.ALL
+        )
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendUpdateMuteListEntry(entry)
+        }
+        mutateWorldManagement { wm ->
+            val deduplicated = wm.muteList.filterNot {
+                (resolvedId != UUID(0L, 0L) && it.muteId == resolvedId) ||
+                    it.name.equals(cleanName, ignoreCase = true)
+            }
+            wm.copy(
+                muteList = listOf(entry) + deduplicated,
+                lastManagementStatus = "Muted ${type.label.lowercase()}: $cleanName"
+            )
+        }
+        showToast("Muted $cleanName")
+    }
+
+    override fun unmuteEntity(muteId: UUID, name: String) {
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendRemoveMuteListEntry(muteId, name)
+        }
+        mutateWorldManagement { wm ->
+            wm.copy(
+                muteList = wm.muteList.filterNot {
+                    (muteId != UUID(0L, 0L) && it.muteId == muteId) ||
+                        it.name.equals(name, ignoreCase = true)
+                },
+                lastManagementStatus = "Unmuted $name"
+            )
+        }
+        showToast("Unmuted $name")
+    }
+
+    override fun requestObjectPayPrice(objectId: UUID) {
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendRequestPayPrice(objectId)
+        }
+    }
+
+    override fun payObject(objectId: UUID, objectName: String, amount: Int) {
+        if (amount <= 0) {
+            showToast("Enter a positive L$ amount")
+            return
+        }
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendMoneyTransferRequest(
+                destId = objectId,
+                amount = amount,
+                description = "Pay $objectName"
+            )
+        }
+        _state.update { s ->
+            s.copy(
+                lindenBalance = (s.lindenBalance - amount).coerceAtLeast(0),
+                localChat = (s.localChat + ChatMessage(
+                    speaker = "L$ Transaction",
+                    text = "Paid L$$amount to $objectName",
+                    isSystem = true
+                )).takeLast(120),
+                worldManagement = s.worldManagement.copy(
+                    lastManagementStatus = "Paid L$$amount to $objectName"
+                )
+            )
+        }
+        showToast("Paid L$$amount to $objectName")
+    }
+
+    private fun mutateWorldManagement(transform: (WorldManagementState) -> WorldManagementState) {
+        _state.update { s ->
+            s.copy(worldManagement = transform(s.worldManagement))
+        }
+    }
+
+    private fun sandboxDirectoryCatalog(): List<DirectorySearchResult> = listOf(
+        DirectorySearchResult(
+            id = "place-welcome",
+            targetUuid = UUID.fromString("20202020-0001-4001-8001-000000000001"),
+            category = DirectoryCategory.PLACES,
+            title = "Linkpoint Welcome Plaza",
+            subtitle = "Linkpoint Archipelago (128, 128, 25) • General",
+            metricLabel = "1,420 dwell",
+            dwell = 1420f,
+            maturity = "General",
+            regionName = "Linkpoint Archipelago"
+        ),
+        DirectorySearchResult(
+            id = "place-harbor",
+            targetUuid = UUID.fromString("20202020-0002-4002-8002-000000000002"),
+            category = DirectoryCategory.PLACES,
+            title = "Harbor Signal Marina & Vendors",
+            subtitle = "Harbor Reach (156, 150, 24) • General",
+            metricLabel = "890 dwell",
+            dwell = 890f,
+            forSale = true,
+            maturity = "General",
+            regionName = "Harbor Reach"
+        ),
+        DirectorySearchResult(
+            id = "place-spire",
+            targetUuid = UUID.fromString("20202020-0003-4003-8003-000000000003"),
+            category = DirectoryCategory.PLACES,
+            title = "Obsidian Synth Club & Gallery",
+            subtitle = "Obsidian Spire (96, 144, 38) • Moderate",
+            metricLabel = "2,310 dwell",
+            dwell = 2310f,
+            maturity = "Moderate",
+            regionName = "Obsidian Spire"
+        ),
+        DirectorySearchResult(
+            id = "person-aria",
+            targetUuid = UUID.fromString("22222222-2222-4222-8222-222222222222"),
+            category = DirectoryCategory.PEOPLE,
+            title = "Aria Vance",
+            subtitle = "Mesh & Shader Creator • Online",
+            metricLabel = "Online",
+            online = true,
+            regionName = "Linkpoint Archipelago"
+        ),
+        DirectorySearchResult(
+            id = "person-kaito",
+            targetUuid = UUID.fromString("33333333-3333-4333-8333-333333333333"),
+            category = DirectoryCategory.PEOPLE,
+            title = "Kaito Solis",
+            subtitle = "LSL Scripter & Estate Manager • Online",
+            metricLabel = "Online",
+            online = true,
+            regionName = "Harbor Reach"
+        ),
+        DirectorySearchResult(
+            id = "group-pioneers",
+            targetUuid = UUID.fromString("55555555-1111-4111-8111-111111111111"),
+            category = DirectoryCategory.GROUPS,
+            title = "Linkpoint Pioneers",
+            subtitle = "Open Enrollment • Builders, testers & mobile creators",
+            metricLabel = "348 members",
+            memberCount = 348
+        ),
+        DirectorySearchResult(
+            id = "group-sailors",
+            targetUuid = UUID.fromString("55555555-2222-4222-8222-222222222222"),
+            category = DirectoryCategory.GROUPS,
+            title = "Blake Sea & Archipelago Yacht Club",
+            subtitle = "Open Enrollment • Regattas & region-crossing cruises",
+            metricLabel = "612 members",
+            memberCount = 612
+        ),
+        DirectorySearchResult(
+            id = "event-jazz",
+            targetUuid = UUID.fromString("66666666-1111-4111-8111-111111111111"),
+            category = DirectoryCategory.EVENTS,
+            title = "Live Sunset Jazz @ Harbor Pier",
+            subtitle = "Harbor Reach • Live Music",
+            metricLabel = "18:00 SLT",
+            eventId = 4102,
+            eventDate = "Today 18:00 SLT",
+            maturity = "General",
+            regionName = "Harbor Reach"
+        ),
+        DirectorySearchResult(
+            id = "event-ktheme",
+            targetUuid = UUID.fromString("66666666-2222-4222-8222-222222222222"),
+            category = DirectoryCategory.EVENTS,
+            title = "Ktheme & Mesh HUD Creator Workshop",
+            subtitle = "Linkpoint Archipelago • Education & Building",
+            metricLabel = "20:00 SLT",
+            eventId = 4109,
+            eventDate = "Today 20:00 SLT",
+            maturity = "General",
+            regionName = "Linkpoint Archipelago"
+        )
+    )
+
+    private fun buildSandboxWorldManagement(
+        selfId: UUID,
+        selfName: String,
+        welcomeNoteId: UUID,
+        builderChecklistId: UUID,
+        wornItems: List<InventoryEntry>
+    ): WorldManagementState {
+        val pioneersGroupId = UUID.fromString("55555555-1111-4111-8111-111111111111")
+        val yachtGroupId = UUID.fromString("55555555-2222-4222-8222-222222222222")
+        val creatorsGroupId = UUID.fromString("55555555-3333-4333-8333-333333333333")
+
+        val architectRoleId = UUID.fromString("55555555-1111-4111-8111-aaaaaaaaaaaa")
+        val everyoneRoleId = UUID.fromString("55555555-1111-4111-8111-bbbbbbbbbbbb")
+        val commodoreRoleId = UUID.fromString("55555555-2222-4222-8222-aaaaaaaaaaaa")
+
+        val allPowers = GroupPowers.GP_NOTICES_SEND or
+            GroupPowers.GP_NOTICES_RECEIVE or
+            GroupPowers.GP_MEMBER_INVITE or
+            GroupPowers.GP_LAND_RETURN_GROUP_SET or
+            GroupPowers.GP_LAND_RETURN_NON_GROUP
+
+        val groups = listOf(
+            GroupMembershipInfo(
+                groupId = pioneersGroupId,
+                name = "Linkpoint Pioneers",
+                powers = allPowers,
+                acceptNotices = true,
+                contribution = 1024,
+                activeTitle = "Grid Architect"
+            ),
+            GroupMembershipInfo(
+                groupId = yachtGroupId,
+                name = "Archipelago Yacht Club",
+                powers = GroupPowers.GP_NOTICES_RECEIVE or GroupPowers.GP_NOTICES_SEND,
+                acceptNotices = true,
+                contribution = 512,
+                activeTitle = "Skipper"
+            ),
+            GroupMembershipInfo(
+                groupId = creatorsGroupId,
+                name = "Mesh & Shader Guild",
+                powers = GroupPowers.GP_NOTICES_RECEIVE,
+                acceptNotices = true,
+                contribution = 0,
+                activeTitle = "Shader Artisan"
+            )
+        )
+
+        val profiles = mapOf(
+            pioneersGroupId to GroupProfileInfo(
+                groupId = pioneersGroupId,
+                name = "Linkpoint Pioneers",
+                charter = "Official mobile Second Life & OpenSim pioneers testing modern Ktheme chrome, LLUDP telemetry, and 3D scene tools.",
+                memberTitle = "Grid Architect",
+                powersMask = allPowers,
+                founderId = selfId,
+                membershipFee = 0,
+                openEnrollment = true,
+                memberCount = 348,
+                roleCount = 3
+            ),
+            yachtGroupId to GroupProfileInfo(
+                groupId = yachtGroupId,
+                name = "Archipelago Yacht Club",
+                charter = "Open-water sailing, Blake Sea navigation, and Harbor Reach dock slips.",
+                memberTitle = "Skipper",
+                powersMask = GroupPowers.GP_NOTICES_RECEIVE or GroupPowers.GP_NOTICES_SEND,
+                founderId = selfId,
+                membershipFee = 25,
+                openEnrollment = true,
+                memberCount = 612,
+                roleCount = 2
+            )
+        )
+
+        val titles = mapOf(
+            pioneersGroupId to listOf(
+                GroupTitleInfo(architectRoleId, "Grid Architect", selected = true),
+                GroupTitleInfo(everyoneRoleId, "Pioneer Member", selected = false)
+            ),
+            yachtGroupId to listOf(
+                GroupTitleInfo(commodoreRoleId, "Skipper", selected = true)
+            )
+        )
+
+        val roles = mapOf(
+            pioneersGroupId to listOf(
+                GroupRoleInfo(
+                    roleId = architectRoleId,
+                    name = "Architects",
+                    title = "Grid Architect",
+                    description = "Full parcel management, group notices, and build rights",
+                    powers = allPowers,
+                    memberCount = 14
+                ),
+                GroupRoleInfo(
+                    roleId = everyoneRoleId,
+                    name = "Everyone",
+                    title = "Pioneer Member",
+                    description = "Standard rezzing & group chat access",
+                    powers = GroupPowers.GP_NOTICES_RECEIVE,
+                    memberCount = 348
+                )
+            )
+        )
+
+        val notices = listOf(
+            GroupNoticeRecord(
+                id = "notice-1",
+                groupId = pioneersGroupId,
+                groupName = "Linkpoint Pioneers",
+                subject = "Phase 10 Ktheme & World Tools Live",
+                message = "Try all 6 layout languages (including Rule & Rail and Press) plus 32 WCAG-verified Kthemes!",
+                senderName = "Aria Vance",
+                timestampLabel = "12m ago"
+            )
+        )
+
+        val parcel = ParcelManagementInfo(
+            parcelId = UUID.fromString("90909090-1111-4111-8111-111111111111"),
+            localId = 1,
+            name = "Linkpoint Welcome Deck",
+            description = "Central arrival plaza, HUD test deck & L$ quick-pay vendor showcase.",
+            ownerId = selfId,
+            ownerName = selfName,
+            groupId = pioneersGroupId,
+            groupName = "Linkpoint Pioneers",
+            isGroupOwned = true,
+            maturity = "General",
+            areaSqm = 4096,
+            maxPrims = 1406,
+            totalPrims = 412,
+            ownerPrims = 280,
+            groupPrims = 94,
+            otherPrims = 38,
+            otherCleanTimeMinutes = 15,
+            parcelFlags = ParcelFlags.PF_ALLOW_FLY or
+                ParcelFlags.PF_ALLOW_OTHER_SCRIPTS or
+                ParcelFlags.PF_CREATE_OBJECTS or
+                ParcelFlags.PF_ALLOW_LANDMARK or
+                ParcelFlags.PF_USE_PASS_LIST,
+            passPrice = 25,
+            passHours = 2.0f,
+            simName = "Linkpoint Archipelago",
+            dwell = 1420f
+        )
+
+        val notecards = listOf(
+            EditableNotecard(
+                itemId = welcomeNoteId,
+                assetId = UUID.fromString("71717171-1111-4111-8111-111111111111"),
+                title = "Linkpoint Welcome Guide",
+                description = "Onboarding & viewer controls",
+                bodyText = "Welcome to Linkpoint!\n\n- Switch 6 Design Languages & 32 Ktheme palettes in Design Studio.\n- Manage Groups, Land Prims, Outfits & Mute List in the World floater.\n- Inspect any in-world vendor prim to use L$ Quick-Pay buttons.",
+                lastSavedStatus = "Synced"
+            ),
+            EditableNotecard(
+                itemId = builderChecklistId,
+                assetId = UUID.fromString("71717171-2222-4222-8222-222222222222"),
+                title = "Parcel & Vendor Quick-Pay Notes",
+                description = "Builder reference",
+                bodyText = "Parcel Land Impact headroom: 994 prims free.\nAether Nexus Beacon configured with custom llSetPayPrice(100, [25, 100, PAY_HIDE, 500]).",
+                lastSavedStatus = "Synced"
+            )
+        )
+
+        val payPrices = buildMap {
+            allSceneObjects.values.forEachIndexed { idx, obj ->
+                when (idx) {
+                    1 -> put(
+                        obj.uuid,
+                        PayPriceInfo(
+                            objectId = obj.uuid,
+                            defaultPayPrice = 100,
+                            buttonPrices = listOf(25, 100, PayPriceInfo.PAY_HIDE, 500)
+                        )
+                    )
+                    2 -> put(
+                        obj.uuid,
+                        PayPriceInfo(
+                            objectId = obj.uuid,
+                            defaultPayPrice = 50,
+                            buttonPrices = listOf(PayPriceInfo.PAY_DEFAULT, PayPriceInfo.PAY_DEFAULT, 50, 250)
+                        )
+                    )
+                    else -> put(
+                        obj.uuid,
+                        PayPriceInfo(
+                            objectId = obj.uuid,
+                            defaultPayPrice = PayPriceInfo.PAY_DEFAULT,
+                            buttonPrices = listOf(
+                                PayPriceInfo.PAY_DEFAULT,
+                                PayPriceInfo.PAY_DEFAULT,
+                                PayPriceInfo.PAY_DEFAULT,
+                                PayPriceInfo.PAY_DEFAULT
+                            )
+                        )
+                    )
+                }
+            }
+        }
+
+        val initialOutfit = SavedOutfitRecord(
+            folderId = UUID.fromString("dddddddd-1111-4111-8111-111111111111"),
+            name = "Default Explorer Look",
+            linkedItemIds = wornItems.map { it.id },
+            createdAtLabel = "${wornItems.size} worn links"
+        )
+
+        val sampleMute = MuteEntry(
+            muteId = UUID.fromString("88888888-9999-4999-8999-999999999999"),
+            name = "Noisy AdBoard Spammer",
+            type = MuteType.OBJECT,
+            flags = MuteFlags.ALL
+        )
+
+        return WorldManagementState(
+            searchQuery = "",
+            searchCategory = DirectoryCategory.PLACES,
+            searchResults = sandboxDirectoryCatalog().filter { it.category == DirectoryCategory.PLACES },
+            groups = groups,
+            activeGroupId = pioneersGroupId,
+            selectedGroupId = pioneersGroupId,
+            groupProfiles = profiles,
+            groupTitles = titles,
+            groupRoles = roles,
+            groupNotices = notices,
+            currentParcel = parcel,
+            notecards = notecards,
+            activeNotecardId = welcomeNoteId,
+            savedOutfits = listOf(initialOutfit),
+            muteList = listOf(sampleMute),
+            payPrices = payPrices,
+            lastManagementStatus = "Sandbox world management ready"
+        )
     }
 
     // --- Internal Helpers ---
