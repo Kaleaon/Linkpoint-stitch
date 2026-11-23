@@ -8,6 +8,7 @@ import com.example.linkpoint.designsystem.DockToolId
 import com.example.linkpoint.designsystem.PersonalDesignState
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.protocol.AssetStreamStats
+import com.example.linkpoint.protocol.ChatEmoteFormatter
 import com.example.linkpoint.protocol.ConnectionHealthSnapshot
 import com.example.linkpoint.protocol.NetworkDiagnosticReport
 import com.example.linkpoint.protocol.NetworkErrorCategory
@@ -78,15 +79,56 @@ data class ChatMessage(
     val channel: Int = 0,
     val isSystem: Boolean = false,
     val isFromHud: Boolean = false,
+    val isEmote: Boolean = !isSystem && !isFromHud && ChatEmoteFormatter.isEmoteMessage(text),
+    val sourceAgentId: UUID? = null,
     val timestampMs: Long = System.currentTimeMillis()
-)
+) {
+    val displayBody: String
+        get() = if (isEmote) ChatEmoteFormatter.analyze(text).displayBody else text
+
+    fun formattedLine(): String =
+        if (isSystem) text else ChatEmoteFormatter.formatLine(speaker, text, isEmote)
+}
 
 data class ImConversation(
     val sessionId: UUID,
     val peerAgentId: UUID,
     val peerName: String,
     val messages: List<ChatMessage> = emptyList(),
-    val unreadCount: Int = 0
+    val unreadCount: Int = 0,
+    val isPeerTyping: Boolean = false
+)
+
+data class FriendEntry(
+    val agentId: UUID,
+    val name: String,
+    val isOnline: Boolean = false,
+    val rightsGiven: Int = 1,
+    val rightsHas: Int = 1
+)
+
+data class GroupChatSession(
+    val sessionId: UUID,
+    val groupName: String,
+    val messages: List<ChatMessage> = emptyList(),
+    val unreadCount: Int = 0,
+    val isJoined: Boolean = true,
+    val isPendingInvite: Boolean = false
+)
+
+data class TeleportOfferPrompt(
+    val fromAgentId: UUID,
+    val fromName: String,
+    val lureId: UUID,
+    val message: String,
+    val isTeleportRequest: Boolean = false
+)
+
+data class FriendshipOfferPrompt(
+    val fromAgentId: UUID,
+    val fromName: String,
+    val sessionId: UUID,
+    val message: String
 )
 
 data class NearbyAvatarInfo(
@@ -165,6 +207,12 @@ data class ViewerState(
     val localChat: List<ChatMessage> = emptyList(),
     val imConversations: List<ImConversation> = emptyList(),
     val activeImSessionId: UUID? = null,
+    val groupChats: List<GroupChatSession> = emptyList(),
+    val activeGroupSessionId: UUID? = null,
+    val friends: List<FriendEntry> = emptyList(),
+    val incomingTeleportOffer: TeleportOfferPrompt? = null,
+    val incomingFriendshipOffer: FriendshipOfferPrompt? = null,
+    val mutedAgentIds: Set<UUID> = emptySet(),
     val nearbyAvatars: List<NearbyAvatarInfo> = emptyList(),
     val inventoryEntries: List<InventoryEntry> = emptyList(),
     val expandedFolderIds: Set<UUID> = emptySet(),

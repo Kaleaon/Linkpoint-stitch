@@ -33,7 +33,9 @@ import com.example.linkpoint.protocol.LoginRequestParams
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
+import com.example.linkpoint.protocol.ChatEmoteFormatter
 import com.example.linkpoint.protocol.SlBinaryParsers
+import com.example.linkpoint.protocol.SocialProtocolPackets
 import com.example.linkpoint.protocol.XmlRpcLoginClient
 import com.example.linkpoint.render.LinkpointGlRenderer
 import com.example.linkpoint.render.RenderSceneSnapshot
@@ -54,12 +56,16 @@ import com.example.linkpoint.store.AdaptiveHudCoordinator
 import com.example.linkpoint.store.ChatMessage
 import com.example.linkpoint.store.ChatRange
 import com.example.linkpoint.store.ConnectionState
+import com.example.linkpoint.store.FriendEntry
+import com.example.linkpoint.store.FriendshipOfferPrompt
 import com.example.linkpoint.store.GridReachability
+import com.example.linkpoint.store.GroupChatSession
 import com.example.linkpoint.store.ImConversation
 import com.example.linkpoint.store.InventoryEntry
 import com.example.linkpoint.store.MapRegionTile
 import com.example.linkpoint.store.NearbyAvatarInfo
 import com.example.linkpoint.store.ScriptDialogPrompt
+import com.example.linkpoint.store.TeleportOfferPrompt
 import com.example.linkpoint.store.ViewerState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -86,8 +92,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private val cacheRepo = LinkpointCacheRepository(db)
     private val prefsRepo = PreferencesRepository(application)
     private val loginClient = XmlRpcLoginClient()
-    private val capabilityManager = CapabilityManager()
-    private val lludpEngine = LludpCircuitEngine()
+    internal val capabilityManager = CapabilityManager()
+    internal val lludpEngine = LludpCircuitEngine()
     private val assetManager = GridAssetManager()
 
     val renderer = LinkpointGlRenderer(
@@ -126,6 +132,11 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     @Volatile private var lastUiPosSyncMs = 0L
     private val pressedMoveKeys = ConcurrentHashMap.newKeySet<Int>()
     private val requestedProfiles = ConcurrentHashMap.newKeySet<UUID>()
+    private val startedGroupSessions = ConcurrentHashMap.newKeySet<UUID>()
+    private val activeOutboundTypingSessions = ConcurrentHashMap.newKeySet<UUID>()
+    private val outboundTypingJobs = ConcurrentHashMap<UUID, Job>()
+    private val inboundTypingExpiryJobs = ConcurrentHashMap<UUID, Job>()
+    private var callingCardFolderId: UUID = UUID(0L, 0L)
     private var simLoopJob: Job? = null
 
     private data class LoginAttemptSpec(
@@ -209,14 +220,93 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         pushSceneSnapshot()
                     }
                     is SimEvent.ChatReceived -> {
-                        val msg = ChatMessage(speaker = evt.fromName, text = evt.message)
-                        appendLocalChat(msg)
-                        viewModelScope.launch {
-                            cacheRepo.logChat(evt.fromName, evt.message, 0, currentRegionName())
+                        if (!isAgentMuted(evt.sourceId)) {
+                            val msg = ChatMessage(
+                                speaker = evt.fromName,
+                                text = evt.message,
+                                sourceAgentId = evt.sourceId
+                            )
+                            appendLocalChat(msg)
+                            viewModelScope.launch {
+                                cacheRepo.logChat(evt.fromName, evt.message, 0, currentRegionName())
+                            }
                         }
                     }
                     is SimEvent.InstantMessageReceived -> {
-                        appendImMessage(evt.imSessionId, evt.fromAgentId, evt.fromName, evt.fromName, evt.message)
+                        if (!isAgentMuted(evt.fromAgentId)) {
+                            val resolved = resolveKnownName(evt.fromAgentId, evt.fromName)
+                            setInboundPeerTyping(evt.fromAgentId, evt.imSessionId, resolved, isTyping = false)
+                            appendImMessage(
+                                sessionId = evt.imSessionId,
+                                peerId = evt.fromAgentId,
+                                peerName = resolved,
+                                speaker = resolved,
+                                text = evt.message,
+                                sourceAgentId = evt.fromAgentId
+                            )
+                        }
+                    }
+                    is SimEvent.FriendOnlineStatusChanged -> {
+                        handleFriendOnlineStatusChanged(evt.agentIds, evt.isOnline)
+                    }
+                    is SimEvent.PeerTypingStateChanged -> {
+                        if (!isAgentMuted(evt.fromAgentId)) {
+                            val resolved = resolveKnownName(evt.fromAgentId, evt.fromName)
+                            setInboundPeerTyping(evt.fromAgentId, evt.imSessionId, resolved, evt.isTyping)
+                        }
+                    }
+                    is SimEvent.TeleportLureReceived -> {
+                        if (!isAgentMuted(evt.fromAgentId)) {
+                            val resolved = resolveKnownName(evt.fromAgentId, evt.fromName)
+                            _state.update {
+                                it.copy(
+                                    incomingTeleportOffer = TeleportOfferPrompt(
+                                        fromAgentId = evt.fromAgentId,
+                                        fromName = resolved,
+                                        lureId = evt.lureId,
+                                        message = evt.message,
+                                        isTeleportRequest = evt.isTeleportRequest
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    is SimEvent.FriendshipOfferReceived -> {
+                        if (!isAgentMuted(evt.fromAgentId)) {
+                            val resolved = resolveKnownName(evt.fromAgentId, evt.fromName)
+                            _state.update {
+                                it.copy(
+                                    incomingFriendshipOffer = FriendshipOfferPrompt(
+                                        fromAgentId = evt.fromAgentId,
+                                        fromName = resolved,
+                                        sessionId = evt.transactionId,
+                                        message = evt.message
+                                    )
+                                )
+                            }
+                        }
+                    }
+                    is SimEvent.FriendshipResponseReceived -> {
+                        val resolved = resolveKnownName(evt.fromAgentId, evt.fromName)
+                        if (evt.accepted) {
+                            upsertFriend(evt.fromAgentId, resolved, isOnline = true)
+                            showToast("$resolved accepted your friendship offer")
+                        } else {
+                            showToast("$resolved declined your friendship offer")
+                        }
+                    }
+                    is SimEvent.GroupChatReceived -> {
+                        if (!isAgentMuted(evt.fromAgentId)) {
+                            val resolved = resolveKnownName(evt.fromAgentId, evt.fromName)
+                            appendIncomingGroupChat(
+                                sessionId = evt.sessionId,
+                                groupName = evt.groupName,
+                                fromAgentId = evt.fromAgentId,
+                                fromName = resolved,
+                                message = evt.message,
+                                isNotice = evt.isNotice
+                            )
+                        }
                     }
                     is SimEvent.ObjectUpdated -> {
                         val obj = mergeIncomingObjectWithCaps(evt.sceneObject)
@@ -465,6 +555,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                 )
                             }
                         }
+                        applyResolvedSocialNames(evt.names)
                         refreshNearbyRadar()
                         pushSceneSnapshot()
                     }
@@ -571,6 +662,14 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     is CapsEvent.AttachmentsUpdated -> {
                         applyCapsAttachmentUpdates(evt.updates)
                     }
+                    is CapsEvent.ChatterBoxInvitationReceived -> {
+                        if (!isAgentMuted(evt.fromAgentId)) {
+                            handleChatterBoxInvitation(evt)
+                        }
+                    }
+                    is CapsEvent.ChatterBoxSessionEventReceived -> {
+                        handleChatterBoxSessionEvent(evt)
+                    }
                     is CapsEvent.GenericNotice -> appendLocalChat(
                         ChatMessage(speaker = evt.title, text = evt.message, isSystem = true)
                     )
@@ -612,6 +711,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                 avatars[id] = av.copy(displayName = name)
                             }
                         }
+                        applyResolvedSocialNames(evt.names)
                         refreshNearbyRadar()
                         pushSceneSnapshot()
                     }
@@ -1083,10 +1183,31 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     assetType = f.typeDefault
                 )
             }
+            callingCardFolderId = response.inventorySkeleton
+                .firstOrNull { it.typeDefault == 2 || it.name.equals("Calling Cards", ignoreCase = true) }
+                ?.folderId
+                ?: response.inventoryRootId
+            startedGroupSessions.clear()
+            clearTypingTimers()
+
+            val initialFriends = response.buddyList.map { buddy ->
+                FriendEntry(
+                    agentId = buddy.buddyId,
+                    name = knownNames[buddy.buddyId] ?: "Resident ${buddy.buddyId.toString().take(8)}",
+                    isOnline = false,
+                    rightsGiven = buddy.rightsGiven,
+                    rightsHas = buddy.rightsHas
+                )
+            }
 
             lastRegionGridX = (response.regionX / 256).coerceAtLeast(0)
             lastRegionGridY = (response.regionY / 256).coerceAtLeast(0)
             lludpEngine.connect(response)
+            if (initialFriends.isNotEmpty()) {
+                val buddyIds = initialFriends.map { it.agentId }
+                assetManager.requestDisplayNames(buddyIds)
+                lludpEngine.requestUuidNames(buddyIds)
+            }
             if (capsResult.capabilities.containsKey("AttachmentResources")) {
                 viewModelScope.launch { capabilityManager.fetchAttachmentResources() }
             }
@@ -1103,11 +1224,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     ),
                     avatarPosition = Vec3(128f, 128f, 23f),
                     inventoryEntries = invEntries,
+                    friends = initialFriends,
+                    groupChats = emptyList(),
+                    activeGroupSessionId = null,
+                    activeImSessionId = null,
+                    incomingTeleportOffer = null,
+                    incomingFriendshipOffer = null,
                     localChat = listOf(
                         ChatMessage(speaker = grid.name, text = response.message, isSystem = true),
                         ChatMessage(
                             speaker = "Linkpoint Protocol",
-                            text = "LLUDP circuit active (${response.simIp}:${response.simPort}) • CAPS resolved: ${capsResult.capabilities.size}",
+                            text = "LLUDP circuit active (${response.simIp}:${response.simPort}) • CAPS resolved: ${capsResult.capabilities.size} • Friends: ${initialFriends.size}",
                             isSystem = true
                         )
                     ),
@@ -1199,6 +1326,45 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             MapRegionTile(999, 1000, "Emerald Cove", "PG", 0)
         )
 
+        startedGroupSessions.clear()
+        clearTypingTimers()
+
+        val greeterId = UUID.fromString("22222222-2222-4222-8222-222222222222")
+        val torleyId = UUID.fromString("44444444-4444-4444-8444-444444444444")
+        val lyraId = UUID.fromString("55555555-5555-4555-8555-555555555555")
+        val pioneersGroupId = UUID.fromString("66666666-6666-4666-8666-666666666666")
+        sandboxAvatars.forEach { knownNames[it.agentId] = it.displayName }
+        knownNames[torleyId] = "Torley Navigator"
+        knownNames[lyraId] = "Lyra Architect"
+
+        val sandboxFriends = listOf(
+            FriendEntry(agentId = greeterId, name = "Grid Greeter Bot", isOnline = true),
+            FriendEntry(agentId = torleyId, name = "Torley Navigator", isOnline = true),
+            FriendEntry(agentId = lyraId, name = "Lyra Architect", isOnline = false)
+        )
+
+        val sandboxGroupChats = listOf(
+            GroupChatSession(
+                sessionId = pioneersGroupId,
+                groupName = "Linkpoint Pioneers",
+                isJoined = true,
+                unreadCount = 1,
+                messages = listOf(
+                    ChatMessage(
+                        speaker = "Torley Navigator",
+                        text = "Welcome to the Linkpoint Pioneers group channel! Try /me emotes here or in Local Chat.",
+                        sourceAgentId = torleyId
+                    ),
+                    ChatMessage(
+                        speaker = "Grid Greeter Bot",
+                        text = "/me waves from the Welcome Deck",
+                        isEmote = true,
+                        sourceAgentId = greeterId
+                    )
+                )
+            )
+        )
+
         _state.update { s ->
             s.copy(
                 connection = ConnectionState.LocalSandbox(),
@@ -1209,6 +1375,13 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 inventoryEntries = sandboxInventory,
                 expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
                 mapRegions = sandboxMap,
+                friends = sandboxFriends,
+                groupChats = sandboxGroupChats,
+                activeGroupSessionId = null,
+                activeImSessionId = null,
+                incomingTeleportOffer = null,
+                incomingFriendshipOffer = null,
+                mutedAgentIds = emptySet(),
                 localChat = listOf(
                     ChatMessage(
                         speaker = "Linkpoint Sandbox",
@@ -1241,6 +1414,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         verticalVelocityZ = 0f
         textInputFocused = false
         renderer.focusOverride = null
+        startedGroupSessions.clear()
+        clearTypingTimers()
         _state.update { s ->
             s.copy(
                 connection = ConnectionState.Disconnected,
@@ -1250,6 +1425,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 projectedNametags = emptyList(),
                 activeKeyboardHint = null,
                 scriptDialog = null,
+                incomingTeleportOffer = null,
+                incomingFriendshipOffer = null,
                 hudEditMode = false
             )
         }
@@ -1896,27 +2073,53 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 body = match.groupValues[2]
             }
         }
+        val emote = ChatEmoteFormatter.analyze(body)
+        val wireBody = if (emote.isEmote) emote.wireMessage else body
         if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendChat(body, range.packetType, channel)
+            lludpEngine.sendChat(wireBody, range.packetType, channel)
         }
-        val prefix = if (channel != 0) "[ch $channel] " else if (range != ChatRange.SAY) "(${range.label}) " else ""
-        appendLocalChat(ChatMessage(speaker = selfAvatarName, text = "$prefix$body", channel = channel))
-        viewModelScope.launch { cacheRepo.logChat(selfAvatarName, body, channel, currentRegionName()) }
+        val localText = when {
+            emote.isEmote -> wireBody
+            channel != 0 -> "[ch $channel] $body"
+            range != ChatRange.SAY -> "(${range.label}) $body"
+            else -> body
+        }
+        appendLocalChat(
+            ChatMessage(
+                speaker = selfAvatarName,
+                text = localText,
+                channel = channel,
+                isEmote = emote.isEmote,
+                sourceAgentId = selfAgentId
+            )
+        )
+        viewModelScope.launch { cacheRepo.logChat(selfAvatarName, wireBody, channel, currentRegionName()) }
     }
 
     override fun openImWith(agentId: UUID, name: String) {
         val existing = _state.value.imConversations.firstOrNull { it.peerAgentId == agentId }
-        val sessionId = existing?.sessionId ?: UUID.nameUUIDFromBytes((selfAgentId.toString() + agentId.toString()).toByteArray())
+        val sessionId = existing?.sessionId ?: SocialProtocolPackets.computeDirectImSessionId(selfAgentId, agentId)
+        val resolvedName = name.ifBlank { knownNames[agentId] ?: "Resident ${agentId.toString().take(8)}" }
         if (existing == null) {
             _state.update { s ->
                 s.copy(
-                    imConversations = s.imConversations + ImConversation(sessionId, agentId, name),
+                    imConversations = s.imConversations + ImConversation(sessionId, agentId, resolvedName),
                     activeImSessionId = sessionId,
+                    activeGroupSessionId = null,
                     activeFloater = DockToolId.CHAT
                 )
             }
         } else {
-            _state.update { it.copy(activeImSessionId = sessionId, activeFloater = DockToolId.CHAT) }
+            _state.update { s ->
+                s.copy(
+                    activeImSessionId = sessionId,
+                    activeGroupSessionId = null,
+                    imConversations = s.imConversations.map {
+                        if (it.sessionId == sessionId) it.copy(unreadCount = 0) else it
+                    },
+                    activeFloater = DockToolId.CHAT
+                )
+            }
         }
         pushSceneSnapshot()
     }
@@ -1925,6 +2128,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         _state.update { s ->
             s.copy(
                 activeImSessionId = sessionId,
+                activeGroupSessionId = if (sessionId != null) null else null,
                 imConversations = s.imConversations.map {
                     if (it.sessionId == sessionId) it.copy(unreadCount = 0) else it
                 }
@@ -1932,14 +2136,250 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    override fun onImDraftChanged(sessionId: UUID, draftText: String) {
+        val convo = _state.value.imConversations.firstOrNull { it.sessionId == sessionId } ?: return
+        val hasText = draftText.isNotBlank()
+        if (!hasText) {
+            stopOutboundTyping(convo.sessionId, convo.peerAgentId)
+            return
+        }
+        if (activeOutboundTypingSessions.add(convo.sessionId)) {
+            if (_state.value.connection is ConnectionState.Connected) {
+                lludpEngine.sendTypingIndicator(convo.peerAgentId, convo.sessionId, selfAvatarName, isTyping = true)
+            }
+        }
+        outboundTypingJobs[convo.sessionId]?.cancel()
+        outboundTypingJobs[convo.sessionId] = viewModelScope.launch {
+            delay(5000L)
+            stopOutboundTyping(convo.sessionId, convo.peerAgentId)
+        }
+    }
+
     override fun sendInstantMessage(sessionId: UUID, text: String) {
         val trimmed = text.trim()
         if (trimmed.isEmpty()) return
         val convo = _state.value.imConversations.firstOrNull { it.sessionId == sessionId } ?: return
+        stopOutboundTyping(convo.sessionId, convo.peerAgentId)
+        val emote = ChatEmoteFormatter.analyze(trimmed)
+        val wireText = if (emote.isEmote) emote.wireMessage else trimmed
         if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendInstantMessage(convo.peerAgentId, sessionId, selfAvatarName, trimmed)
+            lludpEngine.sendInstantMessage(convo.peerAgentId, sessionId, selfAvatarName, wireText)
         }
-        appendImMessage(sessionId, convo.peerAgentId, convo.peerName, selfAvatarName, trimmed)
+        appendImMessage(
+            sessionId = sessionId,
+            peerId = convo.peerAgentId,
+            peerName = convo.peerName,
+            speaker = selfAvatarName,
+            text = wireText,
+            sourceAgentId = selfAgentId
+        )
+    }
+
+    override fun selectGroupChatSession(sessionId: UUID?) {
+        val target = sessionId?.let { id -> _state.value.groupChats.firstOrNull { it.sessionId == id } }
+        _state.update { s ->
+            s.copy(
+                activeGroupSessionId = sessionId,
+                activeImSessionId = null,
+                groupChats = s.groupChats.map { g ->
+                    if (g.sessionId == sessionId) g.copy(unreadCount = 0) else g
+                }
+            )
+        }
+        if (target != null && (!target.isJoined || target.isPendingInvite)) {
+            joinGroupChatSession(target.sessionId)
+        } else if (target != null && _state.value.connection is ConnectionState.Connected && startedGroupSessions.add(target.sessionId)) {
+            viewModelScope.launch {
+                capabilityManager.startGroupChatSession(target.sessionId)
+                lludpEngine.sendGroupSessionStart(target.sessionId, selfAvatarName)
+            }
+        }
+    }
+
+    override fun joinGroupChatSession(sessionId: UUID) {
+        val existing = _state.value.groupChats.firstOrNull { it.sessionId == sessionId }
+        val wasInvite = existing?.isPendingInvite == true
+        _state.update { s ->
+            val updated = if (existing != null) {
+                s.groupChats.map { g ->
+                    if (g.sessionId == sessionId) g.copy(isJoined = true, isPendingInvite = false, unreadCount = 0) else g
+                }
+            } else {
+                s.groupChats + GroupChatSession(sessionId = sessionId, groupName = "Group Chat", isJoined = true)
+            }
+            s.copy(
+                groupChats = updated,
+                activeGroupSessionId = sessionId,
+                activeImSessionId = null,
+                activeFloater = DockToolId.CHAT
+            )
+        }
+        startedGroupSessions.add(sessionId)
+        if (_state.value.connection is ConnectionState.Connected) {
+            viewModelScope.launch {
+                val ok = if (wasInvite) {
+                    capabilityManager.acceptGroupChatInvitation(sessionId)
+                } else {
+                    capabilityManager.startGroupChatSession(sessionId)
+                }
+                if (!ok) {
+                    lludpEngine.sendGroupSessionStart(sessionId, selfAvatarName)
+                }
+            }
+        }
+        showToast("Joined ${existing?.groupName ?: "Group Chat"}")
+    }
+
+    override fun sendGroupChatMessage(sessionId: UUID, text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        val group = _state.value.groupChats.firstOrNull { it.sessionId == sessionId } ?: return
+        val emote = ChatEmoteFormatter.analyze(trimmed)
+        val wireText = if (emote.isEmote) emote.wireMessage else trimmed
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            if (startedGroupSessions.add(sessionId)) {
+                viewModelScope.launch {
+                    capabilityManager.startGroupChatSession(sessionId)
+                    lludpEngine.sendGroupSessionStart(sessionId, selfAvatarName)
+                    lludpEngine.sendGroupChat(sessionId, selfAvatarName, wireText)
+                }
+            } else {
+                lludpEngine.sendGroupChat(sessionId, selfAvatarName, wireText)
+            }
+        }
+        val msg = ChatMessage(
+            speaker = selfAvatarName,
+            text = wireText,
+            isEmote = emote.isEmote,
+            sourceAgentId = selfAgentId
+        )
+        _state.update { s ->
+            s.copy(
+                groupChats = s.groupChats.map { g ->
+                    if (g.sessionId == group.sessionId) {
+                        g.copy(
+                            isJoined = true,
+                            isPendingInvite = false,
+                            messages = (g.messages + msg).takeLast(120),
+                            unreadCount = 0
+                        )
+                    } else g
+                }
+            )
+        }
+    }
+
+    override fun offerTeleport(targetAgentId: UUID, targetName: String, message: String) {
+        if (targetAgentId == selfAgentId) return
+        val resolvedName = targetName.ifBlank { knownNames[targetAgentId] ?: "Resident" }
+        val lureMessage = message.trim().ifBlank { "Join me in ${currentRegionName()}!" }
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendStartLure(targetAgentId, lureMessage)
+        }
+        appendLocalChat(
+            ChatMessage(
+                speaker = "Teleport",
+                text = "Offered teleport to $resolvedName (\"$lureMessage\")",
+                isSystem = true
+            )
+        )
+        showToast("Teleport offer sent to $resolvedName")
+    }
+
+    override fun acceptTeleportOffer() {
+        val offer = _state.value.incomingTeleportOffer ?: return
+        _state.update { it.copy(incomingTeleportOffer = null) }
+        if (_state.value.connection is ConnectionState.Connected) {
+            if (offer.isTeleportRequest) {
+                lludpEngine.sendStartLure(offer.fromAgentId, "Accepting teleport request to ${currentRegionName()}")
+                showToast("Sent teleport lure to ${offer.fromName}")
+            } else {
+                lludpEngine.sendTeleportLureRequest(offer.lureId)
+                showToast("Teleporting to ${offer.fromName}...")
+            }
+        } else {
+            val peerPos = avatars[offer.fromAgentId]?.position
+            if (peerPos != null && !offer.isTeleportRequest) {
+                teleportToRegion(currentRegionName(), peerPos.x.toInt(), peerPos.y.toInt(), peerPos.z.toInt())
+            } else {
+                showToast("Accepted teleport from ${offer.fromName}")
+            }
+        }
+    }
+
+    override fun declineTeleportOffer() {
+        val offer = _state.value.incomingTeleportOffer ?: return
+        _state.update { it.copy(incomingTeleportOffer = null) }
+        showToast("Declined teleport from ${offer.fromName}")
+    }
+
+    override fun offerFriendship(targetAgentId: UUID, targetName: String, message: String) {
+        if (targetAgentId == selfAgentId) return
+        val resolvedName = targetName.ifBlank { knownNames[targetAgentId] ?: "Resident" }
+        if (_state.value.friends.any { it.agentId == targetAgentId }) {
+            showToast("$resolvedName is already in your Friends list")
+            return
+        }
+        val offerMessage = message.trim().ifBlank { "Would you like to be friends in Second Life?" }
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendFriendshipOffer(targetAgentId, selfAvatarName, offerMessage)
+            showToast("Friendship offer sent to $resolvedName")
+        } else {
+            upsertFriend(targetAgentId, resolvedName, isOnline = true)
+            showToast("Added $resolvedName to Friends")
+        }
+        appendLocalChat(
+            ChatMessage(
+                speaker = "Friends",
+                text = "Sent friendship offer to $resolvedName",
+                isSystem = true
+            )
+        )
+    }
+
+    override fun acceptFriendshipOffer() {
+        val offer = _state.value.incomingFriendshipOffer ?: return
+        _state.update { it.copy(incomingFriendshipOffer = null) }
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendAcceptFriendship(offer.sessionId, callingCardFolderId)
+        }
+        upsertFriend(offer.fromAgentId, offer.fromName, isOnline = true)
+        appendLocalChat(
+            ChatMessage(
+                speaker = "Friends",
+                text = "You and ${offer.fromName} are now friends.",
+                isSystem = true
+            )
+        )
+        showToast("You and ${offer.fromName} are now friends")
+    }
+
+    override fun declineFriendshipOffer() {
+        val offer = _state.value.incomingFriendshipOffer ?: return
+        _state.update { it.copy(incomingFriendshipOffer = null) }
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendDeclineFriendship(offer.sessionId)
+        }
+        showToast("Declined friendship offer from ${offer.fromName}")
+    }
+
+    override fun toggleMuteAvatar(agentId: UUID, avatarName: String) {
+        if (agentId == selfAgentId) return
+        val resolvedName = avatarName.ifBlank { knownNames[agentId] ?: "Resident" }
+        val wasMuted = agentId in _state.value.mutedAgentIds
+        _state.update { s ->
+            val nextMuted = if (wasMuted) s.mutedAgentIds - agentId else s.mutedAgentIds + agentId
+            s.copy(
+                mutedAgentIds = nextMuted,
+                incomingTeleportOffer = s.incomingTeleportOffer?.takeUnless { !wasMuted && it.fromAgentId == agentId },
+                incomingFriendshipOffer = s.incomingFriendshipOffer?.takeUnless { !wasMuted && it.fromAgentId == agentId },
+                imConversations = s.imConversations.map { c ->
+                    if (!wasMuted && c.peerAgentId == agentId) c.copy(isPeerTyping = false) else c
+                }
+            )
+        }
+        showToast(if (wasMuted) "Unmuted $resolvedName" else "Muted $resolvedName")
     }
 
     override fun searchMapRegions(query: String) {
@@ -2392,24 +2832,311 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     }
 
     private fun appendLocalChat(msg: ChatMessage) {
+        if (isAgentMuted(msg.sourceAgentId)) return
         _state.update { s -> s.copy(localChat = (s.localChat + msg).takeLast(120)) }
     }
 
-    private fun appendImMessage(sessionId: UUID, peerId: UUID, peerName: String, speaker: String, text: String) {
-        val msg = ChatMessage(speaker = speaker, text = text)
+    private fun appendImMessage(
+        sessionId: UUID,
+        peerId: UUID,
+        peerName: String,
+        speaker: String,
+        text: String,
+        sourceAgentId: UUID? = null
+    ) {
+        if (isAgentMuted(sourceAgentId)) return
+        val msg = ChatMessage(speaker = speaker, text = text, sourceAgentId = sourceAgentId)
         _state.update { s ->
-            val exists = s.imConversations.any { it.sessionId == sessionId }
-            val updated = if (exists) {
+            val targetConvo = s.imConversations.firstOrNull { it.sessionId == sessionId || it.peerAgentId == peerId }
+            val updated = if (targetConvo != null) {
                 s.imConversations.map { c ->
-                    if (c.sessionId == sessionId) {
-                        val unread = if (s.activeImSessionId == sessionId && s.activeFloater == DockToolId.CHAT) 0 else c.unreadCount + 1
-                        c.copy(messages = (c.messages + msg).takeLast(100), unreadCount = unread)
+                    if (c.sessionId == targetConvo.sessionId) {
+                        val isActiveView = s.activeImSessionId == c.sessionId && s.activeFloater == DockToolId.CHAT
+                        val unread = if (isActiveView || sourceAgentId == selfAgentId) 0 else c.unreadCount + 1
+                        c.copy(
+                            peerName = if (c.peerName.startsWith("Resident ") && !peerName.startsWith("Resident ")) peerName else c.peerName,
+                            messages = (c.messages + msg).takeLast(100),
+                            unreadCount = unread
+                        )
                     } else c
                 }
             } else {
                 s.imConversations + ImConversation(sessionId, peerId, peerName, listOf(msg), unreadCount = 1)
             }
             s.copy(imConversations = updated)
+        }
+    }
+
+    internal fun isAgentMuted(agentId: UUID?): Boolean {
+        return agentId != null &&
+            agentId != UUID(0L, 0L) &&
+            agentId != selfAgentId &&
+            agentId in _state.value.mutedAgentIds
+    }
+
+    private fun resolveKnownName(agentId: UUID, fallback: String): String {
+        val cleaned = fallback.trim()
+        if (cleaned.isNotBlank() && cleaned != "Resident") {
+            knownNames[agentId] = cleaned
+            return cleaned
+        }
+        val cached = knownNames[agentId]
+        if (!cached.isNullOrBlank()) return cached
+        if (_state.value.connection is ConnectionState.Connected && agentId != UUID(0L, 0L)) {
+            assetManager.requestDisplayNames(listOf(agentId))
+            lludpEngine.requestUuidNames(listOf(agentId))
+        }
+        return if (cleaned.isNotBlank()) cleaned else "Resident ${agentId.toString().take(8)}"
+    }
+
+    private fun applyResolvedSocialNames(names: Map<UUID, String>) {
+        if (names.isEmpty()) return
+        _state.update { s ->
+            val updatedFriends = s.friends.map { f ->
+                val resolved = names[f.agentId]
+                if (!resolved.isNullOrBlank()) f.copy(name = resolved) else f
+            }
+            val updatedIms = s.imConversations.map { c ->
+                val resolved = names[c.peerAgentId]
+                if (!resolved.isNullOrBlank() && (c.peerName.startsWith("Resident") || c.peerName.isBlank())) {
+                    c.copy(peerName = resolved)
+                } else c
+            }
+            val updatedTp = s.incomingTeleportOffer?.let { tp ->
+                val resolved = names[tp.fromAgentId]
+                if (!resolved.isNullOrBlank()) tp.copy(fromName = resolved) else tp
+            }
+            val updatedFr = s.incomingFriendshipOffer?.let { fr ->
+                val resolved = names[fr.fromAgentId]
+                if (!resolved.isNullOrBlank()) fr.copy(fromName = resolved) else fr
+            }
+            s.copy(
+                friends = updatedFriends,
+                imConversations = updatedIms,
+                incomingTeleportOffer = updatedTp,
+                incomingFriendshipOffer = updatedFr
+            )
+        }
+    }
+
+    private fun handleFriendOnlineStatusChanged(agentIds: List<UUID>, isOnline: Boolean) {
+        val idSet = agentIds.filter { it != UUID(0L, 0L) && it != selfAgentId }.toSet()
+        if (idSet.isEmpty()) return
+        val unresolvedIds = mutableListOf<UUID>()
+        idSet.forEach { id ->
+            avatars[id]?.let { av -> avatars[id] = av.copy(isOnline = isOnline) }
+            if (!knownNames.containsKey(id)) unresolvedIds.add(id)
+        }
+        if (unresolvedIds.isNotEmpty() && _state.value.connection is ConnectionState.Connected) {
+            assetManager.requestDisplayNames(unresolvedIds)
+            lludpEngine.requestUuidNames(unresolvedIds)
+        }
+        var statusAnnouncement: String? = null
+        _state.update { s ->
+            val existingById = s.friends.associateBy { it.agentId }.toMutableMap()
+            for (id in idSet) {
+                val prev = existingById[id]
+                val name = knownNames[id] ?: prev?.name ?: "Resident ${id.toString().take(8)}"
+                if (prev != null && prev.isOnline != isOnline && !name.startsWith("Resident ")) {
+                    statusAnnouncement = "$name is ${if (isOnline) "online" else "offline"}"
+                }
+                existingById[id] = (prev ?: FriendEntry(agentId = id, name = name)).copy(
+                    name = name,
+                    isOnline = isOnline
+                )
+            }
+            s.copy(friends = existingById.values.sortedWith(compareByDescending<FriendEntry> { it.isOnline }.thenBy { it.name }))
+        }
+        statusAnnouncement?.let { showToast(it) }
+    }
+
+    private fun upsertFriend(agentId: UUID, name: String, isOnline: Boolean) {
+        if (agentId == UUID(0L, 0L) || agentId == selfAgentId) return
+        knownNames[agentId] = name
+        _state.update { s ->
+            val exists = s.friends.any { it.agentId == agentId }
+            val next = if (exists) {
+                s.friends.map { f ->
+                    if (f.agentId == agentId) f.copy(name = name.ifBlank { f.name }, isOnline = isOnline) else f
+                }
+            } else {
+                s.friends + FriendEntry(agentId = agentId, name = name, isOnline = isOnline)
+            }
+            s.copy(friends = next.sortedWith(compareByDescending<FriendEntry> { it.isOnline }.thenBy { it.name }))
+        }
+    }
+
+    private fun setInboundPeerTyping(peerId: UUID, imSessionId: UUID, peerName: String, isTyping: Boolean) {
+        inboundTypingExpiryJobs.remove(peerId)?.cancel()
+        if (isTyping) {
+            inboundTypingExpiryJobs[peerId] = viewModelScope.launch {
+                delay(12_000L)
+                setInboundPeerTyping(peerId, imSessionId, peerName, isTyping = false)
+            }
+        }
+        _state.update { s ->
+            val target = s.imConversations.firstOrNull { it.peerAgentId == peerId || it.sessionId == imSessionId }
+            val updated = if (target != null) {
+                s.imConversations.map { c ->
+                    if (c.sessionId == target.sessionId) c.copy(isPeerTyping = isTyping) else c
+                }
+            } else if (isTyping) {
+                val sid = if (imSessionId != UUID(0L, 0L)) imSessionId else SocialProtocolPackets.computeDirectImSessionId(selfAgentId, peerId)
+                s.imConversations + ImConversation(sid, peerId, peerName, isPeerTyping = true)
+            } else {
+                s.imConversations
+            }
+            s.copy(imConversations = updated)
+        }
+    }
+
+    private fun stopOutboundTyping(sessionId: UUID, peerAgentId: UUID) {
+        outboundTypingJobs.remove(sessionId)?.cancel()
+        if (activeOutboundTypingSessions.remove(sessionId)) {
+            if (_state.value.connection is ConnectionState.Connected) {
+                lludpEngine.sendTypingIndicator(peerAgentId, sessionId, selfAvatarName, isTyping = false)
+            }
+        }
+    }
+
+    private fun clearTypingTimers() {
+        outboundTypingJobs.values.forEach { it.cancel() }
+        outboundTypingJobs.clear()
+        inboundTypingExpiryJobs.values.forEach { it.cancel() }
+        inboundTypingExpiryJobs.clear()
+        activeOutboundTypingSessions.clear()
+    }
+
+    private fun appendIncomingGroupChat(
+        sessionId: UUID,
+        groupName: String,
+        fromAgentId: UUID?,
+        fromName: String,
+        message: String,
+        isNotice: Boolean = false
+    ) {
+        val nowMs = System.currentTimeMillis()
+        val msg = ChatMessage(
+            speaker = fromName,
+            text = message,
+            isSystem = isNotice,
+            sourceAgentId = fromAgentId,
+            timestampMs = nowMs
+        )
+        _state.update { s ->
+            val existing = s.groupChats.firstOrNull { it.sessionId == sessionId }
+            if (fromAgentId == selfAgentId && existing != null) {
+                val recentEcho = existing.messages.lastOrNull {
+                    it.sourceAgentId == selfAgentId &&
+                        it.text == message &&
+                        nowMs - it.timestampMs < 4000L
+                }
+                if (recentEcho != null) return@update s
+            }
+            val isActiveGroup = s.activeFloater == DockToolId.CHAT && s.activeGroupSessionId == sessionId
+            val updatedGroups = if (existing != null) {
+                s.groupChats.map { g ->
+                    if (g.sessionId == sessionId) {
+                        val bestName = if ((g.groupName == "Group Chat" || g.groupName.isBlank()) &&
+                            groupName != "Group Chat" && groupName != "Group Notice"
+                        ) groupName else g.groupName
+                        g.copy(
+                            groupName = bestName,
+                            messages = (g.messages + msg).takeLast(120),
+                            unreadCount = if (isActiveGroup) 0 else g.unreadCount + 1
+                        )
+                    } else g
+                }
+            } else {
+                val initialName = groupName.takeUnless { it == "Group Notice" || it.isBlank() } ?: "Group Chat"
+                s.groupChats + GroupChatSession(
+                    sessionId = sessionId,
+                    groupName = initialName,
+                    messages = listOf(msg),
+                    unreadCount = if (isActiveGroup) 0 else 1,
+                    isJoined = true
+                )
+            }
+            s.copy(groupChats = updatedGroups)
+        }
+    }
+
+    private fun handleChatterBoxInvitation(evt: CapsEvent.ChatterBoxInvitationReceived) {
+        val initialMessages = if (evt.message.isNotBlank()) {
+            listOf(
+                ChatMessage(
+                    speaker = evt.fromName,
+                    text = evt.message,
+                    sourceAgentId = evt.fromAgentId
+                )
+            )
+        } else emptyList()
+
+        _state.update { s ->
+            val existing = s.groupChats.firstOrNull { it.sessionId == evt.sessionId }
+            val isActiveGroup = s.activeFloater == DockToolId.CHAT && s.activeGroupSessionId == evt.sessionId
+            val nextGroups = if (existing != null) {
+                s.groupChats.map { g ->
+                    if (g.sessionId == evt.sessionId) {
+                        g.copy(
+                            groupName = evt.sessionName.ifBlank { g.groupName },
+                            messages = (g.messages + initialMessages).takeLast(120),
+                            unreadCount = if (isActiveGroup || initialMessages.isEmpty()) g.unreadCount else g.unreadCount + 1
+                        )
+                    } else g
+                }
+            } else {
+                s.groupChats + GroupChatSession(
+                    sessionId = evt.sessionId,
+                    groupName = evt.sessionName.ifBlank { "Group Chat" },
+                    messages = initialMessages,
+                    unreadCount = 1,
+                    isJoined = false,
+                    isPendingInvite = true
+                )
+            }
+            s.copy(groupChats = nextGroups)
+        }
+        showToast("Group chat invite: ${evt.sessionName}")
+    }
+
+    private fun handleChatterBoxSessionEvent(evt: CapsEvent.ChatterBoxSessionEventReceived) {
+        if (evt.success) {
+            startedGroupSessions.add(evt.sessionId)
+        }
+        _state.update { s ->
+            val existing = s.groupChats.firstOrNull { it.sessionId == evt.sessionId }
+            val nextGroups = if (existing != null) {
+                s.groupChats.map { g ->
+                    if (g.sessionId == evt.sessionId) {
+                        g.copy(
+                            groupName = if (g.groupName == "Group Chat" && evt.sessionName.isNotBlank()) evt.sessionName else g.groupName,
+                            isJoined = evt.success || g.isJoined,
+                            isPendingInvite = false
+                        )
+                    } else g
+                }
+            } else if (evt.success) {
+                s.groupChats + GroupChatSession(
+                    sessionId = evt.sessionId,
+                    groupName = evt.sessionName.ifBlank { "Group Chat" },
+                    isJoined = true,
+                    isPendingInvite = false
+                )
+            } else s.groupChats
+            s.copy(groupChats = nextGroups)
+        }
+        if (!evt.chatMessage.isNullOrBlank() && !isAgentMuted(evt.fromAgentId)) {
+            val senderName = evt.fromName?.takeIf { it.isNotBlank() }
+                ?: evt.fromAgentId?.let { resolveKnownName(it, "") }
+                ?: evt.sessionName
+            appendIncomingGroupChat(
+                sessionId = evt.sessionId,
+                groupName = evt.sessionName,
+                fromAgentId = evt.fromAgentId,
+                fromName = senderName,
+                message = evt.chatMessage
+            )
         }
     }
 

@@ -22,10 +22,15 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.VolumeOff
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Checkroom
+import androidx.compose.material.icons.filled.Explore
+import androidx.compose.material.icons.filled.HowToReg
 import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.PersonAdd
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -70,6 +75,12 @@ fun AvatarProfileSheetContent(
     val cardShape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(12.dp))
     val distMeters = remember(avatar.position, state.avatarPosition) {
         avatar.position.distanceTo(state.avatarPosition)
+    }
+    val isFriend = remember(avatar.agentId, state.friends) {
+        state.friends.any { it.agentId == avatar.agentId }
+    }
+    val isMuted = remember(avatar.agentId, state.mutedAgentIds) {
+        avatar.agentId in state.mutedAgentIds
     }
 
     Column(
@@ -154,6 +165,12 @@ fun AvatarProfileSheetContent(
                     )
                     if (avatar.isFlying) {
                         LinkpointStatusChip(label = "FLY", color = tokens.accentSecondary)
+                    }
+                    if (!avatar.isSelf && isFriend) {
+                        LinkpointStatusChip(label = "FRIEND", color = tokens.statusOnline)
+                    }
+                    if (!avatar.isSelf && isMuted) {
+                        LinkpointStatusChip(label = "MUTED", color = tokens.statusWarning)
                     }
                 }
                 Text(
@@ -356,7 +373,7 @@ fun AvatarProfileSheetContent(
 
         Spacer(Modifier.height(8.dp))
 
-        // Action Buttons Row
+        // Action Buttons Rows
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -390,6 +407,40 @@ fun AvatarProfileSheetContent(
                 testTag = "avatar_profile_refresh_button",
                 modifier = Modifier.weight(1f)
             )
+        }
+
+        if (!avatar.isSelf) {
+            Spacer(Modifier.height(6.dp))
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                LinkpointActionButton(
+                    text = if (isFriend) "Friends" else "Add Friend",
+                    icon = if (isFriend) Icons.Default.HowToReg else Icons.Default.PersonAdd,
+                    onClick = { client.offerFriendship(avatar.agentId, avatar.displayName) },
+                    primary = false,
+                    enabled = !isFriend,
+                    testTag = "avatar_profile_add_friend_button",
+                    modifier = Modifier.weight(1f)
+                )
+                LinkpointActionButton(
+                    text = "Offer Teleport",
+                    icon = Icons.Default.Explore,
+                    onClick = { client.offerTeleport(avatar.agentId, avatar.displayName) },
+                    primary = false,
+                    testTag = "avatar_profile_offer_teleport_button",
+                    modifier = Modifier.weight(1.1f)
+                )
+                LinkpointActionButton(
+                    text = if (isMuted) "Unmute" else "Mute",
+                    icon = if (isMuted) Icons.AutoMirrored.Filled.VolumeUp else Icons.AutoMirrored.Filled.VolumeOff,
+                    onClick = { client.toggleMuteAvatar(avatar.agentId, avatar.displayName) },
+                    primary = false,
+                    testTag = "avatar_profile_mute_button",
+                    modifier = Modifier.weight(0.9f)
+                )
+            }
         }
     }
 }
