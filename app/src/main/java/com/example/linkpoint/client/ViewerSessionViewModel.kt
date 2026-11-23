@@ -5,6 +5,10 @@ import android.graphics.Bitmap
 import android.view.KeyEvent
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.linkpoint.audio.AndroidMediaPlayerStreamPlayer
+import com.example.linkpoint.audio.AudioCategory
+import com.example.linkpoint.audio.SlAudioEngine
+import com.example.linkpoint.audio.SlVoiceWebRtcProtocol
 import com.example.linkpoint.cache.GridConfigEntity
 import com.example.linkpoint.cache.LandmarkCacheEntity
 import com.example.linkpoint.cache.LinkpointCacheRepository
@@ -89,6 +93,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private val capabilityManager = CapabilityManager()
     private val lludpEngine = LludpCircuitEngine()
     private val assetManager = GridAssetManager()
+    val audioEngine = SlAudioEngine(parcelStreamPlayer = AndroidMediaPlayerStreamPlayer())
 
     val renderer = LinkpointGlRenderer(
         onFpsMeasured = ::onFpsMeasured,
@@ -145,6 +150,11 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private var lastRegionGridY: Int = 1000
 
     init {
+        viewModelScope.launch {
+            audioEngine.state.collect { audioVoice ->
+                _state.update { it.copy(audioVoice = audioVoice) }
+            }
+        }
         viewModelScope.launch {
             cacheRepo.ensureBuiltInGrids()
         }
@@ -471,12 +481,36 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     is SimEvent.ObjectKilled -> {
                         allSceneObjects.remove(evt.localId)
                         manualHudAttachments.remove(evt.localId)
+                        audioEngine.onObjectKilled(evt.localId)
                         val deadAv = avatars.values.firstOrNull { it.localId == evt.localId && !it.isSelf }
                         if (deadAv != null) {
                             avatars.remove(deadAv.agentId)
                             refreshNearbyRadar()
                         }
                         pushSceneSnapshot()
+                    }
+                    is SimEvent.ParcelPropertiesReceived -> {
+                        if (evt.parcel.name.isNotBlank()) {
+                            _state.update { it.copy(parcelName = evt.parcel.name) }
+                        }
+                        audioEngine.onParcelProperties(
+                            localId = evt.parcel.localId,
+                            name = evt.parcel.name,
+                            musicUrl = evt.parcel.musicUrl,
+                            mediaUrl = evt.parcel.mediaUrl
+                        )
+                    }
+                    is SimEvent.SoundTriggered -> {
+                        audioEngine.onSoundTrigger(evt.sound)
+                    }
+                    is SimEvent.AttachedSoundReceived -> {
+                        audioEngine.onAttachedSound(evt.sound)
+                    }
+                    is SimEvent.AttachedSoundGainChanged -> {
+                        audioEngine.onAttachedSoundGainChange(evt.change)
+                    }
+                    is SimEvent.SoundsPreloaded -> {
+                        audioEngine.onPreloadSounds(evt.entries)
                     }
                     is SimEvent.ObjectPropertiesReceived -> {
                         allSceneObjects.values.firstOrNull { it.uuid == evt.objectId }?.let { existing ->
@@ -564,7 +598,20 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             capabilityManager.capsEvents.collect { evt ->
                 when (evt) {
-                    is CapsEvent.ParcelProperties -> _state.update { it.copy(parcelName = evt.parcelName) }
+                    is CapsEvent.ParcelProperties -> {
+                        if (evt.parcelName.isNotBlank()) {
+                            _state.update { it.copy(parcelName = evt.parcelName) }
+                        }
+                        audioEngine.onParcelProperties(
+                            localId = evt.localId,
+                            name = evt.parcelName,
+                            musicUrl = evt.musicUrl,
+                            mediaUrl = evt.mediaUrl
+                        )
+                    }
+                    is CapsEvent.ParcelVoiceInfoUpdate -> {
+                        appendDiagnostic("[Voice] ParcelVoiceInfo region=${evt.info.regionName} localId=${evt.info.localId}")
+                    }
                     is CapsEvent.ScriptDialog -> _state.update {
                         it.copy(scriptDialog = ScriptDialogPrompt(evt.objectName, evt.message, evt.buttons, evt.channel))
                     }
@@ -1086,6 +1133,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
             lastRegionGridX = (response.regionX / 256).coerceAtLeast(0)
             lastRegionGridY = (response.regionY / 256).coerceAtLeast(0)
+            audioEngine.resetSession()
             lludpEngine.connect(response)
             if (capsResult.capabilities.containsKey("AttachmentResources")) {
                 viewModelScope.launch { capabilityManager.fetchAttachmentResources() }
@@ -1221,13 +1269,77 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             )
         }
         renderer.focusOverride = null
+        audioEngine.resetSession()
+        audioEngine.syncSceneObjects(
+            objects = allSceneObjects.values + manualHudAttachments.values,
+            avatars = sandboxAvatars,
+            selfAgentId = selfAgentId,
+            selfPosition = self.position
+        )
+        audioEngine.onParcelProperties(
+            localId = 101,
+            name = "Linkpoint Welcome Deck (Local Preview)",
+            musicUrl = "https://streams.linkpoint.example/archipelago-ambient.ogg",
+            mediaUrl = "https://media.linkpoint.example/welcome-deck"
+        )
+        audioEngine.onVoiceSessionConnected(
+            viewerSession = "sandbox-webrtc-local-101",
+            channelName = "Linkpoint Archipelago Local Voice",
+            channelType = "local",
+            primary = true
+        )
+        val greeter = sandboxAvatars.firstOrNull { !it.isSelf }
+        if (greeter != null) {
+            audioEngine.upsertVoiceParticipant(
+                agentId = greeter.agentId,
+                displayName = greeter.displayName,
+                audioLevel = 0.62f,
+                isSpeaking = true,
+                position = greeter.position,
+                isInitialJoin = true
+            )
+        }
+        val drone = sandboxAvatars.drop(1).firstOrNull { !it.isSelf && it.agentId != greeter?.agentId }
+        if (drone != null) {
+            audioEngine.upsertVoiceParticipant(
+                agentId = drone.agentId,
+                displayName = drone.displayName,
+                audioLevel = 0.0f,
+                isSpeaking = false,
+                position = drone.position,
+                isInitialJoin = true
+            )
+        }
+        allSceneObjects.values.firstOrNull()?.let { beacon ->
+            audioEngine.onAttachedSound(
+                LludpPackets.ParsedAttachedSound(
+                    soundId = UUID.fromString("77777777-7777-4777-8777-777777777777"),
+                    objectId = beacon.uuid,
+                    ownerId = selfAgentId,
+                    gain = 0.55f,
+                    flags = LludpPackets.SOUND_LOOP
+                )
+            )
+        }
         refreshNearbyRadar()
         startSimLoop()
         pushSceneSnapshot()
     }
 
+    internal fun stopSimLoopForTesting() {
+        simLoopJob?.cancel()
+        simLoopJob = null
+    }
+
     override fun disconnect() {
         simLoopJob?.cancel()
+        val activeVoiceSession = audioEngine.state.value.viewerSessionId
+        if (_state.value.connection is ConnectionState.Connected && activeVoiceSession.isNotBlank()) {
+            viewModelScope.launch {
+                runCatching { capabilityManager.logoutVoiceAccount(activeVoiceSession) }
+            }
+        }
+        audioEngine.resetSession()
         lludpEngine.disconnect(sendLogout = true)
         capabilityManager.shutdown()
         assetManager.clearSession()
@@ -1535,6 +1647,20 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     } else {
                         lludpEngine.avatarYaw = self.yaw
                         lludpEngine.controlFlags = flags
+                    }
+
+                    // Sync spatial audio listener & SLData pose (throttled internally to 100ms)
+                    if (tick % 6 == 0) {
+                        val activeAv = avatars[selfAgentId] ?: self
+                        val camAt = renderer.lastCameraAt
+                        val camYaw = atan2(camAt.y.toDouble(), camAt.x.toDouble()).toFloat()
+                        audioEngine.updateListenerAndAvatarPose(
+                            avatarPos = activeAv.position,
+                            avatarRot = Quat.fromYaw(activeAv.yaw),
+                            cameraPos = renderer.lastCameraEye,
+                            cameraRot = Quat.fromYaw(camYaw),
+                            regionOriginMeters = Vec3(lastRegionGridX * 256f, lastRegionGridY * 256f, 0f)
+                        )
                     }
 
                     // Gentle orbital drift for the sandbox patrol drone
@@ -2364,6 +2490,12 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val nowMs = System.currentTimeMillis()
         if (syncUiState || flashLocalId != null || nowMs - lastUiSnapshotSyncMs >= 160L) {
             lastUiSnapshotSyncMs = nowMs
+            audioEngine.syncSceneObjects(
+                objects = resolvedWorldObjects + resolvedHudAttachments.values,
+                avatars = assembledAvatars,
+                selfAgentId = selfAgentId,
+                selfPosition = avatars[selfAgentId]?.position
+            )
             _state.update { it.copy(sceneSnapshot = snap) }
         }
     }
@@ -2427,9 +2559,127 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         }
     }
 
+    // --- Phase 6: WebRTC Voice, Parcel Streams & Audio Mixer Commands ---
+
+    override fun toggleAudioMixer() {
+        audioEngine.toggleAudioMixer()
+    }
+
+    override fun toggleVoiceChannel() {
+        val current = audioEngine.state.value
+        if (current.voiceConnected) {
+            val session = current.viewerSessionId
+            audioEngine.onVoiceSessionDisconnected()
+            if (_state.value.connection is ConnectionState.Connected && session.isNotBlank()) {
+                viewModelScope.launch {
+                    capabilityManager.logoutVoiceAccount(session)
+                }
+            }
+            showToast("Disconnected from voice channel")
+            return
+        }
+
+        when (_state.value.connection) {
+            is ConnectionState.LocalSandbox -> {
+                audioEngine.onVoiceSessionConnected(
+                    viewerSession = "sandbox-webrtc-local-${current.parcelLocalId.takeIf { it != 0 } ?: 101}",
+                    channelName = current.parcelName.ifBlank { "Linkpoint Archipelago Local Voice" },
+                    channelType = "local",
+                    primary = true
+                )
+                showToast("Joined spatial sandbox voice")
+            }
+            is ConnectionState.Connected -> {
+                audioEngine.setVoiceConnecting(true)
+                viewModelScope.launch {
+                    val parcelVoice = capabilityManager.requestParcelVoiceInfo()
+                    val localId = parcelVoice?.localId?.takeIf { it != 0 }
+                        ?: current.parcelLocalId.takeIf { it != 0 }
+                    val channelReq = if (parcelVoice != null && parcelVoice.channelUri.isNotBlank() && parcelVoice.channelCredentials.isNotBlank()) {
+                        SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(parcelLocalId = localId)
+                    } else {
+                        SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(parcelLocalId = localId)
+                    }
+                    val offerTemplate = buildString {
+                        append("v=0\r\n")
+                        append("o=- 1 2 IN IP4 127.0.0.1\r\n")
+                        append("s=-\r\n")
+                        append("t=0 0\r\n")
+                        append("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n")
+                        append("a=rtpmap:111 opus/48000/2\r\n")
+                        append("a=fmtp:111 minptime=10;useinbandfec=1\r\n")
+                        append("m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n")
+                    }
+                    val provisioned = capabilityManager.requestProvisionVoiceAccount(
+                        channelRequest = channelReq,
+                        offerSdp = offerTemplate,
+                        mungeOpusFmtp = true
+                    )
+                    if (provisioned != null) {
+                        capabilityManager.sendVoiceSignalingCompleted(provisioned.viewerSession)
+                        audioEngine.onVoiceSessionConnected(
+                            viewerSession = provisioned.viewerSession,
+                            channelName = parcelVoice?.regionName?.ifBlank { null } ?: currentRegionName(),
+                            channelType = "local",
+                            primary = true
+                        )
+                        showToast("Connected to WebRTC spatial voice")
+                    } else {
+                        audioEngine.setVoiceConnecting(false)
+                        showToast("Voice capability unavailable in this region")
+                    }
+                }
+            }
+            else -> Unit
+        }
+    }
+
+    override fun toggleMicMuted() {
+        val current = audioEngine.state.value
+        if (!current.voiceConnected) {
+            toggleVoiceChannel()
+            audioEngine.setMicMuted(false)
+            return
+        }
+        val muted = audioEngine.toggleMicMuted()
+        showToast(if (muted) "Microphone muted" else "Microphone live")
+    }
+
+    override fun setEarLocation(location: SlVoiceWebRtcProtocol.EarLocation) {
+        audioEngine.setEarLocation(location)
+    }
+
+    override fun toggleParcelMusicPlayback() {
+        val current = audioEngine.state.value
+        if (current.parcelMusicUrl.isBlank()) {
+            showToast("No parcel audio stream set on this parcel")
+            return
+        }
+        val playing = audioEngine.toggleParcelMusicPlayback()
+        showToast(if (playing) "Playing parcel audio stream" else "Stopped parcel audio stream")
+    }
+
+    override fun toggleMasterMute() {
+        val muted = audioEngine.toggleMasterMute()
+        showToast(if (muted) "Master audio muted" else "Master audio unmuted")
+    }
+
+    override fun setAudioCategoryVolume(category: AudioCategory, volume: Float) {
+        audioEngine.setCategoryVolume(category, volume)
+    }
+
+    override fun setVoiceParticipantVolume(agentId: UUID, volume: Float) {
+        audioEngine.setVoiceParticipantVolume(agentId, volume)
+    }
+
+    override fun toggleVoiceParticipantMute(agentId: UUID) {
+        audioEngine.toggleVoiceParticipantMute(agentId)
+    }
+
     override fun onCleared() {
         super.onCleared()
         simLoopJob?.cancel()
+        audioEngine.shutdown()
         lludpEngine.disconnect(sendLogout = false)
         capabilityManager.shutdown()
         assetManager.clearSession()

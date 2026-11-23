@@ -36,7 +36,16 @@ data class CapsAttachmentTransform(
 
 sealed class CapsEvent {
     data class TeleportFinish(val simIp: String, val simPort: Int, val seedCap: String, val regionHandle: Long) : CapsEvent()
-    data class ParcelProperties(val parcelName: String, val parcelDesc: String) : CapsEvent()
+    data class ParcelProperties(
+        val parcelName: String,
+        val parcelDesc: String,
+        val localId: Int = 0,
+        val musicUrl: String = "",
+        val mediaUrl: String = ""
+    ) : CapsEvent()
+    data class ParcelVoiceInfoUpdate(
+        val info: com.example.linkpoint.audio.SlVoiceWebRtcProtocol.ParcelVoiceInfo
+    ) : CapsEvent()
     data class ScriptDialog(val objectName: String, val message: String, val buttons: List<String>, val channel: Int) : CapsEvent()
     data class AttachmentsUpdated(val updates: List<CapsAttachmentTransform>) : CapsEvent()
     data class GenericNotice(val title: String, val message: String) : CapsEvent()
@@ -99,6 +108,11 @@ class CapabilityManager(
     @Volatile private var lastSeedUrl: String = ""
 
     companion object {
+        const val CAP_PROVISION_VOICE_ACCOUNT = "ProvisionVoiceAccountRequest"
+        const val CAP_PARCEL_VOICE_INFO = "ParcelVoiceInfoRequest"
+        const val CAP_VOICE_SIGNALING = "VoiceSignalingRequest"
+        const val CAP_SL_VOICE_WEBRTC = "SLVoiceWebRTC"
+
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
         private val REQUESTED_CAPS = listOf(
             "EventQueueGet",
@@ -116,7 +130,11 @@ class CapabilityManager(
             "UpdateAgentInformation",
             "ChatSessionRequest",
             "MapLayer",
-            "EnvironmentSettings"
+            "EnvironmentSettings",
+            CAP_PROVISION_VOICE_ACCOUNT,
+            CAP_PARCEL_VOICE_INFO,
+            CAP_VOICE_SIGNALING,
+            CAP_SL_VOICE_WEBRTC
         )
 
         /**
@@ -571,8 +589,26 @@ class CapabilityManager(
                 val parcelData = body["ParcelData"].asList().firstOrNull() ?: return
                 val name = parcelData["Name"].asString()
                 val desc = parcelData["Desc"].asString()
-                if (name.isNotBlank()) {
-                    _capsEvents.tryEmit(CapsEvent.ParcelProperties(name, desc))
+                val localId = parcelData["LocalID"].asInt(0)
+                val musicUrl = parcelData["MusicURL"].asString()
+                val mediaUrl = parcelData["MediaURL"].asString()
+                if (name.isNotBlank() || musicUrl.isNotBlank() || mediaUrl.isNotBlank() || localId != 0) {
+                    _capsEvents.tryEmit(
+                        CapsEvent.ParcelProperties(
+                            parcelName = name,
+                            parcelDesc = desc,
+                            localId = localId,
+                            musicUrl = musicUrl,
+                            mediaUrl = mediaUrl
+                        )
+                    )
+                }
+            }
+            "ParcelVoiceInfoRequest",
+            "ParcelVoiceInfoUpdate" -> {
+                val parsed = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.parseParcelVoiceInfoResponse(body)
+                if (parsed != null) {
+                    _capsEvents.tryEmit(CapsEvent.ParcelVoiceInfoUpdate(parsed))
                 }
             }
             "ScriptDialog" -> {
@@ -706,6 +742,119 @@ class CapabilityManager(
         }
 
     fun getCapabilityUrl(name: String): String? = capabilities[name]
+
+    fun setCapabilityUrlForTesting(name: String, url: String) {
+        capabilities[name] = url
+    }
+
+    /**
+     * Posts an LLSD XML request body to a resolved capability URL and parses the LLSD XML response.
+     */
+    suspend fun postLlsdCapability(capName: String, payload: LlsdValue): LlsdValue? =
+        withContext(Dispatchers.IO) {
+            val url = capabilities[capName] ?: return@withContext null
+            val xmlPayload = LlsdCodec.toXml(payload)
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                .header("Accept", "application/llsd+xml, text/xml")
+                .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
+                .build()
+            try {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@withContext null
+                    val raw = resp.body?.string().orEmpty()
+                    if (raw.isBlank()) LlsdValue.MapVal(emptyMap()) else LlsdCodec.parseXml(raw)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    /**
+     * Negotiates a Second Life WebRTC voice session via `ProvisionVoiceAccountRequest`
+     * (or `SLVoiceWebRTC` if advertised by the simulator), munging the Opus SDP fmtp line.
+     */
+    suspend fun requestProvisionVoiceAccount(
+        channelRequest: com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceChannelRequest,
+        offerSdp: String,
+        mungeOpusFmtp: Boolean = true
+    ): com.example.linkpoint.audio.SlVoiceWebRtcProtocol.ProvisionVoiceResponse? {
+        val body = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.buildProvisionVoiceOfferRequest(
+            channelRequest = channelRequest,
+            offerSdp = offerSdp,
+            mungeOpusFmtp = mungeOpusFmtp
+        )
+        val primaryCap = if (capabilities.containsKey(CAP_PROVISION_VOICE_ACCOUNT)) {
+            CAP_PROVISION_VOICE_ACCOUNT
+        } else {
+            CAP_SL_VOICE_WEBRTC
+        }
+        val response = postLlsdCapability(primaryCap, body)
+            ?: (if (primaryCap != CAP_SL_VOICE_WEBRTC) postLlsdCapability(CAP_SL_VOICE_WEBRTC, body) else null)
+            ?: return null
+        return com.example.linkpoint.audio.SlVoiceWebRtcProtocol.parseProvisionVoiceResponse(response)
+    }
+
+    /**
+     * Tears down an active WebRTC voice session via `ProvisionVoiceAccountRequest` (`logout = true`).
+     */
+    suspend fun logoutVoiceAccount(viewerSession: String): Boolean {
+        if (viewerSession.isBlank()) return false
+        val body = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.buildProvisionVoiceLogoutRequest(viewerSession)
+        val primaryCap = if (capabilities.containsKey(CAP_PROVISION_VOICE_ACCOUNT)) {
+            CAP_PROVISION_VOICE_ACCOUNT
+        } else {
+            CAP_SL_VOICE_WEBRTC
+        }
+        return postLlsdCapability(primaryCap, body) != null
+    }
+
+    /**
+     * Queries `ParcelVoiceInfoRequest` for the current parcel's voice channel URI and credentials.
+     */
+    suspend fun requestParcelVoiceInfo(): com.example.linkpoint.audio.SlVoiceWebRtcProtocol.ParcelVoiceInfo? {
+        val body = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.buildParcelVoiceInfoRequest()
+        val response = postLlsdCapability(CAP_PARCEL_VOICE_INFO, body) ?: return null
+        val info = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.parseParcelVoiceInfoResponse(response)
+        if (info != null) {
+            _capsEvents.tryEmit(CapsEvent.ParcelVoiceInfoUpdate(info))
+        }
+        return info
+    }
+
+    /**
+     * Sends trickled WebRTC ICE candidates or the gather-complete sentinel via `VoiceSignalingRequest`.
+     */
+    suspend fun sendVoiceSignaling(
+        viewerSession: String,
+        payload: com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceSignalingPayload
+    ): Boolean {
+        val body = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.buildVoiceSignalingRequest(
+            viewerSession = viewerSession,
+            payload = payload
+        )
+        return postLlsdCapability(CAP_VOICE_SIGNALING, body) != null
+    }
+
+    suspend fun sendVoiceSignalingCandidates(
+        viewerSession: String,
+        candidates: List<com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceIceCandidate>
+    ): Boolean {
+        if (candidates.isEmpty()) return false
+        return sendVoiceSignaling(
+            viewerSession = viewerSession,
+            payload = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceSignalingPayload.CandidatesBatch(candidates)
+        )
+    }
+
+    suspend fun sendVoiceSignalingCompleted(viewerSession: String): Boolean =
+        sendVoiceSignaling(
+            viewerSession = viewerSession,
+            payload = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceSignalingPayload.GatheringComplete
+        )
 
     fun shutdown() {
         eventQueueJob?.cancel()

@@ -105,6 +105,26 @@ sealed class SimEvent {
         val description: String
     ) : SimEvent()
 
+    data class ParcelPropertiesReceived(
+        val parcel: LludpPackets.ParsedParcelProperties
+    ) : SimEvent()
+
+    data class SoundTriggered(
+        val sound: LludpPackets.ParsedSoundTrigger
+    ) : SimEvent()
+
+    data class AttachedSoundReceived(
+        val sound: LludpPackets.ParsedAttachedSound
+    ) : SimEvent()
+
+    data class AttachedSoundGainChanged(
+        val change: LludpPackets.ParsedAttachedSoundGainChange
+    ) : SimEvent()
+
+    data class SoundsPreloaded(
+        val entries: List<LludpPackets.ParsedPreloadSoundEntry>
+    ) : SimEvent()
+
     data class CoarseLocationsUpdated(val locations: List<Vec3>) : SimEvent()
     data class TerrainPatchReceived(val patchX: Int, val patchY: Int, val avgHeight: Float) : SimEvent()
     data class MapBlockReceived(val x: Int, val y: Int, val name: String, val access: Int, val agents: Int) : SimEvent()
@@ -642,10 +662,45 @@ class LludpCircuitEngine {
                     }
                 }
             }
+            LludpPackets.MSG_PARCEL_PROPERTIES -> {
+                val parsed = LludpPackets.parseParcelProperties(buf)
+                if (parsed != null) {
+                    _events.tryEmit(SimEvent.ParcelPropertiesReceived(parsed))
+                }
+            }
+            LludpPackets.MSG_SOUND_TRIGGER -> {
+                val parsed = LludpPackets.parseSoundTrigger(buf)
+                if (parsed != null) {
+                    _events.tryEmit(SimEvent.SoundTriggered(parsed))
+                }
+            }
+            LludpPackets.MSG_ATTACHED_SOUND -> {
+                val parsed = LludpPackets.parseAttachedSound(buf)
+                if (parsed != null) {
+                    _events.tryEmit(SimEvent.AttachedSoundReceived(parsed))
+                }
+            }
+            LludpPackets.MSG_ATTACHED_SOUND_GAIN_CHANGE -> {
+                val parsed = LludpPackets.parseAttachedSoundGainChange(buf)
+                if (parsed != null) {
+                    _events.tryEmit(SimEvent.AttachedSoundGainChanged(parsed))
+                }
+            }
+            LludpPackets.MSG_PRELOAD_SOUND -> {
+                val entries = LludpPackets.parsePreloadSound(buf)
+                if (entries.isNotEmpty()) {
+                    _events.tryEmit(SimEvent.SoundsPreloaded(entries))
+                }
+            }
             LludpPackets.MSG_LOGOUT_REPLY -> {
                 _events.tryEmit(SimEvent.LoggedOut)
             }
         }
+    }
+
+    internal fun dispatchRawPacketForTesting(raw: ByteArray, length: Int = raw.size) {
+        val decoded = LludpPackets.decodePacket(raw, length) ?: return
+        handleDecodedPacket(decoded)
     }
 
     private fun parseObjectUpdate(buf: ByteBuffer) {

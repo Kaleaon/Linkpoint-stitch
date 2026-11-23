@@ -27,9 +27,23 @@ object LludpPackets {
     const val MSG_OBJECT_UPDATE_COMPRESSED: Int = 13
     const val MSG_IMPROVED_TERSE_OBJECT_UPDATE: Int = 15
     const val MSG_KILL_OBJECT: Int = 16
+    const val MSG_PARCEL_PROPERTIES: Int = 23
+    const val MSG_SOUND_TRIGGER: Int = 29
 
     // Medium frequency message IDs (0xFF + 1 byte)
     const val MSG_COARSE_LOCATION_UPDATE: Int = 0xFF06
+    const val MSG_ATTACHED_SOUND: Int = 0xFF0D
+    const val MSG_ATTACHED_SOUND_GAIN_CHANGE: Int = 0xFF0E
+    const val MSG_PRELOAD_SOUND: Int = 0xFF0F
+
+    // Canonical Second Life AttachedSound flags (llaudio/sound_ids.h)
+    const val SOUND_PLAY: Int = 0x00
+    const val SOUND_LOOP: Int = 0x01
+    const val SOUND_SYNC_MASTER: Int = 0x02
+    const val SOUND_SYNC_SLAVE: Int = 0x04
+    const val SOUND_SYNC_PENDING: Int = 0x08
+    const val SOUND_QUEUE: Int = 0x10
+    const val SOUND_PRIO: Int = 0x20
 
     // Low frequency message IDs (0xFFFF + 2 bytes)
     const val MSG_USE_CIRCUIT_CODE: Int = 0xFFFF0003.toInt()
@@ -240,7 +254,7 @@ object LludpPackets {
             (messageId and 0xFFFFFF00.toInt()) == 0 -> {
                 rawMsg.write(messageId and 0xFF)
             }
-            (messageId and 0xFFFF0000.toInt()) == 0x0000FF00 -> {
+            (messageId and 0xFFFFFF00.toInt()) == 0x0000FF00 -> {
                 rawMsg.write(0xFF)
                 rawMsg.write(messageId and 0xFF)
             }
@@ -604,6 +618,319 @@ object LludpPackets {
         putUuid(buf, agentId)
         putUuid(buf, sessionId)
         putUuid(buf, targetAvatarId)
+        return buf.array()
+    }
+
+    data class ParsedParcelProperties(
+        val requestResult: Int,
+        val sequenceId: Int,
+        val snapSelection: Boolean,
+        val localId: Int,
+        val ownerId: UUID,
+        val isGroupOwned: Boolean,
+        val aabbMin: Vec3,
+        val aabbMax: Vec3,
+        val area: Int,
+        val parcelFlags: Int,
+        val name: String,
+        val desc: String,
+        val musicUrl: String,
+        val mediaUrl: String
+    )
+
+    data class ParsedSoundTrigger(
+        val soundId: UUID,
+        val ownerId: UUID,
+        val objectId: UUID,
+        val parentId: UUID,
+        val handle: Long,
+        val position: Vec3,
+        val gain: Float
+    )
+
+    data class ParsedAttachedSound(
+        val soundId: UUID,
+        val objectId: UUID,
+        val ownerId: UUID,
+        val gain: Float,
+        val flags: Int
+    ) {
+        val isLoop: Boolean get() = (flags and SOUND_LOOP) != 0
+        val isQueue: Boolean get() = (flags and SOUND_QUEUE) != 0
+        val isSyncMaster: Boolean get() = (flags and SOUND_SYNC_MASTER) != 0
+        val isSyncSlave: Boolean get() = (flags and SOUND_SYNC_SLAVE) != 0
+        val isSyncPending: Boolean get() = (flags and SOUND_SYNC_PENDING) != 0
+        val isPlayOnce: Boolean get() = !isLoop
+        val isStopSound: Boolean get() = soundId == UUID(0L, 0L)
+    }
+
+    data class ParsedAttachedSoundGainChange(
+        val objectId: UUID,
+        val gain: Float
+    )
+
+    data class ParsedPreloadSoundEntry(
+        val objectId: UUID,
+        val ownerId: UUID,
+        val soundId: UUID
+    )
+
+    /**
+     * Decodes a canonical Second Life `ParcelProperties` (High 23, Zerocoded) payload,
+     * extracting `LocalID`, parcel `Name`, `Desc`, `MusicURL`, and `MediaURL`.
+     */
+    fun parseParcelProperties(buf: ByteBuffer): ParsedParcelProperties? {
+        if (buf.remaining() < 84) return null
+        val requestResult = buf.int
+        val sequenceId = buf.int
+        val snapSelection = buf.get().toInt() != 0
+        buf.position(buf.position() + 12) // SelfCount, OtherCount, PublicCount (3 * S32)
+        val localId = buf.int
+        val ownerId = readUuid(buf)
+        val isGroupOwned = buf.get().toInt() != 0
+        buf.position(buf.position() + 16) // AuctionID, ClaimDate, ClaimPrice, RentPrice (4 * 4B)
+        val aabbMin = Vec3(buf.float, buf.float, buf.float)
+        val aabbMax = Vec3(buf.float, buf.float, buf.float)
+
+        val bitmapLen = buf.short.toInt() and 0xFFFF
+        if (buf.remaining() < bitmapLen + 53) return null
+        buf.position(buf.position() + bitmapLen)
+
+        val area = buf.int
+        buf.get() // Status (U8)
+        buf.position(buf.position() + 32) // 8 * S32 prim counts
+        buf.float // ParcelPrimBonus
+        buf.int // OtherCleanTime
+        val parcelFlags = buf.int
+        buf.int // SalePrice
+
+        if (buf.remaining() < 1) return null
+        val nameLen = buf.get().toInt() and 0xFF
+        val name = readCString(buf, nameLen)
+
+        val desc = if (buf.remaining() >= 1) {
+            val len = buf.get().toInt() and 0xFF
+            readCString(buf, len)
+        } else ""
+
+        val musicUrl = if (buf.remaining() >= 1) {
+            val len = buf.get().toInt() and 0xFF
+            readCString(buf, len)
+        } else ""
+
+        val mediaUrl = if (buf.remaining() >= 1) {
+            val len = buf.get().toInt() and 0xFF
+            readCString(buf, len)
+        } else ""
+
+        return ParsedParcelProperties(
+            requestResult = requestResult,
+            sequenceId = sequenceId,
+            snapSelection = snapSelection,
+            localId = localId,
+            ownerId = ownerId,
+            isGroupOwned = isGroupOwned,
+            aabbMin = aabbMin,
+            aabbMax = aabbMax,
+            area = area,
+            parcelFlags = parcelFlags,
+            name = name,
+            desc = desc,
+            musicUrl = musicUrl,
+            mediaUrl = mediaUrl
+        )
+    }
+
+    /**
+     * Decodes a Second Life `SoundTrigger` (High 29, Unencoded) 88-byte payload.
+     */
+    fun parseSoundTrigger(buf: ByteBuffer): ParsedSoundTrigger? {
+        if (buf.remaining() < 88) return null
+        val soundId = readUuid(buf)
+        val ownerId = readUuid(buf)
+        val objectId = readUuid(buf)
+        val parentId = readUuid(buf)
+        val handle = buf.long
+        val pos = Vec3(buf.float, buf.float, buf.float)
+        val gain = buf.float
+        return ParsedSoundTrigger(
+            soundId = soundId,
+            ownerId = ownerId,
+            objectId = objectId,
+            parentId = parentId,
+            handle = handle,
+            position = pos,
+            gain = gain
+        )
+    }
+
+    /**
+     * Decodes a Second Life `AttachedSound` (Medium 13 / 0xFF0D, Unencoded) 53-byte payload.
+     */
+    fun parseAttachedSound(buf: ByteBuffer): ParsedAttachedSound? {
+        if (buf.remaining() < 53) return null
+        val soundId = readUuid(buf)
+        val objectId = readUuid(buf)
+        val ownerId = readUuid(buf)
+        val gain = buf.float
+        val flags = buf.get().toInt() and 0xFF
+        return ParsedAttachedSound(
+            soundId = soundId,
+            objectId = objectId,
+            ownerId = ownerId,
+            gain = gain,
+            flags = flags
+        )
+    }
+
+    /**
+     * Decodes a Second Life `AttachedSoundGainChange` (Medium 14 / 0xFF0E, Unencoded) 20-byte payload.
+     */
+    fun parseAttachedSoundGainChange(buf: ByteBuffer): ParsedAttachedSoundGainChange? {
+        if (buf.remaining() < 20) return null
+        val objectId = readUuid(buf)
+        val gain = buf.float
+        return ParsedAttachedSoundGainChange(
+            objectId = objectId,
+            gain = gain
+        )
+    }
+
+    /**
+     * Decodes a Second Life `PreloadSound` (Medium 15 / 0xFF0F, Unencoded) variable payload.
+     */
+    fun parsePreloadSound(buf: ByteBuffer): List<ParsedPreloadSoundEntry> {
+        if (buf.remaining() < 1) return emptyList()
+        val count = buf.get().toInt() and 0xFF
+        if (count == 0) return emptyList()
+        val entries = ArrayList<ParsedPreloadSoundEntry>(count)
+        repeat(count) {
+            if (buf.remaining() < 48) return entries
+            val objectId = readUuid(buf)
+            val ownerId = readUuid(buf)
+            val soundId = readUuid(buf)
+            entries += ParsedPreloadSoundEntry(
+                objectId = objectId,
+                ownerId = ownerId,
+                soundId = soundId
+            )
+        }
+        return entries
+    }
+
+    // --- Sound & Parcel Builders (for protocol round-trip verification & simulation) ---
+
+    fun buildParcelProperties(
+        localId: Int,
+        name: String,
+        desc: String = "",
+        musicUrl: String = "",
+        mediaUrl: String = "",
+        ownerId: UUID = UUID(0L, 0L),
+        aabbMin: Vec3 = Vec3(0f, 0f, 0f),
+        aabbMax: Vec3 = Vec3(256f, 256f, 64f),
+        area: Int = 4096,
+        parcelFlags: Int = 0,
+        sequenceId: Int = 1,
+        requestResult: Int = 0,
+        bitmap: ByteArray = ByteArray(8)
+    ): ByteArray {
+        fun var1Bytes(s: String): ByteArray {
+            val utf8 = (s + "\u0000").toByteArray(Charsets.UTF_8)
+            return if (utf8.size <= 255) utf8 else utf8.copyOf(255).also { it[254] = 0 }
+        }
+        val nameB = var1Bytes(name)
+        val descB = var1Bytes(desc)
+        val musicB = var1Bytes(musicUrl)
+        val mediaB = var1Bytes(mediaUrl)
+
+        val totalSize = 84 + bitmap.size + 53 +
+            1 + nameB.size +
+            1 + descB.size +
+            1 + musicB.size +
+            1 + mediaB.size
+        val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putInt(requestResult)
+        buf.putInt(sequenceId)
+        buf.put(0.toByte()) // SnapSelection
+        repeat(3) { buf.putInt(0) } // SelfCount, OtherCount, PublicCount
+        buf.putInt(localId)
+        putUuid(buf, ownerId)
+        buf.put(0.toByte()) // IsGroupOwned
+        repeat(4) { buf.putInt(0) } // AuctionID, ClaimDate, ClaimPrice, RentPrice
+        putVec3(buf, aabbMin)
+        putVec3(buf, aabbMax)
+        buf.putShort(bitmap.size.toShort())
+        buf.put(bitmap)
+        buf.putInt(area)
+        buf.put(0.toByte()) // Status
+        repeat(8) { buf.putInt(0) } // Prim counts
+        buf.putFloat(1.0f) // ParcelPrimBonus
+        buf.putInt(0) // OtherCleanTime
+        buf.putInt(parcelFlags)
+        buf.putInt(0) // SalePrice
+        buf.put(nameB.size.toByte()); buf.put(nameB)
+        buf.put(descB.size.toByte()); buf.put(descB)
+        buf.put(musicB.size.toByte()); buf.put(musicB)
+        buf.put(mediaB.size.toByte()); buf.put(mediaB)
+        return buf.array()
+    }
+
+    fun buildSoundTrigger(
+        soundId: UUID,
+        ownerId: UUID,
+        objectId: UUID,
+        parentId: UUID = UUID(0L, 0L),
+        handle: Long = 0L,
+        position: Vec3,
+        gain: Float
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(88).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, soundId)
+        putUuid(buf, ownerId)
+        putUuid(buf, objectId)
+        putUuid(buf, parentId)
+        buf.putLong(handle)
+        putVec3(buf, position)
+        buf.putFloat(gain)
+        return buf.array()
+    }
+
+    fun buildAttachedSound(
+        soundId: UUID,
+        objectId: UUID,
+        ownerId: UUID,
+        gain: Float,
+        flags: Int
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(53).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, soundId)
+        putUuid(buf, objectId)
+        putUuid(buf, ownerId)
+        buf.putFloat(gain)
+        buf.put((flags and 0xFF).toByte())
+        return buf.array()
+    }
+
+    fun buildAttachedSoundGainChange(
+        objectId: UUID,
+        gain: Float
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(20).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, objectId)
+        buf.putFloat(gain)
+        return buf.array()
+    }
+
+    fun buildPreloadSound(entries: List<ParsedPreloadSoundEntry>): ByteArray {
+        val capped = entries.take(255)
+        val buf = ByteBuffer.allocate(1 + capped.size * 48).order(ByteOrder.LITTLE_ENDIAN)
+        buf.put(capped.size.toByte())
+        for (entry in capped) {
+            putUuid(buf, entry.objectId)
+            putUuid(buf, entry.ownerId)
+            putUuid(buf, entry.soundId)
+        }
         return buf.array()
     }
 

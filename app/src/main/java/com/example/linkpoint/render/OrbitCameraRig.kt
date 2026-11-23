@@ -99,10 +99,11 @@ class OrbitCameraRig(
     }
 
     fun applyZoomScale(scaleFactor: Float, nowMs: Long = System.currentTimeMillis()) {
-        if (!scaleFactor.isFinite() || scaleFactor <= 0.01f) return
+        if (!scaleFactor.isFinite() || scaleFactor <= 0f) return
+        val safeScale = scaleFactor.coerceAtLeast(1e-5f)
         synchronized(lock) {
             lastManualOrbitMs = nowMs
-            targetDistance = (targetDistance / scaleFactor).coerceIn(MIN_DISTANCE, MAX_DISTANCE)
+            targetDistance = (targetDistance / safeScale).coerceIn(MIN_DISTANCE, MAX_DISTANCE)
         }
     }
 

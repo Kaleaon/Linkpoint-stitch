@@ -103,6 +103,8 @@ import com.example.linkpoint.scene.HudAttachmentPoint
 import com.example.linkpoint.scene.ProjectedNametag
 import com.example.linkpoint.store.ConnectionState
 import com.example.linkpoint.store.ViewerState
+import com.example.linkpoint.ui.floaters.AudioAndVoiceFloater
+import com.example.linkpoint.ui.floaters.CompactAudioVoicePill
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.hypot
@@ -120,6 +122,7 @@ fun InWorldCockpitScreen(
     BackHandler(enabled = true) {
         when {
             zenMode -> zenMode = false
+            state.audioVoice.isMixerOpen -> client.toggleAudioMixer()
             state.selectedAvatarId != null -> client.onAvatarSelected(null)
             state.activeFloater != null -> client.toggleFloater(null)
             else -> client.disconnect()
@@ -213,21 +216,31 @@ fun InWorldCockpitScreen(
                     modifier = Modifier
                         .align(telemetryAlign)
                         .padding(
-                            end = if (state.design.telemetryPosition != TelemetryPosition.BOTTOM) 104.dp else 0.dp,
+                            end = if (state.design.telemetryPosition != TelemetryPosition.BOTTOM) 196.dp else 0.dp,
                             bottom = telemetryBottomPad
                         )
                 )
 
-                // Top-End Mini System Pill (Zen 3D Toggle + Disconnect)
-                TopRightMiniControls(
-                    zenMode = zenMode,
-                    onToggleZen = {
-                        client.toggleFloater(null)
-                        zenMode = true
-                    },
-                    onDisconnect = client::disconnect,
-                    modifier = Modifier.align(Alignment.TopEnd)
-                )
+                // Top-End Compact Mic/Audio Mixer Pill + Mini System Pill (Zen 3D Toggle + Disconnect)
+                Row(
+                    modifier = Modifier.align(Alignment.TopEnd),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    CompactAudioVoicePill(
+                        audioState = state.audioVoice,
+                        onToggleMic = client::toggleMicMuted,
+                        onToggleMixer = client::toggleAudioMixer
+                    )
+                    TopRightMiniControls(
+                        zenMode = zenMode,
+                        onToggleZen = {
+                            client.toggleFloater(null)
+                            zenMode = true
+                        },
+                        onDisconnect = client::disconnect
+                    )
+                }
 
                 // Live Transport Recovery Banner (only when Live Grid LLUDP/CAPS is degraded/retrying/failed)
                 val isLiveConnected = state.connection is ConnectionState.Connected
@@ -420,6 +433,46 @@ fun InWorldCockpitScreen(
                             }
                         }
                     }
+                }
+
+                // Audio, Spatial Sound, Parcel Stream & WebRTC Voice Mixer Floater
+                AnimatedVisibility(
+                    visible = state.audioVoice.isMixerOpen,
+                    enter = fadeIn() + slideInVertically { -it / 4 },
+                    exit = fadeOut() + slideOutVertically { -it / 4 },
+                    modifier = Modifier.align(
+                        if (isWideScreen) Alignment.TopEnd else Alignment.BottomCenter
+                    )
+                ) {
+                    val mixerPad = if (isWideScreen) {
+                        PaddingValues(
+                            top = 48.dp,
+                            bottom = 10.dp,
+                            end = if (state.design.dockPosition == DockPosition.RIGHT) 58.dp else 8.dp
+                        )
+                    } else {
+                        PaddingValues(
+                            bottom = if (state.design.dockPosition == DockPosition.BOTTOM) 56.dp else 4.dp
+                        )
+                    }
+                    AudioAndVoiceFloater(
+                        audioState = state.audioVoice,
+                        client = client,
+                        onClose = client::toggleAudioMixer,
+                        modifier = Modifier
+                            .padding(mixerPad)
+                            .then(
+                                if (isWideScreen) {
+                                    Modifier
+                                        .widthIn(min = 310.dp, max = 376.dp)
+                                        .heightIn(max = (viewportH * 0.80f).coerceAtLeast(300.dp))
+                                } else {
+                                    Modifier
+                                        .fillMaxWidth()
+                                        .heightIn(max = (viewportH * 0.52f).coerceAtLeast(250.dp))
+                                }
+                            )
+                    )
                 }
 
                 // Avatar Profile & Appearance Sheet (when tapping a 3D avatar, floating nametag, or Radar resident)
