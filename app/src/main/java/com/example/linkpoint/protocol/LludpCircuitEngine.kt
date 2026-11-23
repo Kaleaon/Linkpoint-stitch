@@ -65,7 +65,13 @@ sealed class SimEvent {
         val position: Vec3,
         val rotation: Quat,
         val scale: Vec3,
-        val textureEntry: ParsedTextureEntry
+        val textureEntry: ParsedTextureEntry,
+        val parentId: Int = 0
+    ) : SimEvent()
+    data class AvatarAnimationsUpdated(
+        val agentId: UUID,
+        val animations: List<LludpPackets.AvatarAnimationEntry>,
+        val sourceObjectIds: List<UUID> = emptyList()
     ) : SimEvent()
     data class TerseObjectUpdated(
         val localId: Int,
@@ -555,6 +561,7 @@ class LludpCircuitEngine {
             LludpPackets.MSG_OBJECT_UPDATE -> parseObjectUpdate(buf)
             LludpPackets.MSG_OBJECT_UPDATE_COMPRESSED -> parseObjectUpdateCompressed(buf)
             LludpPackets.MSG_IMPROVED_TERSE_OBJECT_UPDATE -> parseImprovedTerseObjectUpdate(buf)
+            LludpPackets.MSG_AVATAR_ANIMATION -> parseAvatarAnimation(buf)
             LludpPackets.MSG_AVATAR_APPEARANCE -> parseAvatarAppearance(buf)
             LludpPackets.MSG_AVATAR_PROPERTIES_REPLY -> parseAvatarPropertiesReply(buf)
             LludpPackets.MSG_AGENT_WEARABLES_UPDATE -> parseAgentWearablesUpdate(buf)
@@ -788,7 +795,8 @@ class LludpCircuitEngine {
                         position = pos,
                         rotation = rot,
                         scale = Vec3(sx, sy, sz),
-                        textureEntry = texEntry
+                        textureEntry = texEntry,
+                        parentId = parentId
                     )
                 )
             } else {
@@ -799,6 +807,11 @@ class LludpCircuitEngine {
                     else if (attachmentPoint in 1..56) "Attachment #$localId"
                     else if (extraParams.isMesh) "Mesh #$localId"
                     else "Object #$localId"
+                val defaultMat = if (extraParams.defaultRenderMaterialId != null) {
+                    texEntry.defaultMaterial.copy(renderMaterialId = extraParams.defaultRenderMaterialId)
+                } else {
+                    texEntry.defaultMaterial
+                }
                 _events.tryEmit(
                     SimEvent.ObjectUpdated(
                         SceneObject(
@@ -819,6 +832,10 @@ class LludpCircuitEngine {
                             defaultTextureId = texEntry.defaultTextureId,
                             faceTextures = texEntry.faceTextures,
                             faceColors = texEntry.faceColors,
+                            defaultMaterial = defaultMat,
+                            faceMaterials = texEntry.faceMaterials,
+                            renderMaterialIds = extraParams.renderMaterialIds,
+                            isFullbright = texEntry.isDefaultFullbright,
                             isScripted = (updateFlags and 0x00000004) != 0,
                             isPhysical = (updateFlags and 0x00000001) != 0,
                             isPhantom = (updateFlags and 0x00000020) != 0,
@@ -956,7 +973,8 @@ class LludpCircuitEngine {
                             position = pos,
                             rotation = rot,
                             scale = Vec3(sx, sy, sz),
-                            textureEntry = texEntry
+                            textureEntry = texEntry,
+                            parentId = parentId
                         )
                     )
                 } else {
@@ -966,6 +984,11 @@ class LludpCircuitEngine {
                         else if (attachmentPoint in 1..56) "Attachment #$localId"
                         else if (extraParams.isMesh) "Mesh #$localId"
                         else "Prim #$localId"
+                    val defaultMat = if (extraParams.defaultRenderMaterialId != null) {
+                        texEntry.defaultMaterial.copy(renderMaterialId = extraParams.defaultRenderMaterialId)
+                    } else {
+                        texEntry.defaultMaterial
+                    }
                     _events.tryEmit(
                         SimEvent.ObjectUpdated(
                             SceneObject(
@@ -986,6 +1009,10 @@ class LludpCircuitEngine {
                                 defaultTextureId = texEntry.defaultTextureId,
                                 faceTextures = texEntry.faceTextures,
                                 faceColors = texEntry.faceColors,
+                                defaultMaterial = defaultMat,
+                                faceMaterials = texEntry.faceMaterials,
+                                renderMaterialIds = extraParams.renderMaterialIds,
+                                isFullbright = texEntry.isDefaultFullbright,
                                 isScripted = (updateFlags and 0x00000004) != 0,
                                 isPhysical = (updateFlags and 0x00000001) != 0,
                                 isPhantom = (updateFlags and 0x00000020) != 0,
@@ -1026,16 +1053,12 @@ class LludpCircuitEngine {
                 val rawPz = buf.float
                 buf.position(buf.position() + 12) // Velocity(6B) + Acceleration(6B)
                 parsedRot = readQuantizedQuat(buf)
-                parsedPos = if (isAvatar) {
-                    clampObjectPosition(rawPx, rawPy, rawPz, isChildOrAttachment = false)
-                } else {
-                    // Non-avatar terse updates can carry negative local offsets for attachments & child prims
-                    Vec3(
-                        if (rawPx.isFinite()) rawPx.coerceIn(-256f, 512f) else 0f,
-                        if (rawPy.isFinite()) rawPy.coerceIn(-256f, 512f) else 0f,
-                        if (rawPz.isFinite()) rawPz.coerceIn(-256f, 4096f) else 0f
-                    )
-                }
+                // Both world prims/attachments and seated avatars (`parentId != 0`) can receive signed parent-relative offsets in ImprovedTerseObjectUpdate
+                parsedPos = Vec3(
+                    if (rawPx.isFinite()) rawPx.coerceIn(-256f, 512f) else 0f,
+                    if (rawPy.isFinite()) rawPy.coerceIn(-256f, 512f) else 0f,
+                    if (rawPz.isFinite()) rawPz.coerceIn(-256f, 4096f) else 0f
+                )
             }
             buf.position(endPos)
             // Optional TextureEntry (2-byte length) — carries updated textures or avatar baked textures
@@ -1064,6 +1087,17 @@ class LludpCircuitEngine {
                 )
             }
         }
+    }
+
+    private fun parseAvatarAnimation(buf: ByteBuffer) {
+        val parsed = LludpPackets.parseAvatarAnimation(buf) ?: return
+        _events.tryEmit(
+            SimEvent.AvatarAnimationsUpdated(
+                agentId = parsed.agentId,
+                animations = parsed.animations,
+                sourceObjectIds = parsed.sourceObjectIds
+            )
+        )
     }
 
     private fun parseAvatarAppearance(buf: ByteBuffer) {
@@ -1384,6 +1418,10 @@ class LludpCircuitEngine {
                 errorCategory = errorCategory
             )
         )
+    }
+
+    internal fun handleDecodedPacketForTesting(pkt: LludpPackets.DecodedPacket) {
+        handleDecodedPacket(pkt)
     }
 
     fun disconnect(sendLogout: Boolean = true) {

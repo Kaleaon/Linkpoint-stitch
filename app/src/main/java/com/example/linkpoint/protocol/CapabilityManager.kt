@@ -39,6 +39,7 @@ sealed class CapsEvent {
     data class ParcelProperties(val parcelName: String, val parcelDesc: String) : CapsEvent()
     data class ScriptDialog(val objectName: String, val message: String, val buttons: List<String>, val channel: Int) : CapsEvent()
     data class AttachmentsUpdated(val updates: List<CapsAttachmentTransform>) : CapsEvent()
+    data class EnvironmentUpdated(val settings: com.example.linkpoint.scene.RegionEnvironmentSettings) : CapsEvent()
     data class GenericNotice(val title: String, val message: String) : CapsEvent()
     data class HealthChanged(
         val status: LayerHealthStatus,
@@ -116,7 +117,8 @@ class CapabilityManager(
             "UpdateAgentInformation",
             "ChatSessionRequest",
             "MapLayer",
-            "EnvironmentSettings"
+            "EnvironmentSettings",
+            "ExtEnvironment"
         )
 
         /**
@@ -605,8 +607,64 @@ class CapabilityManager(
                     _capsEvents.tryEmit(CapsEvent.AttachmentsUpdated(updates))
                 }
             }
+            "RegionEnvironment",
+            "EnvironmentSettings",
+            "ExtEnvironment",
+            "ParcelEnvironment",
+            "WindLight" -> {
+                val settings = EepEnvironmentParser.parse(body)
+                if (settings != null) {
+                    _capsEvents.tryEmit(CapsEvent.EnvironmentUpdated(settings))
+                }
+            }
         }
     }
+
+    internal fun dispatchCapsEventForTesting(message: String, body: LlsdValue) {
+        dispatchCapsEvent(message, body)
+    }
+
+    /**
+     * Fetches the live region `EnvironmentSettings` (or `ExtEnvironment`) HTTP capability via GET,
+     * parses LLSD sky/water day-cycle parameters, and emits [CapsEvent.EnvironmentUpdated].
+     */
+    suspend fun fetchEnvironmentSettings(): com.example.linkpoint.scene.RegionEnvironmentSettings? =
+        withContext(Dispatchers.IO) {
+            val url = capabilities["EnvironmentSettings"]
+                ?: capabilities["ExtEnvironment"]
+                ?: return@withContext null
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                .header("Accept", "application/llsd+xml, application/llsd+binary, text/xml, */*")
+                .get()
+                .build()
+            try {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@withContext null
+                    val rawBytes = resp.body?.bytes() ?: return@withContext null
+                    if (rawBytes.isEmpty()) return@withContext null
+                    val contentType = resp.header("Content-Type").orEmpty().lowercase()
+                    val isBinary = contentType.contains("binary") ||
+                        (rawBytes.size >= 18 && String(rawBytes, 0, 18, Charsets.ISO_8859_1).startsWith("<? llsd/binary")) ||
+                        (rawBytes[0] == '{'.code.toByte())
+                    val parsedLlsd = if (isBinary) {
+                        LlsdCodec.parseBinary(rawBytes)
+                    } else {
+                        LlsdCodec.parseXml(String(rawBytes, Charsets.UTF_8))
+                    }
+                    val settings = EepEnvironmentParser.parse(parsedLlsd)
+                    if (settings != null) {
+                        _capsEvents.tryEmit(CapsEvent.EnvironmentUpdated(settings))
+                    }
+                    settings
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+        }
 
     /**
      * Queries the negotiated `AttachmentResources` HTTP capability (if supported by the region)

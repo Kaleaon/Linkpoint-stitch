@@ -181,6 +181,62 @@ enum class PrimShape {
 }
 
 /**
+ * Second Life TextureEntry & glTF PBR alpha rendering modes.
+ */
+enum class MaterialAlphaMode(val code: Int) {
+    NONE(0),
+    BLEND(1),
+    MASK(2),
+    EMISSIVE(3);
+
+    companion object {
+        fun fromCode(code: Int): MaterialAlphaMode = entries.firstOrNull { it.code == code } ?: BLEND
+    }
+}
+
+/**
+ * Per-face / default Second Life legacy Blinn-Phong + glTF `RenderMaterials` PBR shading channels.
+ */
+data class FaceMaterialParams(
+    val shininess: Int = 0, // 0 = None, 1 = Low, 2 = Medium, 3 = High
+    val bumpiness: Int = 0, // 0..31 procedural/normal bump index
+    val fullbright: Boolean = false,
+    val glow: Float = 0f, // 0..1 emissive intensity
+    val alphaMode: MaterialAlphaMode = MaterialAlphaMode.BLEND,
+    val alphaCutoff: Float = 0f,
+    val metallicFactor: Float? = null,
+    val roughnessFactor: Float? = null,
+    val emissiveColor: Vec3 = Vec3(0f, 0f, 0f),
+    val materialId: UUID? = null,
+    val renderMaterialId: UUID? = null
+) {
+    val effectiveMetallic: Float
+        get() = metallicFactor?.coerceIn(0f, 1f) ?: when (shininess.coerceIn(0, 3)) {
+            1 -> 0.14f
+            2 -> 0.42f
+            3 -> 0.78f
+            else -> 0.02f
+        }
+
+    val effectiveRoughness: Float
+        get() = roughnessFactor?.coerceIn(0.04f, 1f) ?: when (shininess.coerceIn(0, 3)) {
+            1 -> 0.54f
+            2 -> 0.28f
+            3 -> 0.10f
+            else -> 0.86f
+        }
+
+    val effectiveBumpStrength: Float
+        get() = if (bumpiness <= 0) 0f else (0.18f + (bumpiness.coerceIn(1, 31) / 31f) * 0.82f)
+
+    val effectiveGlow: Float
+        get() = maxOf(
+            glow.coerceIn(0f, 1f),
+            maxOf(emissiveColor.x, emissiveColor.y, emissiveColor.z).coerceIn(0f, 1f)
+        )
+}
+
+/**
  * Canonical Second Life / OpenSimulator HUD attachment point IDs (31..38).
  */
 enum class HudAttachmentPoint(
@@ -237,6 +293,9 @@ data class SceneObject(
     val defaultTextureId: UUID? = null,
     val faceTextures: Map<Int, UUID> = emptyMap(),
     val faceColors: Map<Int, ColorRgba> = emptyMap(),
+    val defaultMaterial: FaceMaterialParams = FaceMaterialParams(),
+    val faceMaterials: Map<Int, FaceMaterialParams> = emptyMap(),
+    val renderMaterialIds: Map<Int, UUID> = emptyMap(),
     val isFullbright: Boolean = false,
     val isScripted: Boolean = false,
     val isTouchable: Boolean = true,
@@ -252,6 +311,16 @@ data class SceneObject(
     val isHudAttachment: Boolean get() = attachmentPoint in 31..38
     val isAvatarBodyAttachment: Boolean get() =
         (parentId != 0 || attachedAvatarId != null) && attachmentPoint in 1..56 && attachmentPoint !in 31..38
+
+    fun materialForFace(faceIndex: Int): FaceMaterialParams {
+        val base = faceMaterials[faceIndex] ?: defaultMaterial
+        val rMat = renderMaterialIds[faceIndex] ?: base.renderMaterialId
+        return if (isFullbright && !base.fullbright || rMat != base.renderMaterialId) {
+            base.copy(fullbright = base.fullbright || isFullbright, renderMaterialId = rMat)
+        } else {
+            base
+        }
+    }
 }
 
 data class AvatarEntity(
@@ -261,6 +330,13 @@ data class AvatarEntity(
     val legacyName: String = "",
     val position: Vec3,
     val yaw: Float = 0f,
+    val parentId: Int = 0,
+    val localPosition: Vec3 = position,
+    val localRotation: Quat = Quat.fromYaw(yaw),
+    val worldRotation: Quat = Quat.fromYaw(yaw),
+    val animState: AvatarAnimState = AvatarAnimState.STAND,
+    val isTyping: Boolean = false,
+    val activeAnimationIds: List<UUID> = emptyList(),
     val isFlying: Boolean = false,
     val isSitting: Boolean = false,
     val shirtColor: ColorRgba = ColorRgba(0.22f, 0.74f, 0.97f, 1f),
@@ -302,6 +378,33 @@ data class ProjectedNametag(
     val isStreaming: Boolean
 )
 
+/**
+ * Parsed Second Life / OpenSimulator `EnvironmentSettings` (EEP / WindLight) region lighting & water state.
+ */
+data class RegionEnvironmentSettings(
+    val sunDirection: Vec3 = Vec3(0.45f, 0.35f, 0.82f).normalized(),
+    val moonDirection: Vec3 = Vec3(-0.40f, -0.35f, 0.80f).normalized(),
+    val sunAzimuthRad: Float = 0.66f,
+    val sunElevationRad: Float = 0.96f,
+    val ambientColor: ColorRgba = ColorRgba(0.38f, 0.42f, 0.48f, 1f),
+    val sunlightColor: ColorRgba = ColorRgba(1.0f, 0.96f, 0.88f, 1f),
+    val blueHorizon: ColorRgba = ColorRgba(0.62f, 0.80f, 0.95f, 1f),
+    val blueDensity: ColorRgba = ColorRgba(0.14f, 0.42f, 0.82f, 1f),
+    val zenithColor: ColorRgba = ColorRgba(0.14f, 0.42f, 0.82f, 1f),
+    val horizonColor: ColorRgba = ColorRgba(0.62f, 0.80f, 0.95f, 1f),
+    val hazeHorizon: Float = 0.22f,
+    val hazeDensity: Float = 0.18f,
+    val cloudDensity: Float = 0.28f,
+    val cloudColor: ColorRgba = ColorRgba(0.94f, 0.95f, 0.98f, 1f),
+    val waterFogColor: ColorRgba = ColorRgba(0.06f, 0.34f, 0.56f, 0.80f),
+    val waterFogDensity: Float = 4.0f,
+    val waterNormalScale: Vec3 = Vec3(2.0f, 2.0f, 1.0f),
+    val fresnelScale: Float = 0.40f,
+    val fresnelOffset: Float = 0.50f,
+    val ambientStrength: Float = 0.42f,
+    val isDaylight: Boolean = true
+)
+
 enum class EnvironmentPreset(
     val label: String,
     val zenith: ColorRgba,
@@ -311,6 +414,15 @@ enum class EnvironmentPreset(
     val waterTint: ColorRgba,
     val ambientStrength: Float
 ) {
+    AUTO_REGION_EEP(
+        label = "Region EEP",
+        zenith = ColorRgba(0.12f, 0.38f, 0.78f, 1f),
+        horizon = ColorRgba(0.66f, 0.78f, 0.92f, 1f),
+        sunColor = ColorRgba(1.0f, 0.94f, 0.85f, 1f),
+        sunDir = Vec3(0.52f, 0.38f, 0.76f),
+        waterTint = ColorRgba(0.06f, 0.32f, 0.52f, 0.80f),
+        ambientStrength = 0.42f
+    ),
     MIDDAY(
         label = "Midday",
         zenith = ColorRgba(0.14f, 0.42f, 0.82f, 1f),
@@ -346,7 +458,30 @@ enum class EnvironmentPreset(
         sunDir = Vec3(0.3f, 0.7f, 0.65f),
         waterTint = ColorRgba(0.03f, 0.22f, 0.30f, 0.82f),
         ambientStrength = 0.38f
-    )
+    );
+
+    fun toRegionEnvironmentSettings(): RegionEnvironmentSettings {
+        val dir = sunDir.normalized()
+        return RegionEnvironmentSettings(
+            sunDirection = dir,
+            ambientColor = ColorRgba(ambientStrength, ambientStrength, ambientStrength * 1.05f, 1f),
+            sunlightColor = sunColor,
+            blueHorizon = horizon,
+            blueDensity = zenith,
+            zenithColor = zenith,
+            horizonColor = horizon,
+            hazeHorizon = 0.20f,
+            hazeDensity = if (this == TWILIGHT) 0.30f else 0.16f,
+            cloudDensity = if (this == CYBER_GRID) 0.10f else 0.26f,
+            waterFogColor = waterTint,
+            waterFogDensity = 4.0f,
+            waterNormalScale = Vec3(2.0f, 2.0f, 1.0f),
+            fresnelScale = 0.42f,
+            fresnelOffset = 0.48f,
+            ambientStrength = ambientStrength,
+            isDaylight = this != MIDNIGHT
+        )
+    }
 }
 
 enum class CameraMode(val label: String) {

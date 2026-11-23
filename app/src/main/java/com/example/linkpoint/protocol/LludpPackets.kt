@@ -27,6 +27,7 @@ object LludpPackets {
     const val MSG_OBJECT_UPDATE_COMPRESSED: Int = 13
     const val MSG_IMPROVED_TERSE_OBJECT_UPDATE: Int = 15
     const val MSG_KILL_OBJECT: Int = 16
+    const val MSG_AVATAR_ANIMATION: Int = 20
 
     // Medium frequency message IDs (0xFF + 1 byte)
     const val MSG_COARSE_LOCATION_UPDATE: Int = 0xFF06
@@ -604,6 +605,84 @@ object LludpPackets {
         putUuid(buf, agentId)
         putUuid(buf, sessionId)
         putUuid(buf, targetAvatarId)
+        return buf.array()
+    }
+
+    data class AvatarAnimationEntry(
+        val animId: UUID,
+        val sequenceId: Int
+    )
+
+    data class ParsedAvatarAnimation(
+        val agentId: UUID,
+        val animations: List<AvatarAnimationEntry>,
+        val sourceObjectIds: List<UUID> = emptyList()
+    )
+
+    /**
+     * Parses High-Frequency `AvatarAnimation` (`MSG_AVATAR_ANIMATION = 20`) payload:
+     * - `Sender` block: `ID` (LLUUID, 16B)
+     * - `AnimationList` block (Variable, U8 count): `[AnimID (LLUUID, 16B), AnimSequenceID (S32 LE, 4B)]`
+     * - Optional `AnimationSourceList` block (Variable, U8 count): `[ObjectID (LLUUID, 16B)]`
+     */
+    fun parseAvatarAnimation(payload: ByteArray): ParsedAvatarAnimation? {
+        if (payload.size < 17) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        return parseAvatarAnimation(buf)
+    }
+
+    fun parseAvatarAnimation(buf: ByteBuffer): ParsedAvatarAnimation? {
+        if (buf.remaining() < 17) return null
+        val prevOrder = buf.order()
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        return try {
+            val agentId = readUuid(buf)
+            val animCount = (buf.get().toInt() and 0xFF).coerceAtMost(64)
+            val entries = ArrayList<AvatarAnimationEntry>(animCount)
+            repeat(animCount) {
+                if (buf.remaining() < 20) return@repeat
+                val animId = readUuid(buf)
+                val seqId = buf.int
+                entries.add(AvatarAnimationEntry(animId = animId, sequenceId = seqId))
+            }
+            val sources = ArrayList<UUID>()
+            if (buf.hasRemaining()) {
+                val srcCount = (buf.get().toInt() and 0xFF).coerceAtMost(64)
+                repeat(srcCount) {
+                    if (buf.remaining() < 16) return@repeat
+                    sources.add(readUuid(buf))
+                }
+            }
+            ParsedAvatarAnimation(
+                agentId = agentId,
+                animations = entries,
+                sourceObjectIds = sources
+            )
+        } finally {
+            buf.order(prevOrder)
+        }
+    }
+
+    fun buildAvatarAnimationPayload(
+        agentId: UUID,
+        animations: List<AvatarAnimationEntry>,
+        sourceObjectIds: List<UUID> = emptyList()
+    ): ByteArray {
+        val cappedAnims = animations.take(64)
+        val cappedSources = sourceObjectIds.take(64)
+        val totalSize = 16 + 1 + cappedAnims.size * 20 + 1 + cappedSources.size * 16 + 1
+        val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, agentId)
+        buf.put(cappedAnims.size.toByte())
+        for (entry in cappedAnims) {
+            putUuid(buf, entry.animId)
+            buf.putInt(entry.sequenceId)
+        }
+        buf.put(cappedSources.size.toByte())
+        for (src in cappedSources) {
+            putUuid(buf, src)
+        }
+        buf.put(0.toByte()) // PhysicalAvatarEventList count = 0
         return buf.array()
     }
 

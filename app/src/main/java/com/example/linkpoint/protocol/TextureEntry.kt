@@ -1,6 +1,8 @@
 package com.example.linkpoint.protocol
 
 import com.example.linkpoint.scene.ColorRgba
+import com.example.linkpoint.scene.FaceMaterialParams
+import com.example.linkpoint.scene.MaterialAlphaMode
 import com.example.linkpoint.scene.Vec3
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -10,10 +12,15 @@ data class ParsedTextureEntry(
     val defaultTextureId: UUID? = null,
     val faceTextures: Map<Int, UUID> = emptyMap(),
     val defaultColor: ColorRgba = ColorRgba(0.84f, 0.86f, 0.90f, 1f),
-    val faceColors: Map<Int, ColorRgba> = emptyMap()
+    val faceColors: Map<Int, ColorRgba> = emptyMap(),
+    val defaultMaterial: FaceMaterialParams = FaceMaterialParams(),
+    val faceMaterials: Map<Int, FaceMaterialParams> = emptyMap()
 ) {
+    val isDefaultFullbright: Boolean get() = defaultMaterial.fullbright
+
     fun textureForFace(faceIndex: Int): UUID? = faceTextures[faceIndex] ?: defaultTextureId
     fun colorForFace(faceIndex: Int): ColorRgba = faceColors[faceIndex] ?: defaultColor
+    fun materialForFace(faceIndex: Int): FaceMaterialParams = faceMaterials[faceIndex] ?: defaultMaterial
 }
 
 data class ParsedExtraParams(
@@ -21,13 +28,16 @@ data class ParsedExtraParams(
     val isMesh: Boolean = false,
     val sculptTextureId: UUID? = null,
     val isFlexible: Boolean = false,
-    val isLight: Boolean = false
+    val isLight: Boolean = false,
+    val renderMaterialIds: Map<Int, UUID> = emptyMap(),
+    val defaultRenderMaterialId: UUID? = null
 )
 
 /**
  * Second Life / OpenSimulator binary parsers for:
- * - TextureEntry (compact per-face UUIDs & RGBA colors)
- * - ExtraParams (0x0060 Mesh/Sculpt UUID extraction)
+ * - TextureEntry (compact per-face UUIDs, RGBA colors, BumpShinyFullbright, Glow, MaterialID)
+ * - ExtraParams (0x0060 Mesh/Sculpt UUID & 0x0080 glTF `RenderMaterials` UUID overrides)
+ * - glTF / LLSD `RenderMaterials` material override metadata
  * - NameValue strings (Avatar FirstName/LastName/Title)
  * - AttachmentPoint decoding from LLUDP State byte (ATTACHMENT_ID_FROM_STATE)
  * - Avatar skeleton joint anchor offsets for worn mesh attachments
@@ -47,6 +57,13 @@ object SlBinaryParsers {
     const val BAKE_FACE_HAIR = 20
     const val BAKE_FACE_LEFT_ARM = 21
     const val BAKE_FACE_LEFT_LEG = 22
+
+    // ExtraParams type codes
+    const val EXTRA_PARAM_FLEXIBLE = 0x0010
+    const val EXTRA_PARAM_LIGHT = 0x0020
+    const val EXTRA_PARAM_SCULPT = 0x0030
+    const val EXTRA_PARAM_MESH = 0x0060
+    const val EXTRA_PARAM_RENDER_MATERIAL = 0x0080
 
     /**
      * Linden Lab's canonical ATTACHMENT_ID_FROM_STATE(state) nibble-swap decoding.
@@ -76,27 +93,30 @@ object SlBinaryParsers {
     }
 
     /**
-     * Parses Second Life's compact binary TextureEntry byte array.
-     * Extracts Default + Face-override Texture UUIDs and RGBA Colors safely with strict bounds checks.
+     * Parses Second Life's compact binary TextureEntry byte array (`LLPrimitive::unpackTEMessage`).
+     * Safely extracts Default + Face-override Texture UUIDs, RGBA Colors, Bumpiness, Shininess,
+     * Fullbright, AlphaMode hints, Glow, and MaterialIDs with defensive bounds checks.
      */
     fun parseTextureEntry(bytes: ByteArray): ParsedTextureEntry {
         if (bytes.size < 16) return ParsedTextureEntry()
         val buf = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         return try {
+            // 1. Textures (16B UUIDs)
             val defaultTex = readUuidBe(buf)
             val faceTextures = LinkedHashMap<Int, UUID>()
             while (buf.hasRemaining()) {
                 val faceBits = readFaceBitfield(buf)
                 if (faceBits == 0L) break
-                if (buf.remaining() < 16) break
+                if (buf.remaining() < 16) return ParsedTextureEntry(defaultTex.takeIf { it != ZERO_UUID }, faceTextures)
                 val faceUuid = readUuidBe(buf)
                 for (bit in 0 until 32) {
-                    if ((faceBits and (1L shl bit)) != 0L) {
-                        if (faceUuid != ZERO_UUID) faceTextures[bit] = faceUuid
+                    if ((faceBits and (1L shl bit)) != 0L && faceUuid != ZERO_UUID) {
+                        faceTextures[bit] = faceUuid
                     }
                 }
             }
 
+            // 2. RGBA Colors (4B inverted transparency)
             var defaultColor = ColorRgba(0.86f, 0.88f, 0.92f, 1f)
             val faceColors = LinkedHashMap<Int, ColorRgba>()
             if (buf.remaining() >= 4) {
@@ -114,15 +134,156 @@ object SlBinaryParsers {
                 }
             }
 
+            // 3..7. UV Transforms: RepeatU (4B), RepeatV (4B), OffsetU (2B), OffsetV (2B), Rotation (2B)
+            val hasFullUvBlock = skipTeFieldBlock(buf, 4) &&
+                skipTeFieldBlock(buf, 4) &&
+                skipTeFieldBlock(buf, 2) &&
+                skipTeFieldBlock(buf, 2) &&
+                skipTeFieldBlock(buf, 2)
+
+            var defaultBumpByte = 0
+            val faceBumpBytes = HashMap<Int, Int>()
+            var defaultMediaByte = 0
+            val faceMediaBytes = HashMap<Int, Int>()
+            var defaultGlow = 0f
+            val faceGlows = HashMap<Int, Float>()
+            var defaultMaterialId: UUID? = null
+            val faceMaterialIds = HashMap<Int, UUID>()
+
+            if (hasFullUvBlock && buf.hasRemaining()) {
+                // 8. BumpShinyFullbright (1B U8: bits 0..4 bump, bit 5 fullbright, bits 6..7 shiny)
+                defaultBumpByte = buf.get().toInt() and 0xFF
+                var bumpTerminated = false
+                while (buf.hasRemaining()) {
+                    val faceBits = readFaceBitfield(buf)
+                    if (faceBits == 0L) {
+                        bumpTerminated = true
+                        break
+                    }
+                    if (!buf.hasRemaining()) break
+                    val b = buf.get().toInt() and 0xFF
+                    for (bit in 0 until 32) {
+                        if ((faceBits and (1L shl bit)) != 0L) faceBumpBytes[bit] = b
+                    }
+                }
+
+                // 9. MediaFlags / TexGen (+ optional extended alpha-mode bits) (1B U8)
+                var mediaTerminated = false
+                if (bumpTerminated && buf.hasRemaining()) {
+                    defaultMediaByte = buf.get().toInt() and 0xFF
+                    while (buf.hasRemaining()) {
+                        val faceBits = readFaceBitfield(buf)
+                        if (faceBits == 0L) {
+                            mediaTerminated = true
+                            break
+                        }
+                        if (!buf.hasRemaining()) break
+                        val m = buf.get().toInt() and 0xFF
+                        for (bit in 0 until 32) {
+                            if ((faceBits and (1L shl bit)) != 0L) faceMediaBytes[bit] = m
+                        }
+                    }
+                }
+
+                // 10. Glow (1B U8 -> 0.0..1.0)
+                var glowTerminated = false
+                if (mediaTerminated && buf.hasRemaining()) {
+                    defaultGlow = (buf.get().toInt() and 0xFF) / 255f
+                    while (buf.hasRemaining()) {
+                        val faceBits = readFaceBitfield(buf)
+                        if (faceBits == 0L) {
+                            glowTerminated = true
+                            break
+                        }
+                        if (!buf.hasRemaining()) break
+                        val g = (buf.get().toInt() and 0xFF) / 255f
+                        for (bit in 0 until 32) {
+                            if ((faceBits and (1L shl bit)) != 0L) faceGlows[bit] = g
+                        }
+                    }
+                }
+
+                // 11. MaterialID (16B UUID)
+                if (glowTerminated && buf.remaining() >= 16) {
+                    defaultMaterialId = readUuidBe(buf).takeIf { it != ZERO_UUID }
+                    while (buf.hasRemaining()) {
+                        val faceBits = readFaceBitfield(buf)
+                        if (faceBits == 0L) break
+                        if (buf.remaining() < 16) break
+                        val matId = readUuidBe(buf).takeIf { it != ZERO_UUID }
+                        if (matId != null) {
+                            for (bit in 0 until 32) {
+                                if ((faceBits and (1L shl bit)) != 0L) faceMaterialIds[bit] = matId
+                            }
+                        }
+                    }
+                }
+            }
+
+            fun buildFaceMaterial(
+                bumpByte: Int,
+                mediaByte: Int,
+                glowVal: Float,
+                matUuid: UUID?
+            ): FaceMaterialParams {
+                val bump = bumpByte and 0x1F
+                val fullbright = ((bumpByte ushr 5) and 0x01) != 0
+                val shiny = (bumpByte ushr 6) and 0x03
+                // MediaFlags upper bits (bits 3..4) can carry explicit alpha-mode hints when non-zero
+                val rawAlphaCode = (mediaByte ushr 3) and 0x03
+                val alphaMode = if (rawAlphaCode != 0) MaterialAlphaMode.fromCode(rawAlphaCode) else MaterialAlphaMode.BLEND
+                val cutoff = if (alphaMode == MaterialAlphaMode.MASK) 0.5f else 0f
+                return FaceMaterialParams(
+                    shininess = shiny,
+                    bumpiness = bump,
+                    fullbright = fullbright,
+                    glow = glowVal.coerceIn(0f, 1f),
+                    alphaMode = alphaMode,
+                    alphaCutoff = cutoff,
+                    materialId = matUuid
+                )
+            }
+
+            val defaultMat = buildFaceMaterial(defaultBumpByte, defaultMediaByte, defaultGlow, defaultMaterialId)
+            val allOverrideFaces = HashSet<Int>().apply {
+                addAll(faceBumpBytes.keys)
+                addAll(faceMediaBytes.keys)
+                addAll(faceGlows.keys)
+                addAll(faceMaterialIds.keys)
+            }
+            val faceMats = LinkedHashMap<Int, FaceMaterialParams>(allOverrideFaces.size)
+            for (face in allOverrideFaces.sorted()) {
+                faceMats[face] = buildFaceMaterial(
+                    bumpByte = faceBumpBytes[face] ?: defaultBumpByte,
+                    mediaByte = faceMediaBytes[face] ?: defaultMediaByte,
+                    glowVal = faceGlows[face] ?: defaultGlow,
+                    matUuid = faceMaterialIds[face] ?: defaultMaterialId
+                )
+            }
+
             ParsedTextureEntry(
                 defaultTextureId = defaultTex.takeIf { it != ZERO_UUID },
                 faceTextures = faceTextures,
                 defaultColor = defaultColor,
-                faceColors = faceColors
+                faceColors = faceColors,
+                defaultMaterial = defaultMat,
+                faceMaterials = faceMats
             )
         } catch (_: Exception) {
             ParsedTextureEntry()
         }
+    }
+
+    private fun skipTeFieldBlock(buf: ByteBuffer, valueBytes: Int): Boolean {
+        if (buf.remaining() < valueBytes) return false
+        buf.position(buf.position() + valueBytes) // Default value
+        while (buf.hasRemaining()) {
+            val faceBits = readFaceBitfield(buf)
+            if (faceBits == 0L) return true
+            if (buf.remaining() < valueBytes) return false
+            buf.position(buf.position() + valueBytes)
+        }
+        return false
     }
 
     private fun readFaceBitfield(buf: ByteBuffer): Long {
@@ -148,7 +309,8 @@ object SlBinaryParsers {
     }
 
     /**
-     * Parses LLUDP ExtraParams block to extract Mesh Asset UUID (type 0x0060) and Sculpt/Flex/Light flags.
+     * Parses LLUDP ExtraParams block to extract Mesh Asset UUID (type 0x0060), Sculpt/Flex/Light flags,
+     * and glTF `RenderMaterials` per-face material asset UUIDs (type 0x0080).
      */
     fun parseExtraParams(bytes: ByteArray): ParsedExtraParams {
         if (bytes.isEmpty()) return ParsedExtraParams()
@@ -158,6 +320,8 @@ object SlBinaryParsers {
         var sculptId: UUID? = null
         var isFlex = false
         var isLight = false
+        val renderMats = LinkedHashMap<Int, UUID>()
+        var defaultRenderMat: UUID? = null
         try {
             val count = buf.get().toInt() and 0xFF
             repeat(count.coerceAtMost(16)) {
@@ -167,9 +331,9 @@ object SlBinaryParsers {
                 if (size < 0 || size > buf.remaining()) return@repeat
                 val nextPos = buf.position() + size
                 when (type) {
-                    0x0010 -> isFlex = true
-                    0x0020 -> isLight = true
-                    0x0030 -> { // Legacy Sculpt
+                    EXTRA_PARAM_FLEXIBLE -> isFlex = true
+                    EXTRA_PARAM_LIGHT -> isLight = true
+                    EXTRA_PARAM_SCULPT -> { // Legacy Sculpt
                         if (size >= 17) {
                             val id = readUuidBe(buf)
                             val sculptType = buf.get().toInt() and 0x07
@@ -183,12 +347,29 @@ object SlBinaryParsers {
                             }
                         }
                     }
-                    0x0060 -> { // Mesh (PARAMS_MESH) — always a binary .llmesh asset
+                    EXTRA_PARAM_MESH -> { // Mesh (PARAMS_MESH) — always a binary .llmesh asset
                         if (size >= 16) {
                             val id = readUuidBe(buf)
                             if (id != ZERO_UUID) {
                                 meshId = id
                                 isMesh = true
+                            }
+                        }
+                    }
+                    EXTRA_PARAM_RENDER_MATERIAL -> { // glTF RenderMaterials (0x0080: count U8 + [teIdx U8, UUID 16B]*)
+                        if (size >= 1) {
+                            val entryCount = (buf.get().toInt() and 0xFF).coerceAtMost(32)
+                            repeat(entryCount) {
+                                if (nextPos - buf.position() < 17) return@repeat
+                                val teIdx = buf.get().toInt() and 0xFF
+                                val matId = readUuidBe(buf)
+                                if (matId != ZERO_UUID) {
+                                    if (teIdx == 255) {
+                                        defaultRenderMat = matId
+                                    } else {
+                                        renderMats[teIdx] = matId
+                                    }
+                                }
                             }
                         }
                     }
@@ -203,7 +384,61 @@ object SlBinaryParsers {
             isMesh = isMesh,
             sculptTextureId = sculptId,
             isFlexible = isFlex,
-            isLight = isLight
+            isLight = isLight,
+            renderMaterialIds = renderMats,
+            defaultRenderMaterialId = defaultRenderMat
+        )
+    }
+
+    /**
+     * Parses LLSD `RenderMaterials` / glTF 2.0 material override metadata into [FaceMaterialParams]
+     * (supporting `pbrMetallicRoughness` `metallicFactor`, `roughnessFactor`, `emissiveFactor`,
+     * `alphaMode` = OPAQUE/MASK/BLEND/EMISSIVE, and `alphaCutoff`).
+     */
+    fun parseGltfMaterialOverride(node: LlsdValue, base: FaceMaterialParams = FaceMaterialParams()): FaceMaterialParams {
+        val map = node.asMap()
+        if (map.isEmpty()) return base
+        val pbr = (map["pbrMetallicRoughness"] ?: map["pbr_metallic_roughness"])?.asMap().orEmpty()
+
+        val metallic = (pbr["metallicFactor"] ?: pbr["metallic_factor"] ?: map["metallicFactor"] ?: map["metallic_factor"])
+            ?.takeIf { it !is LlsdValue.Undef }
+            ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
+            ?: base.metallicFactor
+
+        val roughness = (pbr["roughnessFactor"] ?: pbr["roughness_factor"] ?: map["roughnessFactor"] ?: map["roughness_factor"])
+            ?.takeIf { it !is LlsdValue.Undef }
+            ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0.04f, 1f)
+            ?: base.roughnessFactor
+
+        val emissive = (map["emissiveFactor"] ?: map["emissive_factor"])?.asVec3OrNull() ?: base.emissiveColor
+
+        val alphaModeNode = map["alphaMode"] ?: map["alpha_mode"]
+        val alphaMode = when (alphaModeNode) {
+            is LlsdValue.Str -> when (alphaModeNode.value.trim().uppercase()) {
+                "OPAQUE", "NONE" -> MaterialAlphaMode.NONE
+                "MASK" -> MaterialAlphaMode.MASK
+                "EMISSIVE" -> MaterialAlphaMode.EMISSIVE
+                else -> MaterialAlphaMode.BLEND
+            }
+            is LlsdValue.IntVal -> MaterialAlphaMode.fromCode(alphaModeNode.value)
+            else -> base.alphaMode
+        }
+
+        val alphaCutoff = (map["alphaCutoff"] ?: map["alpha_cutoff"])
+            ?.takeIf { it !is LlsdValue.Undef }
+            ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
+            ?: if (alphaMode == MaterialAlphaMode.MASK && base.alphaCutoff <= 0f) 0.5f else base.alphaCutoff
+
+        val renderMatId = (map["id"] ?: map["material_id"] ?: map["render_material_id"])?.asUuidOrNull()
+            ?: base.renderMaterialId
+
+        return base.copy(
+            metallicFactor = metallic,
+            roughnessFactor = roughness,
+            emissiveColor = emissive,
+            alphaMode = alphaMode,
+            alphaCutoff = alphaCutoff,
+            renderMaterialId = renderMatId
         )
     }
 

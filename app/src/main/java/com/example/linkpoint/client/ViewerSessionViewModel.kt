@@ -37,6 +37,8 @@ import com.example.linkpoint.protocol.SlBinaryParsers
 import com.example.linkpoint.protocol.XmlRpcLoginClient
 import com.example.linkpoint.render.LinkpointGlRenderer
 import com.example.linkpoint.render.RenderSceneSnapshot
+import com.example.linkpoint.scene.AvatarAnimState
+import com.example.linkpoint.scene.AvatarAnimationCatalog
 import com.example.linkpoint.scene.AvatarEntity
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
@@ -44,10 +46,12 @@ import com.example.linkpoint.scene.ColorRgba
 import com.example.linkpoint.scene.EnvironmentPreset
 import com.example.linkpoint.scene.HudAttachmentPoint
 import com.example.linkpoint.scene.HudHitResult
-import com.example.linkpoint.scene.Quat
 import com.example.linkpoint.scene.LocalSandboxBuilder
 import com.example.linkpoint.scene.ProjectedNametag
+import com.example.linkpoint.scene.Quat
+import com.example.linkpoint.scene.RegionEnvironmentSettings
 import com.example.linkpoint.scene.SceneObject
+import com.example.linkpoint.scene.SeatedAvatarTransformResolver
 import com.example.linkpoint.scene.TerrainGrid
 import com.example.linkpoint.scene.Vec3
 import com.example.linkpoint.store.AdaptiveHudCoordinator
@@ -122,6 +126,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     @Volatile private var jumpPulseTicks = 0
     @Volatile private var hasServerSelfPosition = false
     @Volatile private var lastServerSelfZ = 23f
+    @Volatile private var liveRegionEnvironment: RegionEnvironmentSettings? = null
     @Volatile private var lastUiSnapshotSyncMs = 0L
     @Volatile private var lastUiPosSyncMs = 0L
     private val pressedMoveKeys = ConcurrentHashMap.newKeySet<Int>()
@@ -239,7 +244,30 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         if (!evt.name.isNullOrBlank()) {
                             knownNames[evt.agentId] = evt.name
                         }
-                        val yawRad = 2f * atan2(evt.rotation.z, evt.rotation.w)
+                        val parentId = evt.parentId
+                        val incomingRot = evt.rotation.normalized()
+                        val seatedTransform = if (parentId != 0) {
+                            SeatedAvatarTransformResolver.resolveSeatedWorldTransform(
+                                localSitPosition = evt.position,
+                                localSitRotation = incomingRot,
+                                parentId = parentId,
+                                sceneObjectsByLocalId = allSceneObjects
+                            )
+                        } else null
+
+                        val worldPos = when {
+                            parentId == 0 -> evt.position
+                            seatedTransform != null -> seatedTransform.position
+                            existing != null -> existing.position
+                            else -> Vec3(128f, 128f, 23f)
+                        }
+                        val worldRot = when {
+                            parentId == 0 -> incomingRot
+                            seatedTransform != null -> seatedTransform.rotation
+                            existing != null -> existing.worldRotation
+                            else -> incomingRot
+                        }
+                        val yawRad = SeatedAvatarTransformResolver.extractYawRadians(worldRot)
                         val heightM = evt.scale.z.takeIf { it in 1.1f..2.8f } ?: existing?.heightMeters ?: 1.82f
                         val baked = evt.textureEntry
                         val headTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HEAD] ?: existing?.bakedHeadTextureId
@@ -251,19 +279,43 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         listOfNotNull(headTex, upperTex, lowerTex, eyesTex, hairTex, baked.defaultTextureId)
                             .forEach { assetManager.requestTexture(it, highPriority = true) }
 
+                        val activeAnimIds = existing?.activeAnimationIds.orEmpty()
+                        val nextAnimState = when {
+                            activeAnimIds.isNotEmpty() ->
+                                AvatarAnimationCatalog.classifyAnimations(activeAnimIds, isSeatedOnPrim = parentId != 0).primaryState
+                            parentId != 0 -> AvatarAnimState.SIT
+                            existing?.parentId != 0 && parentId == 0 -> AvatarAnimState.STAND
+                            else -> existing?.animState ?: AvatarAnimState.STAND
+                        }
+                        val sittingNow = parentId != 0 ||
+                            nextAnimState == AvatarAnimState.SIT ||
+                            nextAnimState == AvatarAnimState.GROUND_SIT
+                        val flyingNow = !sittingNow && (
+                            nextAnimState == AvatarAnimState.FLY ||
+                                nextAnimState == AvatarAnimState.HOVER ||
+                                (existing?.isFlying == true && parentId == 0)
+                            )
+
                         val updatedAvatar = (existing ?: AvatarEntity(
                             agentId = evt.agentId,
                             localId = evt.localId,
                             displayName = resolvedName,
                             legacyName = evt.name ?: if (isSelf) selfAvatarName else "",
-                            position = evt.position,
+                            position = worldPos,
                             isSelf = isSelf
                         )).copy(
                             localId = evt.localId,
                             displayName = resolvedName,
                             legacyName = evt.name?.takeIf { it.isNotBlank() } ?: existing?.legacyName.orEmpty(),
-                            position = evt.position,
+                            position = worldPos,
                             yaw = yawRad,
+                            parentId = parentId,
+                            localPosition = evt.position,
+                            localRotation = incomingRot,
+                            worldRotation = worldRot,
+                            animState = nextAnimState,
+                            isSitting = sittingNow,
+                            isFlying = flyingNow,
                             isSelf = isSelf,
                             heightMeters = heightM,
                             bakedHeadTextureId = headTex,
@@ -276,15 +328,23 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
                         // Remove any coarse-radar placeholder within 6m of this real avatar
                         val stalePlaceholders = avatars.entries.filter { (id, av) ->
-                            id.mostSignificantBits == COARSE_RADAR_MSB && av.position.distanceTo(evt.position) < 6f
+                            id.mostSignificantBits == COARSE_RADAR_MSB && av.position.distanceTo(worldPos) < 6f
                         }.map { it.key }
                         stalePlaceholders.forEach { avatars.remove(it) }
 
                         if (isSelf) {
-                            hasServerSelfPosition = true
-                            lastServerSelfZ = evt.position.z
-                            lludpEngine.avatarPos = evt.position
-                            _state.update { it.copy(avatarPosition = evt.position) }
+                            if (parentId == 0 || seatedTransform != null) {
+                                hasServerSelfPosition = true
+                                if (parentId == 0) lastServerSelfZ = worldPos.z
+                            }
+                            lludpEngine.avatarPos = worldPos
+                            _state.update {
+                                it.copy(
+                                    avatarPosition = worldPos,
+                                    isSitting = sittingNow,
+                                    isFlying = flyingNow
+                                )
+                            }
                         } else if (evt.name.isNullOrBlank() && !knownNames.containsKey(evt.agentId)) {
                             assetManager.requestDisplayNames(listOf(evt.agentId))
                             lludpEngine.requestUuidNames(listOf(evt.agentId))
@@ -299,7 +359,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         pushSceneSnapshot()
                     }
                     is SimEvent.TerseObjectUpdated -> {
-                        val yawRad = 2f * atan2(evt.rotation.z, evt.rotation.w)
+                        val incomingRot = evt.rotation.normalized()
+                        val yawRad = SeatedAvatarTransformResolver.extractYawRadians(incomingRot)
                         val matchingAvatar = avatars.values.firstOrNull { it.localId == evt.localId }
                         if (matchingAvatar != null) {
                             val te = evt.textureEntry
@@ -313,40 +374,72 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                     .forEach { assetManager.requestTexture(it, highPriority = true) }
                             }
 
-                            val isActivelySteeringSelf = matchingAvatar.isSelf && isSelfActivelySteering()
-                            if (matchingAvatar.isSelf) {
-                                hasServerSelfPosition = true
-                                lastServerSelfZ = evt.position.z
-                            }
-                            if (!isActivelySteeringSelf) {
+                            if (matchingAvatar.parentId != 0) {
+                                // Seated avatar: TerseObjectUpdated carries parent-relative local sit offset & rotation
                                 avatars[matchingAvatar.agentId] = matchingAvatar.copy(
-                                    position = evt.position,
-                                    yaw = yawRad,
+                                    localPosition = evt.position,
+                                    localRotation = incomingRot,
                                     bakedHeadTextureId = headTex,
                                     bakedUpperTextureId = upperTex,
                                     bakedLowerTextureId = lowerTex,
                                     bakedEyesTextureId = eyesTex,
                                     bakedHairTextureId = hairTex
                                 )
-                                if (matchingAvatar.isSelf) {
-                                    lludpEngine.avatarPos = evt.position
-                                    _state.update { it.copy(avatarPosition = evt.position) }
-                                }
                             } else {
-                                // Smoothly reconcile simulator authoritative altitude/position while steering so stairs/floors stay accurate
-                                val blended = Vec3(
-                                    matchingAvatar.position.x * 0.72f + evt.position.x * 0.28f,
-                                    matchingAvatar.position.y * 0.72f + evt.position.y * 0.28f,
-                                    matchingAvatar.position.z * 0.65f + evt.position.z * 0.35f
-                                )
-                                avatars[matchingAvatar.agentId] = matchingAvatar.copy(
-                                    position = blended,
-                                    bakedHeadTextureId = headTex,
-                                    bakedUpperTextureId = upperTex,
-                                    bakedLowerTextureId = lowerTex,
-                                    bakedEyesTextureId = eyesTex,
-                                    bakedHairTextureId = hairTex
-                                )
+                                val isActivelySteeringSelf = matchingAvatar.isSelf && isSelfActivelySteering()
+                                if (matchingAvatar.isSelf) {
+                                    hasServerSelfPosition = true
+                                    lastServerSelfZ = evt.position.z
+                                }
+                                val horizDelta = hypot(
+                                    (evt.position.x - matchingAvatar.position.x).toDouble(),
+                                    (evt.position.y - matchingAvatar.position.y).toDouble()
+                                ).toFloat()
+                                val inferredAnim = if (matchingAvatar.activeAnimationIds.isNotEmpty()) {
+                                    matchingAvatar.animState
+                                } else when {
+                                    matchingAvatar.isSitting -> AvatarAnimState.GROUND_SIT
+                                    matchingAvatar.isFlying -> if (horizDelta > 0.08f) AvatarAnimState.FLY else AvatarAnimState.HOVER
+                                    horizDelta > 0.45f -> AvatarAnimState.RUN
+                                    horizDelta > 0.04f -> AvatarAnimState.WALK
+                                    else -> AvatarAnimState.STAND
+                                }
+
+                                if (!isActivelySteeringSelf) {
+                                    avatars[matchingAvatar.agentId] = matchingAvatar.copy(
+                                        position = evt.position,
+                                        localPosition = evt.position,
+                                        localRotation = incomingRot,
+                                        worldRotation = incomingRot,
+                                        yaw = yawRad,
+                                        animState = inferredAnim,
+                                        bakedHeadTextureId = headTex,
+                                        bakedUpperTextureId = upperTex,
+                                        bakedLowerTextureId = lowerTex,
+                                        bakedEyesTextureId = eyesTex,
+                                        bakedHairTextureId = hairTex
+                                    )
+                                    if (matchingAvatar.isSelf) {
+                                        lludpEngine.avatarPos = evt.position
+                                        _state.update { it.copy(avatarPosition = evt.position) }
+                                    }
+                                } else {
+                                    // Smoothly reconcile simulator authoritative altitude/position while steering so stairs/floors stay accurate
+                                    val blended = Vec3(
+                                        matchingAvatar.position.x * 0.72f + evt.position.x * 0.28f,
+                                        matchingAvatar.position.y * 0.72f + evt.position.y * 0.28f,
+                                        matchingAvatar.position.z * 0.65f + evt.position.z * 0.35f
+                                    )
+                                    avatars[matchingAvatar.agentId] = matchingAvatar.copy(
+                                        position = blended,
+                                        localPosition = blended,
+                                        bakedHeadTextureId = headTex,
+                                        bakedUpperTextureId = upperTex,
+                                        bakedLowerTextureId = lowerTex,
+                                        bakedEyesTextureId = eyesTex,
+                                        bakedHairTextureId = hairTex
+                                    )
+                                }
                             }
                             refreshNearbyRadar()
                             pushSceneSnapshot()
@@ -365,13 +458,49 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                 }
                                 allSceneObjects[evt.localId] = existing.copy(
                                     position = safePos,
-                                    rotation = evt.rotation.normalized(),
+                                    rotation = incomingRot,
                                     defaultTextureId = te?.defaultTextureId ?: existing.defaultTextureId,
-                                    faceTextures = if (te != null && te.faceTextures.isNotEmpty()) te.faceTextures else existing.faceTextures
+                                    faceTextures = if (te != null && te.faceTextures.isNotEmpty()) te.faceTextures else existing.faceTextures,
+                                    defaultMaterial = te?.defaultMaterial ?: existing.defaultMaterial,
+                                    faceMaterials = if (te != null && te.faceMaterials.isNotEmpty()) te.faceMaterials else existing.faceMaterials,
+                                    isFullbright = te?.isDefaultFullbright ?: existing.isFullbright
                                 )
                                 pushSceneSnapshot()
                             }
                         }
+                    }
+                    is SimEvent.AvatarAnimationsUpdated -> {
+                        val isSelf = evt.agentId == selfAgentId
+                        val existing = avatars[evt.agentId]
+                        val base = existing ?: AvatarEntity(
+                            agentId = evt.agentId,
+                            localId = 0,
+                            displayName = knownNames[evt.agentId] ?: if (isSelf) selfAvatarName else "Resident ${evt.agentId.toString().take(6)}",
+                            legacyName = if (isSelf) selfAvatarName else "",
+                            position = if (isSelf) _state.value.avatarPosition else Vec3(128f, 128f, 23f),
+                            isSelf = isSelf
+                        )
+                        val seatedOnPrim = base.parentId != 0
+                        val resolved = AvatarAnimationCatalog.classifyAnimations(
+                            animIds = evt.animations.map { it.animId },
+                            sequenceIds = evt.animations.associate { it.animId to it.sequenceId },
+                            isSeatedOnPrim = seatedOnPrim
+                        )
+                        val nextSitting = seatedOnPrim || resolved.impliesSitting
+                        val nextFlying = !nextSitting && resolved.impliesFlying
+                        val nextTyping = resolved.isTyping || (isSelf && textInputFocused)
+
+                        avatars[evt.agentId] = base.copy(
+                            animState = resolved.primaryState,
+                            isTyping = nextTyping,
+                            activeAnimationIds = resolved.activeAnimIds,
+                            isSitting = nextSitting,
+                            isFlying = nextFlying
+                        )
+                        if (isSelf) {
+                            _state.update { it.copy(isSitting = nextSitting, isFlying = nextFlying) }
+                        }
+                        pushSceneSnapshot()
                     }
                     is SimEvent.AvatarAppearanceReceived -> {
                         val baked = evt.bakedTextures
@@ -571,11 +700,19 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     is CapsEvent.AttachmentsUpdated -> {
                         applyCapsAttachmentUpdates(evt.updates)
                     }
+                    is CapsEvent.EnvironmentUpdated -> {
+                        liveRegionEnvironment = evt.settings
+                        appendDiagnostic(
+                            "[EEP] Live region environment synced (daylight=${evt.settings.isDaylight}, sunZ=${"%.2f".format(evt.settings.sunDirection.z)})"
+                        )
+                        pushSceneSnapshot()
+                    }
                     is CapsEvent.GenericNotice -> appendLocalChat(
                         ChatMessage(speaker = evt.title, text = evt.message, isSystem = true)
                     )
                     is CapsEvent.TeleportFinish -> {
                         showToast("Arrived at simulator ${evt.simIp}:${evt.simPort}")
+                        viewModelScope.launch { capabilityManager.fetchEnvironmentSettings() }
                     }
                     is CapsEvent.HealthChanged -> {
                         _state.update { s ->
@@ -814,6 +951,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             capsRes.diagnostics.forEach { appendDiagnostic(it) }
             if (capsRes.capabilities.isNotEmpty()) {
                 assetManager.configureCapabilities(capsRes.capabilities)
+                if (capsRes.capabilities.containsKey("EnvironmentSettings") || capsRes.capabilities.containsKey("ExtEnvironment")) {
+                    capabilityManager.fetchEnvironmentSettings()
+                }
                 showToast("Transport recovered (${capsRes.capabilities.size} CAPS active)")
             }
         }
@@ -1064,6 +1204,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             pressedMoveKeys.clear()
             verticalVelocityZ = 0f
             hasServerSelfPosition = false
+            liveRegionEnvironment = null
             knownNames[selfAgentId] = selfAvatarName
             avatars[selfAgentId] = AvatarEntity(
                 agentId = selfAgentId,
@@ -1089,6 +1230,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             lludpEngine.connect(response)
             if (capsResult.capabilities.containsKey("AttachmentResources")) {
                 viewModelScope.launch { capabilityManager.fetchAttachmentResources() }
+            }
+            if (capsResult.capabilities.containsKey("EnvironmentSettings") || capsResult.capabilities.containsKey("ExtEnvironment")) {
+                viewModelScope.launch { capabilityManager.fetchEnvironmentSettings() }
             }
 
             _state.update { s ->
@@ -1165,6 +1309,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         pressedMoveKeys.clear()
         verticalVelocityZ = 0f
         hasServerSelfPosition = false
+        liveRegionEnvironment = null
         LocalSandboxBuilder.buildDefaultAvatarHuds().forEach { manualHudAttachments[it.localId] = it }
 
         avatars.clear()
@@ -1240,6 +1385,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         requestedProfiles.clear()
         verticalVelocityZ = 0f
         textInputFocused = false
+        liveRegionEnvironment = null
         renderer.focusOverride = null
         _state.update { s ->
             s.copy(
@@ -1368,6 +1514,14 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         if (focused) {
             clearKeyboardMovement()
         }
+        avatars[selfAgentId]?.let { self ->
+            val serverTyping = AvatarAnimationCatalog.ANIM_AGENT_TYPE in self.activeAnimationIds
+            val nextTyping = focused || serverTyping
+            if (self.isTyping != nextTyping) {
+                avatars[selfAgentId] = self.copy(isTyping = nextTyping)
+                pushSceneSnapshot()
+            }
+        }
     }
 
     override fun triggerJump() {
@@ -1377,12 +1531,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             return
         }
         val floorZ = computeFloorZ(self.position.x, self.position.y)
-        if (self.position.z <= floorZ + 0.30f || groundedGraceSec > 0f || abs(verticalVelocityZ) < 0.05f) {
+        if (self.parentId != 0 || self.position.z <= floorZ + 0.30f || groundedGraceSec > 0f || abs(verticalVelocityZ) < 0.05f) {
             verticalVelocityZ = 6.2f
             groundedGraceSec = 0f
             jumpPulseTicks = 14
-            if (self.isSitting) {
-                avatars[selfAgentId] = self.copy(isSitting = false)
+            if (self.isSitting || self.parentId != 0) {
+                val unseatedParent = if (_state.value.connection is ConnectionState.LocalSandbox) 0 else self.parentId
+                avatars[selfAgentId] = self.copy(
+                    parentId = unseatedParent,
+                    isSitting = false,
+                    animState = AvatarAnimState.CROUCH
+                )
                 _state.update { it.copy(isSitting = false) }
             }
         }
@@ -1511,30 +1670,65 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         abs(nz - self.position.z) > 1e-4f ||
                         abs(yawDelta) > 1e-4f
 
-                    if (moved) {
-                        val updated = self.copy(position = Vec3(nx, ny, nz), yaw = yaw, isSitting = false)
-                        avatars[selfAgentId] = updated
-                        if (_state.value.cameraMode == CameraMode.FOLLOW) {
-                            renderer.nudgeFollowCamera(
-                                deltaAvatarYaw = yawDelta,
-                                avatarYaw = yaw,
-                                movingForward = normFwd > 0.15f,
-                                dtSec = dt
-                            )
-                        }
-                        lludpEngine.avatarPos = updated.position
-                        lludpEngine.avatarYaw = yaw
-                        lludpEngine.controlFlags = flags
-
-                        val nowMs = System.currentTimeMillis()
-                        if (nowMs - lastUiPosSyncMs >= 125L) {
-                            lastUiPosSyncMs = nowMs
-                            _state.update { it.copy(avatarPosition = updated.position, isSitting = false) }
-                        }
-                        pushSceneSnapshot(syncUiState = false)
-                    } else {
+                    if (self.parentId != 0 && !hasMoveInput && abs(rawTurn) < 0.05f && !keyUp && jumpPulseTicks == 0) {
+                        // Seated on a prim/chair: keep authoritative parent-linkset transform and transmit idle control flags
                         lludpEngine.avatarYaw = self.yaw
                         lludpEngine.controlFlags = flags
+                    } else if (self.parentId != 0 && _state.value.connection is ConnectionState.Connected) {
+                        // Seated on a live grid prim/vehicle: send steering/stand control flags to simulator without clobbering local sit offset
+                        lludpEngine.controlFlags = flags
+                    } else {
+                        val horizSpeed = hypot(moveVelX.toDouble(), moveVelY.toDouble()).toFloat()
+                        val proceduralAnim = when {
+                            self.isSitting && !hasMoveInput -> AvatarAnimState.GROUND_SIT
+                            self.isFlying -> if (horizSpeed > 0.35f) AvatarAnimState.FLY else AvatarAnimState.HOVER
+                            keyDown -> if (horizSpeed > 0.25f) AvatarAnimState.CROUCH_WALK else AvatarAnimState.CROUCH
+                            horizSpeed > 6.0f -> AvatarAnimState.RUN
+                            horizSpeed > 0.20f -> AvatarAnimState.WALK
+                            else -> AvatarAnimState.STAND
+                        }
+                        val nextAnimState = if (self.activeAnimationIds.isNotEmpty() && !hasMoveInput) {
+                            self.animState
+                        } else {
+                            proceduralAnim
+                        }
+                        val nextSitting = if (hasMoveInput) false else self.isSitting
+
+                        if (moved || self.animState != nextAnimState || self.parentId != 0) {
+                            val nextRot = Quat.fromYaw(yaw)
+                            val updated = self.copy(
+                                position = Vec3(nx, ny, nz),
+                                localPosition = Vec3(nx, ny, nz),
+                                localRotation = nextRot,
+                                worldRotation = nextRot,
+                                yaw = yaw,
+                                parentId = 0,
+                                isSitting = nextSitting,
+                                animState = nextAnimState
+                            )
+                            avatars[selfAgentId] = updated
+                            if (_state.value.cameraMode == CameraMode.FOLLOW && moved) {
+                                renderer.nudgeFollowCamera(
+                                    deltaAvatarYaw = yawDelta,
+                                    avatarYaw = yaw,
+                                    movingForward = normFwd > 0.15f,
+                                    dtSec = dt
+                                )
+                            }
+                            lludpEngine.avatarPos = updated.position
+                            lludpEngine.avatarYaw = yaw
+                            lludpEngine.controlFlags = flags
+
+                            val nowMs = System.currentTimeMillis()
+                            if (nowMs - lastUiPosSyncMs >= 125L) {
+                                lastUiPosSyncMs = nowMs
+                                _state.update { it.copy(avatarPosition = updated.position, isSitting = nextSitting) }
+                            }
+                            pushSceneSnapshot(syncUiState = false)
+                        } else {
+                            lludpEngine.avatarYaw = self.yaw
+                            lludpEngine.controlFlags = flags
+                        }
                     }
 
                     // Gentle orbital drift for the sandbox patrol drone
@@ -1569,7 +1763,18 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         verticalVelocityZ = 0f
         val floor = computeFloorZ(self.position.x, self.position.y)
         val newZ = if (nextFly) self.position.z + 2.0f else floor
-        avatars[selfAgentId] = self.copy(isFlying = nextFly, isSitting = false, position = self.position.copy(z = newZ))
+        val nextPos = self.position.copy(z = newZ)
+        val nextRot = Quat.fromYaw(self.yaw)
+        avatars[selfAgentId] = self.copy(
+            parentId = if (_state.value.connection is ConnectionState.LocalSandbox) 0 else self.parentId,
+            isFlying = nextFly,
+            isSitting = false,
+            animState = if (nextFly) AvatarAnimState.HOVER else AvatarAnimState.STAND,
+            position = nextPos,
+            localPosition = nextPos,
+            localRotation = nextRot,
+            worldRotation = nextRot
+        )
         _state.update { it.copy(isFlying = nextFly, isSitting = false, avatarPosition = avatars[selfAgentId]!!.position) }
         pushSceneSnapshot()
     }
@@ -1579,7 +1784,13 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val ground = computeFloorZ(self.position.x, self.position.y)
         val nextZ = (self.position.z + deltaZ).coerceIn(ground, 4090f)
         val flying = nextZ > ground + 0.3f
-        avatars[selfAgentId] = self.copy(position = self.position.copy(z = nextZ), isFlying = flying)
+        val nextPos = self.position.copy(z = nextZ)
+        avatars[selfAgentId] = self.copy(
+            position = nextPos,
+            localPosition = nextPos,
+            isFlying = flying,
+            animState = if (flying) AvatarAnimState.HOVER else AvatarAnimState.STAND
+        )
         _state.update { it.copy(isFlying = flying, avatarPosition = avatars[selfAgentId]!!.position) }
         pushSceneSnapshot()
     }
@@ -1587,23 +1798,58 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     override fun toggleSitOnSelected() {
         val self = avatars[selfAgentId] ?: return
         val target = _state.value.selectedObject
-        if (self.isSitting) {
-            avatars[selfAgentId] = self.copy(isSitting = false)
+        if (self.isSitting || self.parentId != 0) {
+            val standRot = Quat.fromYaw(self.yaw)
+            avatars[selfAgentId] = self.copy(
+                parentId = 0,
+                isSitting = false,
+                animState = AvatarAnimState.STAND,
+                localPosition = self.position,
+                localRotation = standRot,
+                worldRotation = standRot
+            )
             _state.update { it.copy(isSitting = false) }
             showToast("Stood up")
         } else if (target != null) {
-            if (_state.value.connection is ConnectionState.Connected) {
+            val isLive = _state.value.connection is ConnectionState.Connected
+            if (isLive) {
                 lludpEngine.sendSitRequest(target.uuid)
+                avatars[selfAgentId] = self.copy(
+                    isFlying = false,
+                    isSitting = true,
+                    animState = AvatarAnimState.SIT
+                )
+            } else {
+                val sitLocalOffset = Vec3(0f, 0f, target.scale.z * 0.5f + 0.35f)
+                val seated = SeatedAvatarTransformResolver.resolveSeatedWorldTransform(
+                    localSitPosition = sitLocalOffset,
+                    localSitRotation = Quat.IDENTITY,
+                    parentId = target.localId,
+                    sceneObjectsByLocalId = allSceneObjects
+                )
+                val worldPos = seated?.position ?: (target.position + sitLocalOffset)
+                val worldRot = seated?.rotation ?: target.rotation
+                avatars[selfAgentId] = self.copy(
+                    parentId = target.localId,
+                    localPosition = sitLocalOffset,
+                    localRotation = Quat.IDENTITY,
+                    worldRotation = worldRot,
+                    position = worldPos,
+                    yaw = SeatedAvatarTransformResolver.extractYawRadians(worldRot),
+                    isFlying = false,
+                    isSitting = true,
+                    animState = AvatarAnimState.SIT
+                )
             }
-            avatars[selfAgentId] = self.copy(
-                position = target.position + Vec3(0f, 0f, target.scale.z * 0.5f),
-                isFlying = false,
-                isSitting = true
-            )
             _state.update { it.copy(isSitting = true, isFlying = false, avatarPosition = avatars[selfAgentId]!!.position) }
             showToast("Sitting on ${target.name}")
         } else {
-            avatars[selfAgentId] = self.copy(isSitting = true, isFlying = false)
+            avatars[selfAgentId] = self.copy(
+                parentId = 0,
+                isSitting = true,
+                isFlying = false,
+                animState = AvatarAnimState.GROUND_SIT
+            )
             _state.update { it.copy(isSitting = true, isFlying = false) }
             showToast("Ground Sit enabled")
         }
@@ -1686,6 +1932,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 "HUD_TOGGLE_FLY" -> toggleFly()
                 "HUD_HOVER_BOOST" -> elevateAvatar(4.5f)
                 "HUD_TOGGLE_SIT" -> toggleSitOnSelected()
+                "HUD_EEP_AUTO" -> setEnvironmentPreset(EnvironmentPreset.AUTO_REGION_EEP)
                 "HUD_EEP_MIDDAY" -> setEnvironmentPreset(EnvironmentPreset.MIDDAY)
                 "HUD_EEP_TWILIGHT" -> setEnvironmentPreset(EnvironmentPreset.TWILIGHT)
                 "HUD_EEP_MIDNIGHT" -> setEnvironmentPreset(EnvironmentPreset.MIDNIGHT)
@@ -2340,6 +2587,38 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             }
         }
 
+        // Compose world-space transforms for any avatars seated (`parentId != 0`) on world prims or linkset child cushions
+        val avatarIterator = avatars.entries.iterator()
+        while (avatarIterator.hasNext()) {
+            val entry = avatarIterator.next()
+            val av = entry.value
+            if (av.parentId != 0) {
+                val seatedWorld = SeatedAvatarTransformResolver.resolveSeatedWorldTransform(
+                    localSitPosition = av.localPosition,
+                    localSitRotation = av.localRotation,
+                    parentId = av.parentId,
+                    sceneObjectsByLocalId = allSceneObjects
+                )
+                if (seatedWorld != null) {
+                    val nextYaw = SeatedAvatarTransformResolver.extractYawRadians(seatedWorld.rotation)
+                    val nextAnim = if (av.animState == AvatarAnimState.STAND) AvatarAnimState.SIT else av.animState
+                    val updatedSeated = av.copy(
+                        position = seatedWorld.position,
+                        worldRotation = seatedWorld.rotation,
+                        yaw = nextYaw,
+                        isSitting = true,
+                        isFlying = false,
+                        animState = nextAnim
+                    )
+                    entry.setValue(updatedSeated)
+                    if (updatedSeated.isSelf) {
+                        lludpEngine.avatarPos = updatedSeated.position
+                        lludpEngine.avatarYaw = nextYaw
+                    }
+                }
+            }
+        }
+
         val assembledAvatars = avatars.values.map { av ->
             val worn = attachmentsByAvatarId[av.agentId].orEmpty()
             if (worn.isEmpty() && av.attachments.isEmpty()) av else av.copy(attachments = worn)
@@ -2352,6 +2631,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             selectedLocalId = s.selectedObject?.localId,
             selectedAvatarId = s.selectedAvatarId,
             environment = s.design.environmentPreset,
+            regionEnvironment = liveRegionEnvironment,
             cameraMode = s.cameraMode,
             drawDistance = s.design.drawDistance,
             hudSafeRect = safeRect,
