@@ -76,7 +76,7 @@ class PreferencesRepository(private val context: Context) {
             hudTouchCaptureEnabled = prefs[Keys.HUD_TOUCH_CAPTURE] ?: true,
             pinnedTools = pinned,
             drawDistance = prefs[Keys.DRAW_DISTANCE] ?: 128f,
-            environmentPreset = enumOrDefault(prefs[Keys.ENVIRONMENT_PRESET], EnvironmentPreset.TWILIGHT)
+            environmentPreset = enumOrDefault(prefs[Keys.ENVIRONMENT_PRESET], EnvironmentPreset.AUTO_REGION_EEP)
         )
     }
 

@@ -50,6 +50,7 @@ object LocalSandboxBuilder {
                 position = Vec3(128f, 128f, groundZ(128f, 128f, 0.25f)),
                 scale = Vec3(14f, 14f, 0.5f),
                 color = ColorRgba(0.14f, 0.19f, 0.27f, 1f),
+                defaultMaterial = FaceMaterialParams(shininess = 2, bumpiness = 6, roughnessFactor = 0.34f, metallicFactor = 0.25f),
                 isTouchable = true
             )
         )
@@ -63,6 +64,7 @@ object LocalSandboxBuilder {
                 position = Vec3(128f, 134f, groundZ(128f, 134f, 4.2f)),
                 scale = Vec3(2.2f, 2.2f, 3.0f),
                 color = ColorRgba(0.22f, 0.78f, 0.98f, 0.88f),
+                defaultMaterial = FaceMaterialParams(shininess = 3, glow = 0.55f, fullbright = true, roughnessFactor = 0.08f),
                 isFullbright = true,
                 isScripted = true
             )
@@ -76,6 +78,7 @@ object LocalSandboxBuilder {
                 position = Vec3(128f, 134f, groundZ(128f, 134f, 4.2f)),
                 scale = Vec3(5.6f, 5.6f, 5.6f),
                 color = ColorRgba(0.96f, 0.62f, 0.06f, 0.95f),
+                defaultMaterial = FaceMaterialParams(shininess = 3, glow = 0.38f, metallicFactor = 0.88f, roughnessFactor = 0.16f),
                 isFullbright = true,
                 isScripted = true
             )
@@ -97,6 +100,7 @@ object LocalSandboxBuilder {
                     rotation = Quat.fromYaw(ang),
                     scale = Vec3(1.5f, 1.5f, h),
                     color = if (idx % 2 == 0) ColorRgba(0.16f, 0.22f, 0.32f, 1f) else ColorRgba(0.20f, 0.30f, 0.42f, 1f),
+                    defaultMaterial = FaceMaterialParams(shininess = 3, bumpiness = 4, metallicFactor = 0.65f, roughnessFactor = 0.20f),
                     isTouchable = true
                 )
             )
@@ -112,6 +116,7 @@ object LocalSandboxBuilder {
                 position = Vec3(108f, 128f, 21.8f),
                 scale = Vec3(22f, 4.2f, 0.35f),
                 color = ColorRgba(0.24f, 0.72f, 0.92f, 0.56f),
+                defaultMaterial = FaceMaterialParams(shininess = 3, roughnessFactor = 0.08f, metallicFactor = 0.12f),
                 isPhantom = false
             )
         )
@@ -128,6 +133,34 @@ object LocalSandboxBuilder {
                 scale = Vec3(2.8f, 0.9f, 0.75f),
                 color = ColorRgba(0.55f, 0.36f, 0.22f, 1f),
                 isScripted = true
+            )
+        )
+
+        // Independent Rigged Animesh Companion (`AnimatedObject` + glTF 2.0 PBR metallic-roughness)
+        objs.add(
+            SceneObject(
+                localId = nextId++,
+                uuid = UUID.fromString("44444444-4444-4444-8444-444444444444"),
+                name = "Animesh Plaza Sentinel",
+                description = "Independent AnimatedObject (Animesh) pseudo-avatar with glTF 2.0 PBR metallic-roughness shading",
+                shape = PrimShape.CYLINDER,
+                position = Vec3(132.5f, 125.5f, groundZ(132.5f, 125.5f, 0.92f)),
+                rotation = Quat.fromYaw(2.45f),
+                scale = Vec3(0.62f, 0.48f, 1.84f),
+                color = ColorRgba(0.82f, 0.88f, 0.96f, 1f),
+                defaultMaterial = FaceMaterialParams(
+                    shininess = 3,
+                    metallicFactor = 0.84f,
+                    roughnessFactor = 0.20f,
+                    emissiveColor = Vec3(0.06f, 0.24f, 0.34f),
+                    doubleSided = false,
+                    hasGltfMaterial = true
+                ),
+                isAnimesh = true,
+                activeAnimationIds = listOf(AvatarAnimationCatalog.ANIM_AGENT_DANCE1),
+                animState = AvatarAnimState.DANCE,
+                isScripted = true,
+                isTouchable = true
             )
         )
 
@@ -152,6 +185,7 @@ object LocalSandboxBuilder {
                 position = Vec3(156f, 150f, groundZ(156f, 150f, 14.8f)),
                 scale = Vec3(2.6f, 2.6f, 2.6f),
                 color = ColorRgba(1.0f, 0.68f, 0.14f, 1f),
+                defaultMaterial = FaceMaterialParams(shininess = 3, glow = 0.75f, fullbright = true),
                 isFullbright = true,
                 isScripted = true
             )
@@ -244,6 +278,8 @@ object LocalSandboxBuilder {
                 legacyName = "Greeter Resident",
                 position = Vec3(134f, 130f, guideZ),
                 yaw = -2.35f,
+                animState = AvatarAnimState.STAND,
+                isTyping = true,
                 shirtColor = ColorRgba(0.96f, 0.62f, 0.08f, 1f),
                 wearableCount = 8,
                 visualParamsCount = 218,
@@ -260,6 +296,7 @@ object LocalSandboxBuilder {
                 legacyName = "SkyPatrol Resident",
                 position = Vec3(119f, 133f, pilotZ),
                 yaw = -0.6f,
+                animState = AvatarAnimState.FLY,
                 isFlying = true,
                 shirtColor = ColorRgba(0.08f, 0.76f, 0.56f, 1f),
                 heightMeters = 1.94f,

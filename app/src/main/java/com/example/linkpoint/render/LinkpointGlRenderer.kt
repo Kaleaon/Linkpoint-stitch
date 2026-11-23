@@ -8,18 +8,22 @@ import android.opengl.Matrix
 import com.example.linkpoint.protocol.DecodedMeshAsset
 import com.example.linkpoint.protocol.DecodedSubmesh
 import com.example.linkpoint.protocol.SlBinaryParsers
+import com.example.linkpoint.scene.AvatarAnimState
 import com.example.linkpoint.scene.AvatarEntity
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.AvatarSkeletonHierarchy
 import com.example.linkpoint.scene.CameraMode
 import com.example.linkpoint.scene.ColorRgba
 import com.example.linkpoint.scene.EnvironmentPreset
+import com.example.linkpoint.scene.FaceMaterialParams
 import com.example.linkpoint.scene.HudAttachmentPoint
 import com.example.linkpoint.scene.HudHitResult
 import com.example.linkpoint.scene.HudSafeRect
+import com.example.linkpoint.scene.MaterialAlphaMode
 import com.example.linkpoint.scene.PrimShape
 import com.example.linkpoint.scene.ProjectedNametag
 import com.example.linkpoint.scene.Quat
+import com.example.linkpoint.scene.RegionEnvironmentSettings
 import com.example.linkpoint.scene.SceneObject
 import com.example.linkpoint.scene.TerrainGrid
 import com.example.linkpoint.scene.Vec3
@@ -45,7 +49,8 @@ data class RenderSceneSnapshot(
     val avatars: List<AvatarEntity> = emptyList(),
     val selectedLocalId: Int? = null,
     val selectedAvatarId: UUID? = null,
-    val environment: EnvironmentPreset = EnvironmentPreset.TWILIGHT,
+    val environment: EnvironmentPreset = EnvironmentPreset.AUTO_REGION_EEP,
+    val regionEnvironment: RegionEnvironmentSettings? = null,
     val cameraMode: CameraMode = CameraMode.FOLLOW,
     val drawDistance: Float = 128f,
     val hudSafeRect: HudSafeRect = HudSafeRect(),
@@ -53,7 +58,15 @@ data class RenderSceneSnapshot(
     val hudGlobalScale: Float = 1.0f,
     val hudTouchFlashLocalId: Int? = null,
     val hudTouchFlashUntilMs: Long = 0L
-)
+) {
+    fun effectiveEnvironment(): RegionEnvironmentSettings {
+        return if (environment == EnvironmentPreset.AUTO_REGION_EEP && regionEnvironment != null) {
+            regionEnvironment
+        } else {
+            environment.toRegionEnvironmentSettings()
+        }
+    }
+}
 
 /**
  * High-Performance Native OpenGL ES 3.0 Dual-Pass Renderer for Linkpoint:
@@ -128,8 +141,11 @@ class LinkpointGlRenderer(
         val uZenith: Int,
         val uHorizon: Int,
         val uSunColor: Int,
+        val uSunDir: Int,
         val uTime: Int,
-        val uPitch: Int
+        val uPitch: Int,
+        val uCloudDensity: Int,
+        val uHazeDensity: Int
     )
 
     private data class TerrainLocs(
@@ -143,7 +159,8 @@ class LinkpointGlRenderer(
         val uSunColor: Int,
         val uFogColor: Int,
         val uEyePos: Int,
-        val uAmbient: Int
+        val uAmbient: Int,
+        val uHazeDensity: Int
     )
 
     private data class PrimLocs(
@@ -156,13 +173,25 @@ class LinkpointGlRenderer(
         val uSunDir: Int,
         val uSunColor: Int,
         val uFogColor: Int,
+        val uSkyZenith: Int,
         val uEyePos: Int,
         val uAmbient: Int,
+        val uHazeDensity: Int,
         val uColor: Int,
         val uFullbright: Int,
         val uSelectedPulse: Int,
+        val uMaterialParams: Int,
+        val uAlphaParams: Int,
+        val uEmissiveFactor: Int,
+        val uPbrExtraParams: Int,
         val uTex: Int,
-        val uUseTex: Int
+        val uUseTex: Int,
+        val uMetallicRoughnessTex: Int,
+        val uUseMetallicRoughnessTex: Int,
+        val uNormalTex: Int,
+        val uUseNormalTex: Int,
+        val uEmissiveTex: Int,
+        val uUseEmissiveTex: Int
     )
 
     private data class WaterLocs(
@@ -172,7 +201,12 @@ class LinkpointGlRenderer(
         val uTime: Int,
         val uWaterTint: Int,
         val uHorizon: Int,
-        val uEyePos: Int
+        val uZenith: Int,
+        val uSunDir: Int,
+        val uSunColor: Int,
+        val uEyePos: Int,
+        val uNormalScale: Int,
+        val uFresnelParams: Int
     )
 
     private data class HudLocs(
@@ -248,6 +282,10 @@ class LinkpointGlRenderer(
 
     // Per-frame GL state caches to avoid redundant binds
     private var activeBoundTextureId = -1
+    private var activeBoundOrmTexId = -1
+    private var activeBoundNormalTexId = -1
+    private var activeBoundEmissiveTexId = -1
+    private var activeCullBackfaces = false
     private var activeBoundVboId = -1
     private var activeBoundIboId = -1
 
@@ -302,11 +340,11 @@ class LinkpointGlRenderer(
         GLES30.glBlendFunc(GLES30.GL_SRC_ALPHA, GLES30.GL_ONE_MINUS_SRC_ALPHA)
         GLES30.glClearColor(0.04f, 0.06f, 0.10f, 1f)
 
-        skyProgram = compileProgram(SKY_VS, SKY_FS)
-        terrainProgram = compileProgram(WORLD_VS, TERRAIN_FS)
-        primProgram = compileProgram(WORLD_VS, PRIM_FS)
-        waterProgram = compileProgram(WATER_VS, WATER_FS)
-        hudProgram = compileProgram(HUD_VS, HUD_FS)
+        skyProgram = compileProgram(RenderShaders.SKY_VS, RenderShaders.SKY_FS)
+        terrainProgram = compileProgram(RenderShaders.WORLD_VS, RenderShaders.TERRAIN_FS)
+        primProgram = compileProgram(RenderShaders.WORLD_VS, RenderShaders.PRIM_FS)
+        waterProgram = compileProgram(RenderShaders.WATER_VS, RenderShaders.WATER_FS)
+        hudProgram = compileProgram(RenderShaders.HUD_VS, RenderShaders.HUD_FS)
 
         cacheShaderLocations()
 
@@ -353,8 +391,11 @@ class LinkpointGlRenderer(
             uZenith = GLES30.glGetUniformLocation(skyProgram, "uZenith"),
             uHorizon = GLES30.glGetUniformLocation(skyProgram, "uHorizon"),
             uSunColor = GLES30.glGetUniformLocation(skyProgram, "uSunColor"),
+            uSunDir = GLES30.glGetUniformLocation(skyProgram, "uSunDir"),
             uTime = GLES30.glGetUniformLocation(skyProgram, "uTime"),
-            uPitch = GLES30.glGetUniformLocation(skyProgram, "uPitch")
+            uPitch = GLES30.glGetUniformLocation(skyProgram, "uPitch"),
+            uCloudDensity = GLES30.glGetUniformLocation(skyProgram, "uCloudDensity"),
+            uHazeDensity = GLES30.glGetUniformLocation(skyProgram, "uHazeDensity")
         )
         terrainLocs = TerrainLocs(
             aPos = GLES30.glGetAttribLocation(terrainProgram, "aPos"),
@@ -367,7 +408,8 @@ class LinkpointGlRenderer(
             uSunColor = GLES30.glGetUniformLocation(terrainProgram, "uSunColor"),
             uFogColor = GLES30.glGetUniformLocation(terrainProgram, "uFogColor"),
             uEyePos = GLES30.glGetUniformLocation(terrainProgram, "uEyePos"),
-            uAmbient = GLES30.glGetUniformLocation(terrainProgram, "uAmbient")
+            uAmbient = GLES30.glGetUniformLocation(terrainProgram, "uAmbient"),
+            uHazeDensity = GLES30.glGetUniformLocation(terrainProgram, "uHazeDensity")
         )
         primLocs = PrimLocs(
             aPos = GLES30.glGetAttribLocation(primProgram, "aPos"),
@@ -379,13 +421,25 @@ class LinkpointGlRenderer(
             uSunDir = GLES30.glGetUniformLocation(primProgram, "uSunDir"),
             uSunColor = GLES30.glGetUniformLocation(primProgram, "uSunColor"),
             uFogColor = GLES30.glGetUniformLocation(primProgram, "uFogColor"),
+            uSkyZenith = GLES30.glGetUniformLocation(primProgram, "uSkyZenith"),
             uEyePos = GLES30.glGetUniformLocation(primProgram, "uEyePos"),
             uAmbient = GLES30.glGetUniformLocation(primProgram, "uAmbient"),
+            uHazeDensity = GLES30.glGetUniformLocation(primProgram, "uHazeDensity"),
             uColor = GLES30.glGetUniformLocation(primProgram, "uColor"),
             uFullbright = GLES30.glGetUniformLocation(primProgram, "uFullbright"),
             uSelectedPulse = GLES30.glGetUniformLocation(primProgram, "uSelectedPulse"),
+            uMaterialParams = GLES30.glGetUniformLocation(primProgram, "uMaterialParams"),
+            uAlphaParams = GLES30.glGetUniformLocation(primProgram, "uAlphaParams"),
+            uEmissiveFactor = GLES30.glGetUniformLocation(primProgram, "uEmissiveFactor"),
+            uPbrExtraParams = GLES30.glGetUniformLocation(primProgram, "uPbrExtraParams"),
             uTex = GLES30.glGetUniformLocation(primProgram, "uTex"),
-            uUseTex = GLES30.glGetUniformLocation(primProgram, "uUseTex")
+            uUseTex = GLES30.glGetUniformLocation(primProgram, "uUseTex"),
+            uMetallicRoughnessTex = GLES30.glGetUniformLocation(primProgram, "uMetallicRoughnessTex"),
+            uUseMetallicRoughnessTex = GLES30.glGetUniformLocation(primProgram, "uUseMetallicRoughnessTex"),
+            uNormalTex = GLES30.glGetUniformLocation(primProgram, "uNormalTex"),
+            uUseNormalTex = GLES30.glGetUniformLocation(primProgram, "uUseNormalTex"),
+            uEmissiveTex = GLES30.glGetUniformLocation(primProgram, "uEmissiveTex"),
+            uUseEmissiveTex = GLES30.glGetUniformLocation(primProgram, "uUseEmissiveTex")
         )
         waterLocs = WaterLocs(
             aPos = GLES30.glGetAttribLocation(waterProgram, "aPos"),
@@ -394,7 +448,12 @@ class LinkpointGlRenderer(
             uTime = GLES30.glGetUniformLocation(waterProgram, "uTime"),
             uWaterTint = GLES30.glGetUniformLocation(waterProgram, "uWaterTint"),
             uHorizon = GLES30.glGetUniformLocation(waterProgram, "uHorizon"),
-            uEyePos = GLES30.glGetUniformLocation(waterProgram, "uEyePos")
+            uZenith = GLES30.glGetUniformLocation(waterProgram, "uZenith"),
+            uSunDir = GLES30.glGetUniformLocation(waterProgram, "uSunDir"),
+            uSunColor = GLES30.glGetUniformLocation(waterProgram, "uSunColor"),
+            uEyePos = GLES30.glGetUniformLocation(waterProgram, "uEyePos"),
+            uNormalScale = GLES30.glGetUniformLocation(waterProgram, "uNormalScale"),
+            uFresnelParams = GLES30.glGetUniformLocation(waterProgram, "uFresnelParams")
         )
         hudLocs = HudLocs(
             aPos = GLES30.glGetAttribLocation(hudProgram, "aPos"),
@@ -448,7 +507,7 @@ class LinkpointGlRenderer(
 
         var ibo = 0
         var idxCount = 0
-        if (useIndexed && indices != null) {
+        if (indices != null && sub.indexCount > 0) {
             ibo = glIdScratch[1]
             idxCount = sub.indexCount
             val idxBuf = ByteBuffer.allocateDirect(idxCount * 2)
@@ -545,23 +604,25 @@ class LinkpointGlRenderer(
         }
         extractFrustumPlanes(vpMatrix, frustumPlanes)
 
+        val activeEnv = snapshot.effectiveEnvironment()
+
         // PASS 1A: Sky Dome (depth write off)
-        drawSkyDome(snapshot.environment, elapsedSec)
+        drawSkyDome(activeEnv, elapsedSec)
 
         // PASS 1B: 256m Terrain Heightfield
         GLES30.glEnable(GLES30.GL_DEPTH_TEST)
         GLES30.glDepthMask(true)
-        terrainMesh?.let { drawTerrain(it, snapshot.environment, eye) }
+        terrainMesh?.let { drawTerrain(it, activeEnv, eye) }
 
         // PASS 1C: Opaque World Meshes/Prims & Real Avatars + Worn Attachments
-        drawWorldObjects(snapshot, eye, elapsedSec, drawDist, translucentPass = false)
-        drawAvatars(snapshot, eye, elapsedSec, drawDist)
+        drawWorldObjects(snapshot, activeEnv, eye, elapsedSec, drawDist, translucentPass = false)
+        drawAvatars(snapshot, activeEnv, eye, elapsedSec, drawDist)
 
         // PASS 1D: Animated Translucent Water Plane
-        drawWater(snapshot.terrain.waterHeight, snapshot.environment, eye, elapsedSec)
+        drawWater(snapshot.terrain.waterHeight, activeEnv, eye, elapsedSec)
 
         // PASS 1E: Translucent World Meshes/Prims
-        drawWorldObjects(snapshot, eye, elapsedSec, drawDist, translucentPass = true)
+        drawWorldObjects(snapshot, activeEnv, eye, elapsedSec, drawDist, translucentPass = true)
 
         // PASS 2: Orthographic Avatar Attachment HUDs (SL Slots 31..38) inside Adaptive HudSafeRect
         val nowMs = System.currentTimeMillis()
@@ -710,6 +771,7 @@ class LinkpointGlRenderer(
         val glTex = textureId?.let { gpuTextureCache[it] }
         return if (glTex != null && glTex != 0) {
             if (activeBoundTextureId != glTex) {
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
                 GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, glTex)
                 activeBoundTextureId = glTex
             }
@@ -721,22 +783,119 @@ class LinkpointGlRenderer(
         }
     }
 
+    private fun bindPbrAuxTextureCached(unitIndex: Int, textureId: UUID?, useTexLoc: Int): Boolean {
+        val glTex = textureId?.let { gpuTextureCache[it] }
+        return if (glTex != null && glTex != 0) {
+            val prevBound = when (unitIndex) {
+                1 -> activeBoundOrmTexId
+                2 -> activeBoundNormalTexId
+                3 -> activeBoundEmissiveTexId
+                else -> -1
+            }
+            if (prevBound != glTex) {
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0 + unitIndex)
+                GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, glTex)
+                when (unitIndex) {
+                    1 -> activeBoundOrmTexId = glTex
+                    2 -> activeBoundNormalTexId = glTex
+                    3 -> activeBoundEmissiveTexId = glTex
+                }
+                GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+            }
+            GLES30.glUniform1f(useTexLoc, 1f)
+            true
+        } else {
+            GLES30.glUniform1f(useTexLoc, 0f)
+            false
+        }
+    }
+
+    private fun setCullBackfaces(cullBack: Boolean) {
+        if (activeCullBackfaces != cullBack) {
+            activeCullBackfaces = cullBack
+            if (cullBack) {
+                GLES30.glEnable(GLES30.GL_CULL_FACE)
+                GLES30.glCullFace(GLES30.GL_BACK)
+            } else {
+                GLES30.glDisable(GLES30.GL_CULL_FACE)
+            }
+        }
+    }
+
     private fun resetBatchBindings() {
         activeBoundTextureId = -1
+        activeBoundOrmTexId = -1
+        activeBoundNormalTexId = -1
+        activeBoundEmissiveTexId = -1
         activeBoundVboId = -1
         activeBoundIboId = -1
     }
 
-    private fun drawSkyDome(env: EnvironmentPreset, timeSec: Float) {
+    private fun uploadMaterialUniforms(mat: FaceMaterialParams, objectFullbright: Boolean) {
+        val singleSided = mat.hasGltfMaterial && !mat.doubleSided
+        setCullBackfaces(singleSided)
+
+        GLES30.glUniform1f(primLocs.uFullbright, if (objectFullbright || mat.fullbright) 1f else 0f)
+        GLES30.glUniform4f(
+            primLocs.uMaterialParams,
+            mat.effectiveMetallic,
+            mat.effectiveRoughness,
+            mat.glow.coerceIn(0f, 1f),
+            mat.effectiveBumpStrength
+        )
+        GLES30.glUniform2f(
+            primLocs.uAlphaParams,
+            mat.alphaMode.code.toFloat(),
+            mat.alphaCutoff
+        )
+        GLES30.glUniform3f(
+            primLocs.uEmissiveFactor,
+            mat.emissiveColor.x.coerceAtLeast(0f),
+            mat.emissiveColor.y.coerceAtLeast(0f),
+            mat.emissiveColor.z.coerceAtLeast(0f)
+        )
+        GLES30.glUniform3f(
+            primLocs.uPbrExtraParams,
+            mat.normalScale,
+            mat.occlusionStrength.coerceIn(0f, 1f),
+            if (singleSided) 0f else 1f
+        )
+
+        bindPbrAuxTextureCached(1, mat.metallicRoughnessTextureId, primLocs.uUseMetallicRoughnessTex)
+        bindPbrAuxTextureCached(2, mat.normalTextureId, primLocs.uUseNormalTex)
+        bindPbrAuxTextureCached(3, mat.emissiveTextureId, primLocs.uUseEmissiveTex)
+    }
+
+    private fun bindPrimEnvironmentUniforms(env: RegionEnvironmentSettings, eye: Vec3) {
+        val sDir = env.sunDirection.normalized()
+        GLES30.glUniform3f(primLocs.uSunDir, sDir.x, sDir.y, sDir.z)
+        GLES30.glUniform3f(primLocs.uSunColor, env.sunlightColor.r, env.sunlightColor.g, env.sunlightColor.b)
+        GLES30.glUniform3f(primLocs.uFogColor, env.horizonColor.r, env.horizonColor.g, env.horizonColor.b)
+        GLES30.glUniform3f(primLocs.uSkyZenith, env.zenithColor.r, env.zenithColor.g, env.zenithColor.b)
+        GLES30.glUniform3f(primLocs.uEyePos, eye.x, eye.y, eye.z)
+        GLES30.glUniform1f(primLocs.uAmbient, env.ambientStrength)
+        GLES30.glUniform1f(primLocs.uHazeDensity, env.hazeDensity)
+        GLES30.glUniform1i(primLocs.uTex, 0)
+        GLES30.glUniform1i(primLocs.uMetallicRoughnessTex, 1)
+        GLES30.glUniform1i(primLocs.uNormalTex, 2)
+        GLES30.glUniform1i(primLocs.uEmissiveTex, 3)
+        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
+    }
+
+    private fun drawSkyDome(env: RegionEnvironmentSettings, timeSec: Float) {
         GLES30.glDisable(GLES30.GL_DEPTH_TEST)
         GLES30.glDepthMask(false)
         GLES30.glUseProgram(skyProgram)
 
-        GLES30.glUniform3f(skyLocs.uZenith, env.zenith.r, env.zenith.g, env.zenith.b)
-        GLES30.glUniform3f(skyLocs.uHorizon, env.horizon.r, env.horizon.g, env.horizon.b)
-        GLES30.glUniform3f(skyLocs.uSunColor, env.sunColor.r, env.sunColor.g, env.sunColor.b)
+        val sDir = env.sunDirection.normalized()
+        GLES30.glUniform3f(skyLocs.uZenith, env.zenithColor.r, env.zenithColor.g, env.zenithColor.b)
+        GLES30.glUniform3f(skyLocs.uHorizon, env.horizonColor.r, env.horizonColor.g, env.horizonColor.b)
+        GLES30.glUniform3f(skyLocs.uSunColor, env.sunlightColor.r, env.sunlightColor.g, env.sunlightColor.b)
+        GLES30.glUniform3f(skyLocs.uSunDir, sDir.x, sDir.y, sDir.z)
         GLES30.glUniform1f(skyLocs.uTime, timeSec)
         GLES30.glUniform1f(skyLocs.uPitch, orbitCamera.pitch)
+        GLES30.glUniform1f(skyLocs.uCloudDensity, env.cloudDensity)
+        GLES30.glUniform1f(skyLocs.uHazeDensity, env.hazeDensity)
 
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, skyQuadVbo)
         GLES30.glEnableVertexAttribArray(skyLocs.aPos)
@@ -746,7 +905,7 @@ class LinkpointGlRenderer(
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
     }
 
-    private fun drawTerrain(mesh: GpuMeshBuffer, env: EnvironmentPreset, eye: Vec3) {
+    private fun drawTerrain(mesh: GpuMeshBuffer, env: RegionEnvironmentSettings, eye: Vec3) {
         GLES30.glUseProgram(terrainProgram)
         Matrix.setIdentityM(modelMatrix, 0)
         Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
@@ -755,12 +914,13 @@ class LinkpointGlRenderer(
         GLES30.glUniformMatrix4fv(terrainLocs.uMvp, 1, false, mvpMatrix, 0)
         GLES30.glUniformMatrix4fv(terrainLocs.uModel, 1, false, modelMatrix, 0)
         GLES30.glUniformMatrix3fv(terrainLocs.uNormalMat, 1, false, normalMatrix3, 0)
-        val sDir = env.sunDir.normalized()
+        val sDir = env.sunDirection.normalized()
         GLES30.glUniform3f(terrainLocs.uSunDir, sDir.x, sDir.y, sDir.z)
-        GLES30.glUniform3f(terrainLocs.uSunColor, env.sunColor.r, env.sunColor.g, env.sunColor.b)
-        GLES30.glUniform3f(terrainLocs.uFogColor, env.horizon.r, env.horizon.g, env.horizon.b)
+        GLES30.glUniform3f(terrainLocs.uSunColor, env.sunlightColor.r, env.sunlightColor.g, env.sunlightColor.b)
+        GLES30.glUniform3f(terrainLocs.uFogColor, env.horizonColor.r, env.horizonColor.g, env.horizonColor.b)
         GLES30.glUniform3f(terrainLocs.uEyePos, eye.x, eye.y, eye.z)
         GLES30.glUniform1f(terrainLocs.uAmbient, env.ambientStrength)
+        GLES30.glUniform1f(terrainLocs.uHazeDensity, env.hazeDensity)
 
         resetBatchBindings()
         enableVertexAttribs(terrainLocs.aPos, terrainLocs.aNormal, terrainLocs.aUv)
@@ -771,29 +931,39 @@ class LinkpointGlRenderer(
 
     private fun drawWorldObjects(
         snapshot: RenderSceneSnapshot,
+        env: RegionEnvironmentSettings,
         eye: Vec3,
         timeSec: Float,
         drawDistance: Float,
         translucentPass: Boolean
     ) {
         GLES30.glUseProgram(primProgram)
-        val env = snapshot.environment
-        val sDir = env.sunDir.normalized()
-        GLES30.glUniform3f(primLocs.uSunDir, sDir.x, sDir.y, sDir.z)
-        GLES30.glUniform3f(primLocs.uSunColor, env.sunColor.r, env.sunColor.g, env.sunColor.b)
-        GLES30.glUniform3f(primLocs.uFogColor, env.horizon.r, env.horizon.g, env.horizon.b)
-        GLES30.glUniform3f(primLocs.uEyePos, eye.x, eye.y, eye.z)
-        GLES30.glUniform1f(primLocs.uAmbient, env.ambientStrength)
-        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glUniform1i(primLocs.uTex, 0)
+        bindPrimEnvironmentUniforms(env, eye)
 
         resetBatchBindings()
         enableVertexAttribs(primLocs.aPos, primLocs.aNormal, primLocs.aUv)
 
         for (obj in snapshot.worldObjects) {
             if (obj.shape == PrimShape.AVATAR) continue
-            val isTranslucent = obj.color.a < 0.98f
-            if (isTranslucent != translucentPass) continue
+            val streamedMesh = obj.meshAssetId?.let { gpuMeshCache[it] }
+            if (streamedMesh == null && obj.isMesh) continue
+
+            if (streamedMesh == null) {
+                val mat0 = obj.materialForFace(0)
+                val isTranslucent = mat0.alphaMode == MaterialAlphaMode.BLEND && obj.color.a < 0.98f
+                if (isTranslucent != translucentPass) continue
+            } else if (translucentPass) {
+                var anyTranslucentSubmesh = false
+                for ((faceIdx, _) in streamedMesh.submeshes) {
+                    val col = obj.faceColors[faceIdx] ?: obj.color
+                    val mat = obj.materialForFace(faceIdx)
+                    if (mat.alphaMode == MaterialAlphaMode.BLEND && col.a < 0.98f) {
+                        anyTranslucentSubmesh = true
+                        break
+                    }
+                }
+                if (!anyTranslucentSubmesh) continue
+            }
 
             // Fast draw-distance + 6-plane frustum sphere cull
             val maxDim = maxOf(obj.scale.x, obj.scale.y, obj.scale.z)
@@ -802,12 +972,30 @@ class LinkpointGlRenderer(
                 continue
             }
 
-            val streamedMesh = obj.meshAssetId?.let { gpuMeshCache[it] }
-            if (streamedMesh == null && obj.isMesh) continue
-
             Matrix.setIdentityM(modelMatrix, 0)
-            Matrix.translateM(modelMatrix, 0, obj.position.x, obj.position.y, obj.position.z)
-            multiplyQuatRotation(modelMatrix, obj.rotation)
+            if (obj.isAnimesh) {
+                // Animesh (`AnimatedObject`): articulate independent pseudo-avatar skeletal pose
+                val phase = ((obj.uuid.leastSignificantBits and 0xFFFFL).toFloat() / 65535f) * 6.283f
+                val animPose = AvatarSkeletonHierarchy.evaluateProceduralBodyPose(
+                    animState = obj.animState,
+                    isTyping = false,
+                    timeSec = timeSec,
+                    heightMeters = obj.scale.z.coerceIn(0.6f, 3.0f),
+                    phaseOffset = phase
+                )
+                val worldPelvisShift = obj.rotation.rotate(animPose.pelvisOffset)
+                Matrix.translateM(
+                    modelMatrix, 0,
+                    obj.position.x + worldPelvisShift.x,
+                    obj.position.y + worldPelvisShift.y,
+                    obj.position.z + worldPelvisShift.z
+                )
+                multiplyQuatRotation(modelMatrix, obj.rotation)
+                multiplyQuatRotation(modelMatrix, (animPose.lowerBodyRotation * animPose.upperBodyRotation).normalized())
+            } else {
+                Matrix.translateM(modelMatrix, 0, obj.position.x, obj.position.y, obj.position.z)
+                multiplyQuatRotation(modelMatrix, obj.rotation)
+            }
             Matrix.scaleM(
                 modelMatrix, 0,
                 obj.scale.x.coerceAtLeast(0.005f),
@@ -820,21 +1008,27 @@ class LinkpointGlRenderer(
             GLES30.glUniformMatrix4fv(primLocs.uMvp, 1, false, mvpMatrix, 0)
             GLES30.glUniformMatrix4fv(primLocs.uModel, 1, false, modelMatrix, 0)
             GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
-            GLES30.glUniform1f(primLocs.uFullbright, if (obj.isFullbright) 1f else 0f)
             val pulse = if (snapshot.selectedLocalId == obj.localId) 0.55f + 0.45f * sin(timeSec * 5f) else 0f
             GLES30.glUniform1f(primLocs.uSelectedPulse, pulse)
 
             if (streamedMesh != null) {
                 for ((faceIdx, submesh) in streamedMesh.submeshes) {
-                    val faceTex = obj.faceTextures[faceIdx] ?: obj.defaultTextureId
-                    val faceCol = obj.faceColors[faceIdx] ?: obj.color
+                    val faceMat = obj.materialForFace(faceIdx)
+                    val faceTex = faceMat.baseColorTextureId ?: obj.faceTextures[faceIdx] ?: obj.defaultTextureId
+                    val faceCol = faceMat.baseColorFactor ?: obj.faceColors[faceIdx] ?: obj.color
+                    val faceTranslucent = faceMat.alphaMode == MaterialAlphaMode.BLEND && faceCol.a < 0.98f
+                    if (faceTranslucent != translucentPass) continue
                     if (SlBinaryParsers.isTransparentFace(faceTex, faceCol)) continue
                     bindTextureCached(faceTex, primLocs.uUseTex)
+                    uploadMaterialUniforms(faceMat, obj.isFullbright)
                     GLES30.glUniform4f(primLocs.uColor, faceCol.r, faceCol.g, faceCol.b, faceCol.a)
                     drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, submesh)
                 }
             } else {
-                if (SlBinaryParsers.isTransparentFace(obj.defaultTextureId, obj.color)) continue
+                val mat0 = obj.materialForFace(0)
+                val baseTex = mat0.baseColorTextureId ?: obj.defaultTextureId
+                val baseCol = mat0.baseColorFactor ?: obj.color
+                if (SlBinaryParsers.isTransparentFace(baseTex, baseCol)) continue
                 val primMesh = when (obj.shape) {
                     PrimShape.BOX -> boxMesh
                     PrimShape.CYLINDER -> cylinderMesh
@@ -843,30 +1037,30 @@ class LinkpointGlRenderer(
                     PrimShape.PRISM -> prismMesh
                     PrimShape.AVATAR -> continue
                 }
-                bindTextureCached(obj.defaultTextureId, primLocs.uUseTex)
-                GLES30.glUniform4f(primLocs.uColor, obj.color.r, obj.color.g, obj.color.b, obj.color.a)
+                bindTextureCached(baseTex, primLocs.uUseTex)
+                uploadMaterialUniforms(mat0, obj.isFullbright)
+                GLES30.glUniform4f(primLocs.uColor, baseCol.r, baseCol.g, baseCol.b, baseCol.a)
                 drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, primMesh)
             }
         }
 
+        setCullBackfaces(false)
         disableVertexAttribs(primLocs.aPos, primLocs.aNormal, primLocs.aUv)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
         GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
     }
 
-    private fun drawAvatars(snapshot: RenderSceneSnapshot, eye: Vec3, timeSec: Float, drawDistance: Float) {
+    private fun drawAvatars(
+        snapshot: RenderSceneSnapshot,
+        env: RegionEnvironmentSettings,
+        eye: Vec3,
+        timeSec: Float,
+        drawDistance: Float
+    ) {
         if (snapshot.avatars.isEmpty()) return
         GLES30.glUseProgram(primProgram)
-        val env = snapshot.environment
-        val sDir = env.sunDir.normalized()
-        GLES30.glUniform3f(primLocs.uSunDir, sDir.x, sDir.y, sDir.z)
-        GLES30.glUniform3f(primLocs.uSunColor, env.sunColor.r, env.sunColor.g, env.sunColor.b)
-        GLES30.glUniform3f(primLocs.uFogColor, env.horizon.r, env.horizon.g, env.horizon.b)
-        GLES30.glUniform3f(primLocs.uEyePos, eye.x, eye.y, eye.z)
-        GLES30.glUniform1f(primLocs.uAmbient, env.ambientStrength)
-        GLES30.glActiveTexture(GLES30.GL_TEXTURE0)
-        GLES30.glUniform1i(primLocs.uTex, 0)
+        bindPrimEnvironmentUniforms(env, eye)
 
         resetBatchBindings()
         enableVertexAttribs(primLocs.aPos, primLocs.aNormal, primLocs.aUv)
@@ -877,9 +1071,30 @@ class LinkpointGlRenderer(
                 continue
             }
 
-            val yawDeg = av.yaw * 180f / PI.toFloat()
-            val bob = if (av.isFlying) sin(timeSec * 3.2f) * 0.10f else 0f
-            val pelvisZ = av.position.z + bob
+            val phase = ((av.agentId.leastSignificantBits and 0xFFFFL).toFloat() / 65535f) * 6.283f
+            val effectiveAnim = when {
+                av.animState != AvatarAnimState.STAND -> av.animState
+                av.isSitting -> AvatarAnimState.SIT
+                av.isFlying -> AvatarAnimState.HOVER
+                else -> AvatarAnimState.STAND
+            }
+            val bodyPose = AvatarSkeletonHierarchy.evaluateProceduralBodyPose(
+                animState = effectiveAnim,
+                isTyping = av.isTyping,
+                timeSec = timeSec,
+                heightMeters = av.heightMeters,
+                phaseOffset = phase
+            )
+            val baseWorldRot = if (av.parentId != 0) {
+                av.worldRotation.normalized()
+            } else {
+                Quat.fromYaw(av.yaw)
+            }
+            val worldPelvisShift = baseWorldRot.rotate(bodyPose.pelvisOffset)
+            val pelvisX = av.position.x + worldPelvisShift.x
+            val pelvisY = av.position.y + worldPelvisShift.y
+            val pelvisZ = av.position.z + worldPelvisShift.z
+
             val hScale = (av.heightMeters / 1.82f).coerceIn(0.68f, 1.38f)
             val torsoS = av.torsoScale.coerceIn(0.80f, 1.30f)
             val shoulderS = av.shoulderScale.coerceIn(0.82f, 1.28f)
@@ -900,16 +1115,11 @@ class LinkpointGlRenderer(
                 }
             }
 
-            fun drawClassicPart(
+            fun drawClassicMeshWithCurrentModel(
                 mesh: GpuMeshBuffer,
-                sx: Float, sy: Float, sz: Float,
                 fallbackColor: ColorRgba,
                 bakedTexId: UUID? = null
             ) {
-                Matrix.setIdentityM(modelMatrix, 0)
-                Matrix.translateM(modelMatrix, 0, av.position.x, av.position.y, pelvisZ)
-                Matrix.rotateM(modelMatrix, 0, yawDeg, 0f, 0f, 1f)
-                Matrix.scaleM(modelMatrix, 0, sx, sy, sz)
                 Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
                 computeNormalMat3(modelMatrix, normalMatrix3)
 
@@ -919,26 +1129,54 @@ class LinkpointGlRenderer(
                 GLES30.glUniformMatrix4fv(primLocs.uModel, 1, false, modelMatrix, 0)
                 GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
                 GLES30.glUniform4f(primLocs.uColor, tint.r, tint.g, tint.b, tint.a)
-                GLES30.glUniform1f(primLocs.uFullbright, 0f)
+                uploadMaterialUniforms(AVATAR_CLASSIC_MATERIAL, objectFullbright = false)
                 GLES30.glUniform1f(primLocs.uSelectedPulse, avPulse)
                 drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, mesh)
             }
 
-            // 1. Sculpted Organic Classic Humanoid Base (only draws zones NOT covered by loaded rigged meshes)
+            // 1. Sculpted Organic Classic Humanoid Base articulated by procedural hip / waist / neck pivots
             if (!riggedCoversLower) {
-                drawClassicPart(avatarLowerMesh, torsoS, torsoS, hScale * legS, AVATAR_PANTS_COLOR, av.bakedLowerTextureId)
+                Matrix.setIdentityM(modelMatrix, 0)
+                Matrix.translateM(modelMatrix, 0, pelvisX, pelvisY, pelvisZ)
+                multiplyQuatRotation(modelMatrix, baseWorldRot)
+                Matrix.translateM(modelMatrix, 0, 0f, 0f, -0.04f * hScale * legS)
+                multiplyQuatRotation(modelMatrix, bodyPose.lowerBodyRotation)
+                Matrix.scaleM(modelMatrix, 0, torsoS, torsoS, hScale * legS)
+                Matrix.translateM(modelMatrix, 0, 0f, 0f, 0.04f)
+                drawClassicMeshWithCurrentModel(avatarLowerMesh, AVATAR_PANTS_COLOR, av.bakedLowerTextureId)
             }
             if (!riggedCoversUpper) {
-                drawClassicPart(avatarUpperMesh, torsoS, shoulderS, hScale, av.shirtColor, av.bakedUpperTextureId)
+                Matrix.setIdentityM(modelMatrix, 0)
+                Matrix.translateM(modelMatrix, 0, pelvisX, pelvisY, pelvisZ)
+                multiplyQuatRotation(modelMatrix, baseWorldRot)
+                Matrix.translateM(modelMatrix, 0, 0f, 0f, 0.05f * hScale)
+                multiplyQuatRotation(modelMatrix, bodyPose.upperBodyRotation)
+                Matrix.scaleM(modelMatrix, 0, torsoS, shoulderS, hScale)
+                Matrix.translateM(modelMatrix, 0, 0f, 0f, -0.05f)
+                drawClassicMeshWithCurrentModel(avatarUpperMesh, av.shirtColor, av.bakedUpperTextureId)
             }
             if (!riggedCoversHead) {
-                drawClassicPart(avatarHeadMesh, headS, headS, hScale * headS, AVATAR_SKIN_COLOR, av.bakedHeadTextureId)
+                fun buildHeadModelMatrix() {
+                    Matrix.setIdentityM(modelMatrix, 0)
+                    Matrix.translateM(modelMatrix, 0, pelvisX, pelvisY, pelvisZ)
+                    multiplyQuatRotation(modelMatrix, baseWorldRot)
+                    Matrix.translateM(modelMatrix, 0, 0f, 0f, 0.05f * hScale)
+                    multiplyQuatRotation(modelMatrix, bodyPose.upperBodyRotation)
+                    Matrix.translateM(modelMatrix, 0, 0f, 0f, 0.49f * hScale)
+                    multiplyQuatRotation(modelMatrix, bodyPose.headRotation)
+                    Matrix.scaleM(modelMatrix, 0, headS, headS, hScale * headS)
+                    Matrix.translateM(modelMatrix, 0, 0f, 0f, -0.54f)
+                }
+                buildHeadModelMatrix()
+                drawClassicMeshWithCurrentModel(avatarHeadMesh, AVATAR_SKIN_COLOR, av.bakedHeadTextureId)
                 if (av.bakedHairTextureId != null && gpuTextureCache.containsKey(av.bakedHairTextureId)) {
-                    drawClassicPart(avatarHairCapMesh, headS, headS, hScale * headS, COLOR_WHITE, av.bakedHairTextureId)
+                    buildHeadModelMatrix()
+                    drawClassicMeshWithCurrentModel(avatarHairCapMesh, COLOR_WHITE, av.bakedHairTextureId)
                 }
             }
 
-            // 2. Real Worn Avatar Mesh & Prim Attachments (root attachments AND multi-prim linkset children)
+            // 2. Real Worn Avatar Mesh & Prim Attachments (driven by animated skeleton bone hierarchy)
+            val animAvatar = if (av.animState == effectiveAnim) av else av.copy(animState = effectiveAnim)
             for (att in av.attachments) {
                 val gpuMesh = att.meshAssetId?.let { gpuMeshCache[it] }
                 if (gpuMesh == null && att.isMesh) continue
@@ -946,10 +1184,11 @@ class LinkpointGlRenderer(
 
                 AvatarSkeletonHierarchy.buildAttachmentModelMatrix(
                     attachment = att,
-                    avatar = av,
-                    pelvisBobZ = bob,
+                    avatar = animAvatar,
+                    pelvisBobZ = 0f,
                     isRiggedMesh = isRigged,
-                    outMatrix = modelMatrix
+                    outMatrix = modelMatrix,
+                    animTimeSec = timeSec
                 )
                 Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
                 computeNormalMat3(modelMatrix, normalMatrix3)
@@ -957,7 +1196,6 @@ class LinkpointGlRenderer(
                 GLES30.glUniformMatrix4fv(primLocs.uMvp, 1, false, mvpMatrix, 0)
                 GLES30.glUniformMatrix4fv(primLocs.uModel, 1, false, modelMatrix, 0)
                 GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
-                GLES30.glUniform1f(primLocs.uFullbright, if (att.isFullbright) 1f else 0f)
                 GLES30.glUniform1f(primLocs.uSelectedPulse, avPulse * 0.5f)
 
                 if (gpuMesh != null) {
@@ -966,6 +1204,7 @@ class LinkpointGlRenderer(
                         val faceCol = att.faceColors[faceIdx] ?: att.color
                         if (SlBinaryParsers.isTransparentFace(faceTex, faceCol)) continue
                         bindTextureCached(faceTex, primLocs.uUseTex)
+                        uploadMaterialUniforms(att.materialForFace(faceIdx), att.isFullbright)
                         GLES30.glUniform4f(primLocs.uColor, faceCol.r, faceCol.g, faceCol.b, faceCol.a)
                         drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, submesh)
                     }
@@ -979,14 +1218,47 @@ class LinkpointGlRenderer(
                         else -> boxMesh
                     }
                     bindTextureCached(att.defaultTextureId, primLocs.uUseTex)
+                    uploadMaterialUniforms(att.materialForFace(0), att.isFullbright)
                     GLES30.glUniform4f(primLocs.uColor, att.color.r, att.color.g, att.color.b, att.color.a)
                     drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, fallbackMesh)
                 }
             }
 
-            if (av.isFlying) {
+            // 3. Holographic typing gesture keypads at animated wrists when ANIM_AGENT_TYPE is active
+            if (av.isTyping) {
+                GLES30.glUniform1f(primLocs.uUseTex, 0f)
+                uploadMaterialUniforms(EMISSIVE_FX_MATERIAL, objectFullbright = true)
+                GLES30.glUniform1f(primLocs.uSelectedPulse, 0f)
+                for (handPoint in TYPING_HAND_SLOTS) {
+                    val wristLocal = AvatarSkeletonHierarchy.resolveAttachmentPointPelvis(
+                        attachPoint = handPoint,
+                        avatar = animAvatar,
+                        animTimeSec = timeSec
+                    )
+                    val handWorldPos = baseWorldRot.rotate(wristLocal.position)
+                    Matrix.setIdentityM(modelMatrix, 0)
+                    Matrix.translateM(
+                        modelMatrix, 0,
+                        pelvisX + handWorldPos.x,
+                        pelvisY + handWorldPos.y,
+                        pelvisZ + handWorldPos.z
+                    )
+                    multiplyQuatRotation(modelMatrix, baseWorldRot)
+                    Matrix.scaleM(modelMatrix, 0, 0.14f, 0.14f, 0.03f)
+                    Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
+                    computeNormalMat3(modelMatrix, normalMatrix3)
+                    GLES30.glUniformMatrix4fv(primLocs.uMvp, 1, false, mvpMatrix, 0)
+                    GLES30.glUniformMatrix4fv(primLocs.uModel, 1, false, modelMatrix, 0)
+                    GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
+                    val keyGlow = 0.55f + 0.35f * sin(timeSec * 16f + handPoint * 1.5f)
+                    GLES30.glUniform4f(primLocs.uColor, 0.25f, 0.88f, 1.0f, keyGlow)
+                    drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, cylinderMesh)
+                }
+            }
+
+            if (av.isFlying || effectiveAnim == AvatarAnimState.FLY || effectiveAnim == AvatarAnimState.HOVER) {
                 Matrix.setIdentityM(modelMatrix, 0)
-                Matrix.translateM(modelMatrix, 0, av.position.x, av.position.y, pelvisZ - av.heightMeters * 0.48f)
+                Matrix.translateM(modelMatrix, 0, pelvisX, pelvisY, pelvisZ - av.heightMeters * 0.48f)
                 Matrix.scaleM(modelMatrix, 0, 0.78f, 0.78f, 0.16f)
                 Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
                 computeNormalMat3(modelMatrix, normalMatrix3)
@@ -995,30 +1267,48 @@ class LinkpointGlRenderer(
                 GLES30.glUniformMatrix4fv(primLocs.uModel, 1, false, modelMatrix, 0)
                 GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
                 GLES30.glUniform4f(primLocs.uColor, 0.22f, 0.83f, 0.98f, 0.65f)
-                GLES30.glUniform1f(primLocs.uFullbright, 1f)
+                uploadMaterialUniforms(EMISSIVE_FX_MATERIAL, objectFullbright = true)
                 GLES30.glUniform1f(primLocs.uSelectedPulse, 0f)
                 drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, torusMesh)
             }
         }
 
+        setCullBackfaces(false)
         disableVertexAttribs(primLocs.aPos, primLocs.aNormal, primLocs.aUv)
         GLES30.glBindBuffer(GLES30.GL_ARRAY_BUFFER, 0)
         GLES30.glBindBuffer(GLES30.GL_ELEMENT_ARRAY_BUFFER, 0)
         GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, 0)
     }
 
-    private fun drawWater(waterHeight: Float, env: EnvironmentPreset, eye: Vec3, timeSec: Float) {
+    private fun drawWater(waterHeight: Float, env: RegionEnvironmentSettings, eye: Vec3, timeSec: Float) {
         GLES30.glUseProgram(waterProgram)
         GLES30.glDepthMask(false)
         Matrix.setIdentityM(modelMatrix, 0)
         Matrix.translateM(modelMatrix, 0, 0f, 0f, waterHeight)
         Matrix.multiplyMM(mvpMatrix, 0, vpMatrix, 0, modelMatrix, 0)
 
+        val sDir = env.sunDirection.normalized()
         GLES30.glUniformMatrix4fv(waterLocs.uMvp, 1, false, mvpMatrix, 0)
         GLES30.glUniform1f(waterLocs.uTime, timeSec)
-        GLES30.glUniform4f(waterLocs.uWaterTint, env.waterTint.r, env.waterTint.g, env.waterTint.b, env.waterTint.a)
-        GLES30.glUniform3f(waterLocs.uHorizon, env.horizon.r, env.horizon.g, env.horizon.b)
+        GLES30.glUniform4f(
+            waterLocs.uWaterTint,
+            env.waterFogColor.r,
+            env.waterFogColor.g,
+            env.waterFogColor.b,
+            env.waterFogColor.a
+        )
+        GLES30.glUniform3f(waterLocs.uHorizon, env.horizonColor.r, env.horizonColor.g, env.horizonColor.b)
+        GLES30.glUniform3f(waterLocs.uZenith, env.zenithColor.r, env.zenithColor.g, env.zenithColor.b)
+        GLES30.glUniform3f(waterLocs.uSunDir, sDir.x, sDir.y, sDir.z)
+        GLES30.glUniform3f(waterLocs.uSunColor, env.sunlightColor.r, env.sunlightColor.g, env.sunlightColor.b)
         GLES30.glUniform3f(waterLocs.uEyePos, eye.x, eye.y, eye.z)
+        GLES30.glUniform3f(
+            waterLocs.uNormalScale,
+            env.waterNormalScale.x,
+            env.waterNormalScale.y,
+            env.waterNormalScale.z
+        )
+        GLES30.glUniform2f(waterLocs.uFresnelParams, env.fresnelScale, env.fresnelOffset)
 
         resetBatchBindings()
         enableVertexAttribs(waterLocs.aPos, -1, waterLocs.aUv)
@@ -1416,207 +1706,18 @@ class LinkpointGlRenderer(
         private val AVATAR_SKIN_COLOR = ColorRgba(0.90f, 0.75f, 0.65f, 1f)
         private val AVATAR_PANTS_COLOR = ColorRgba(0.14f, 0.18f, 0.25f, 1f)
         private val COLOR_WHITE = ColorRgba(1f, 1f, 1f, 1f)
-
-        private const val SKY_VS = """#version 300 es
-            in vec2 aPos;
-            out vec2 vUv;
-            void main() {
-                vUv = aPos * 0.5 + 0.5;
-                gl_Position = vec4(aPos, 0.999, 1.0);
-            }
-        """
-
-        private const val SKY_FS = """#version 300 es
-            precision mediump float;
-            in vec2 vUv;
-            uniform vec3 uZenith;
-            uniform vec3 uHorizon;
-            uniform vec3 uSunColor;
-            uniform float uTime;
-            uniform float uPitch;
-            out vec4 fragColor;
-            void main() {
-                float elev = clamp(vUv.y + uPitch * 0.35, 0.0, 1.0);
-                vec3 sky = mix(uHorizon, uZenith, pow(elev, 0.65));
-                vec2 sunPos = vec2(0.72, 0.42 + uPitch * 0.25);
-                float d = length(vUv - sunPos);
-                float sunGlow = exp(-d * 9.0) * 0.55 + smoothstep(0.05, 0.015, d) * 0.9;
-                float cloud = sin(vUv.x * 11.0 + uTime * 0.08) * cos(vUv.y * 8.0 - uTime * 0.04) * 0.5 + 0.5;
-                float cloudBand = smoothstep(0.35, 0.85, elev) * smoothstep(0.95, 0.55, elev) * cloud * 0.14;
-                vec3 col = sky + uSunColor * sunGlow + vec3(cloudBand);
-                fragColor = vec4(col, 1.0);
-            }
-        """
-
-        private const val WORLD_VS = """#version 300 es
-            in vec3 aPos;
-            in vec3 aNormal;
-            in vec2 aUv;
-            uniform mat4 uMvp;
-            uniform mat4 uModel;
-            uniform mat3 uNormalMat;
-            out vec3 vWorldPos;
-            out vec3 vNormal;
-            out vec2 vUv;
-            void main() {
-                vec4 wp = uModel * vec4(aPos, 1.0);
-                vWorldPos = wp.xyz;
-                vNormal = normalize(uNormalMat * aNormal);
-                vUv = aUv;
-                gl_Position = uMvp * vec4(aPos, 1.0);
-            }
-        """
-
-        private const val TERRAIN_FS = """#version 300 es
-            precision mediump float;
-            in vec3 vWorldPos;
-            in vec3 vNormal;
-            in vec2 vUv;
-            uniform vec3 uSunDir;
-            uniform vec3 uSunColor;
-            uniform vec3 uFogColor;
-            uniform vec3 uEyePos;
-            uniform float uAmbient;
-            out vec4 fragColor;
-            void main() {
-                float h = vWorldPos.z;
-                vec3 sand = vec3(0.76, 0.70, 0.54);
-                vec3 grass = vec3(0.22, 0.45, 0.26);
-                vec3 rock = vec3(0.38, 0.41, 0.46);
-                vec3 snow = vec3(0.86, 0.90, 0.95);
-                vec3 base = mix(sand, grass, smoothstep(20.2, 23.0, h));
-                base = mix(base, rock, smoothstep(28.0, 35.0, h));
-                base = mix(base, snow, smoothstep(40.0, 47.0, h));
-                float slope = 1.0 - clamp(vNormal.z, 0.0, 1.0);
-                base = mix(base, rock, smoothstep(0.25, 0.65, slope));
-
-                vec2 g = abs(fract(vWorldPos.xy / 16.0 - 0.5) - 0.5);
-                float grid = smoothstep(0.025, 0.0, min(g.x, g.y)) * 0.06;
-
-                float diff = max(dot(normalize(vNormal), normalize(uSunDir)), 0.0);
-                vec3 lit = (base + vec3(grid)) * (uAmbient + diff * uSunColor * 0.85);
-                float dist = length(vWorldPos - uEyePos);
-                float fog = clamp((dist - 55.0) / 140.0, 0.0, 0.82);
-                fragColor = vec4(mix(lit, uFogColor, fog), 1.0);
-            }
-        """
-
-        private const val PRIM_FS = """#version 300 es
-            precision mediump float;
-            in vec3 vWorldPos;
-            in vec3 vNormal;
-            in vec2 vUv;
-            uniform vec3 uSunDir;
-            uniform vec3 uSunColor;
-            uniform vec3 uFogColor;
-            uniform vec3 uEyePos;
-            uniform float uAmbient;
-            uniform vec4 uColor;
-            uniform float uFullbright;
-            uniform float uSelectedPulse;
-            uniform sampler2D uTex;
-            uniform float uUseTex;
-            out vec4 fragColor;
-            void main() {
-                vec4 baseCol = uColor;
-                if (uUseTex > 0.5) {
-                    vec4 texCol = texture(uTex, vUv);
-                    baseCol *= texCol;
-                    if (baseCol.a < 0.08) discard;
-                }
-                vec3 n = normalize(vNormal);
-                if (!gl_FrontFacing) {
-                    n = -n;
-                }
-                vec3 l = normalize(uSunDir);
-                vec3 v = normalize(uEyePos - vWorldPos);
-                float diff = max(dot(n, l), 0.0);
-                float backFill = max(dot(n, -l), 0.0) * 0.22;
-                float hemi = mix(0.80, 1.15, n.z * 0.5 + 0.5);
-                vec3 hVec = normalize(l + v);
-                float spec = pow(max(dot(n, hVec), 0.0), 24.0) * 0.20;
-
-                vec3 lit = baseCol.rgb * (uAmbient * hemi + backFill + diff * uSunColor * 0.85) + uSunColor * spec;
-                lit = mix(lit, baseCol.rgb * 1.12, uFullbright);
-
-                float edge = smoothstep(0.035, 0.0, min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y)));
-                float untexturedEdge = (1.0 - uUseTex) * 0.08;
-                lit = mix(lit, vec3(0.22, 0.86, 1.0), edge * (untexturedEdge + uSelectedPulse * 0.85));
-
-                float dist = length(vWorldPos - uEyePos);
-                float fog = clamp((dist - 65.0) / 155.0, 0.0, 0.78);
-                fragColor = vec4(mix(lit, uFogColor, fog), baseCol.a);
-            }
-        """
-
-        private const val WATER_VS = """#version 300 es
-            in vec3 aPos;
-            in vec2 aUv;
-            uniform mat4 uMvp;
-            uniform float uTime;
-            out vec3 vWorldPos;
-            out vec2 vUv;
-            void main() {
-                vec3 p = aPos;
-                p.z += sin(p.x * 0.14 + uTime * 1.6) * 0.12 + cos(p.y * 0.12 + uTime * 1.2) * 0.10;
-                vWorldPos = p;
-                vUv = aUv;
-                gl_Position = uMvp * vec4(p, 1.0);
-            }
-        """
-
-        private const val WATER_FS = """#version 300 es
-            precision mediump float;
-            in vec3 vWorldPos;
-            in vec2 vUv;
-            uniform float uTime;
-            uniform vec4 uWaterTint;
-            uniform vec3 uHorizon;
-            uniform vec3 uEyePos;
-            out vec4 fragColor;
-            void main() {
-                float ripple = sin(vWorldPos.x * 0.65 + uTime * 2.1) * cos(vWorldPos.y * 0.55 - uTime * 1.7) * 0.5 + 0.5;
-                vec3 v = normalize(uEyePos - vWorldPos);
-                float fresnel = pow(1.0 - clamp(v.z, 0.0, 1.0), 3.0);
-                vec3 col = mix(uWaterTint.rgb + vec3(ripple * 0.08), uHorizon, fresnel * 0.58);
-                fragColor = vec4(col, uWaterTint.a);
-            }
-        """
-
-        private const val HUD_VS = """#version 300 es
-            in vec3 aPos;
-            in vec2 aUv;
-            uniform vec4 uRect; // x, y, w, h in [0..1] top-left screen coordinates
-            out vec2 vUv;
-            void main() {
-                float sx = uRect.x + aPos.x * uRect.z;
-                float sy = uRect.y + aPos.y * uRect.w;
-                vec2 ndc = vec2(sx * 2.0 - 1.0, 1.0 - sy * 2.0);
-                vUv = aUv;
-                gl_Position = vec4(ndc, 0.0, 1.0);
-            }
-        """
-
-        private const val HUD_FS = """#version 300 es
-            precision mediump float;
-            in vec2 vUv;
-            uniform vec4 uColor;
-            uniform vec4 uBorderColor;
-            uniform float uFlash;
-            uniform sampler2D uTex;
-            uniform float uUseTex;
-            out vec4 fragColor;
-            void main() {
-                vec4 base = uColor;
-                if (uUseTex > 0.5) {
-                    base *= texture(uTex, vUv);
-                }
-                float edge = step(vUv.x, 0.025) + step(0.975, vUv.x) + step(vUv.y, 0.04) + step(0.96, vUv.y);
-                float grad = uUseTex > 0.5 ? 1.0 : (0.85 + (1.0 - vUv.y) * 0.25);
-                vec3 body = base.rgb * grad + vec3(uFlash);
-                vec3 col = mix(body, uBorderColor.rgb, clamp(edge, 0.0, 1.0) * (uUseTex > 0.5 ? 0.45 : 1.0));
-                fragColor = vec4(col, base.a);
-            }
-        """
+        private val AVATAR_CLASSIC_MATERIAL = FaceMaterialParams(
+            shininess = 1,
+            roughnessFactor = 0.68f,
+            metallicFactor = 0.04f,
+            alphaMode = MaterialAlphaMode.BLEND
+        )
+        private val EMISSIVE_FX_MATERIAL = FaceMaterialParams(
+            shininess = 2,
+            glow = 0.65f,
+            fullbright = true,
+            alphaMode = MaterialAlphaMode.BLEND
+        )
+        private val TYPING_HAND_SLOTS = intArrayOf(5, 6)
     }
 }

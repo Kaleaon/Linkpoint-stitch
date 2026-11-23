@@ -185,7 +185,7 @@ object LlsdCodec {
             is LlsdValue.Date -> sb.append("<date>").append(escapeXml(value.iso8601)).append("</date>")
             is LlsdValue.Uri -> sb.append("<uri>").append(escapeXml(value.value)).append("</uri>")
             is LlsdValue.Binary -> {
-                val b64 = Base64.encodeToString(value.bytes, Base64.NO_WRAP)
+                val b64 = encodeBase64(value.bytes)
                 sb.append("<binary encoding=\"base64\">").append(b64).append("</binary>")
             }
             is LlsdValue.ArrayVal -> {
@@ -288,7 +288,7 @@ object LlsdCodec {
             "uri" -> LlsdValue.Uri(element.textContent.orEmpty().trim())
             "binary" -> {
                 val raw = element.textContent.orEmpty().trim()
-                val bytes = runCatching { Base64.decode(raw, Base64.DEFAULT) }.getOrDefault(ByteArray(0))
+                val bytes = decodeBase64(raw)
                 LlsdValue.Binary(bytes)
             }
             "array" -> LlsdValue.ArrayVal(childElements(element).map { readDomNode(it) })
@@ -368,6 +368,246 @@ object LlsdCodec {
             }
             else -> LlsdValue.Undef
         }
+    }
+
+    /**
+     * Serializes an [LlsdValue] into Second Life Binary LLSD format (used by `RenderMaterials` `"Zipped"` requests).
+     */
+    fun toBinary(value: LlsdValue, includeHeader: Boolean = false): ByteArray {
+        val out = java.io.ByteArrayOutputStream(128)
+        if (includeHeader) {
+            out.write("<? llsd/binary ?>\n".toByteArray(Charsets.UTF_8))
+        }
+        writeBinaryNode(out, value)
+        return out.toByteArray()
+    }
+
+    private fun writeBinaryNode(out: java.io.ByteArrayOutputStream, value: LlsdValue) {
+        fun writeBeInt(v: Int) {
+            out.write((v ushr 24) and 0xFF)
+            out.write((v ushr 16) and 0xFF)
+            out.write((v ushr 8) and 0xFF)
+            out.write(v and 0xFF)
+        }
+        fun writeBeLong(v: Long) {
+            writeBeInt((v ushr 32).toInt())
+            writeBeInt(v.toInt())
+        }
+        when (value) {
+            LlsdValue.Undef -> out.write('!'.code)
+            is LlsdValue.Bool -> out.write(if (value.value) '1'.code else '0'.code)
+            is LlsdValue.IntVal -> {
+                out.write('i'.code)
+                writeBeInt(value.value)
+            }
+            is LlsdValue.Real -> {
+                out.write('r'.code)
+                writeBeLong(java.lang.Double.doubleToRawLongBits(value.value))
+            }
+            is LlsdValue.Uuid -> {
+                out.write('u'.code)
+                writeBeLong(value.value.mostSignificantBits)
+                writeBeLong(value.value.leastSignificantBits)
+            }
+            is LlsdValue.Binary -> {
+                out.write('b'.code)
+                writeBeInt(value.bytes.size)
+                out.write(value.bytes)
+            }
+            is LlsdValue.Str -> {
+                val bytes = value.value.toByteArray(Charsets.UTF_8)
+                out.write('s'.code)
+                writeBeInt(bytes.size)
+                out.write(bytes)
+            }
+            is LlsdValue.Uri -> {
+                val bytes = value.value.toByteArray(Charsets.UTF_8)
+                out.write('l'.code)
+                writeBeInt(bytes.size)
+                out.write(bytes)
+            }
+            is LlsdValue.Date -> {
+                out.write('d'.code)
+                writeBeLong(java.lang.Double.doubleToRawLongBits(0.0))
+            }
+            is LlsdValue.ArrayVal -> {
+                out.write('['.code)
+                writeBeInt(value.items.size)
+                for (item in value.items) writeBinaryNode(out, item)
+                out.write(']'.code)
+            }
+            is LlsdValue.MapVal -> {
+                out.write('{'.code)
+                writeBeInt(value.entries.size)
+                for ((k, v) in value.entries) {
+                    val kBytes = k.toByteArray(Charsets.UTF_8)
+                    out.write('k'.code)
+                    writeBeInt(kBytes.size)
+                    out.write(kBytes)
+                    writeBinaryNode(out, v)
+                }
+                out.write('}'.code)
+            }
+        }
+    }
+
+    /**
+     * Pure-Kotlin JSON parser converting glTF 2.0 JSON strings (`LLGLTFMaterial`) into [LlsdValue] trees.
+     */
+    fun parseJson(json: String): LlsdValue {
+        if (json.isBlank()) return LlsdValue.Undef
+        return runCatching { JsonReader(json).readValue() }.getOrDefault(LlsdValue.Undef)
+    }
+
+    private class JsonReader(private val src: String) {
+        private var pos = 0
+
+        fun readValue(): LlsdValue {
+            skipWs()
+            if (pos >= src.length) return LlsdValue.Undef
+            return when (val ch = src[pos]) {
+                '{' -> readObject()
+                '[' -> readArray()
+                '"' -> LlsdValue.Str(readString())
+                't', 'T' -> {
+                    if (src.regionMatches(pos, "true", 0, 4, ignoreCase = true)) {
+                        pos += 4
+                        LlsdValue.Bool(true)
+                    } else LlsdValue.Undef
+                }
+                'f', 'F' -> {
+                    if (src.regionMatches(pos, "false", 0, 5, ignoreCase = true)) {
+                        pos += 5
+                        LlsdValue.Bool(false)
+                    } else LlsdValue.Undef
+                }
+                'n', 'N' -> {
+                    if (src.regionMatches(pos, "null", 0, 4, ignoreCase = true)) {
+                        pos += 4
+                        LlsdValue.Undef
+                    } else LlsdValue.Undef
+                }
+                '-', in '0'..'9' -> readNumber()
+                else -> {
+                    pos++
+                    LlsdValue.Str(ch.toString())
+                }
+            }
+        }
+
+        private fun readObject(): LlsdValue.MapVal {
+            pos++ // '{'
+            val map = LinkedHashMap<String, LlsdValue>()
+            skipWs()
+            if (pos < src.length && src[pos] == '}') {
+                pos++
+                return LlsdValue.MapVal(map)
+            }
+            while (pos < src.length) {
+                skipWs()
+                if (pos >= src.length || src[pos] == '}') {
+                    if (pos < src.length) pos++
+                    break
+                }
+                if (src[pos] != '"') break
+                val key = readString()
+                skipWs()
+                if (pos < src.length && src[pos] == ':') pos++
+                val value = readValue()
+                map[key] = value
+                skipWs()
+                if (pos < src.length && src[pos] == ',') {
+                    pos++
+                } else if (pos < src.length && src[pos] == '}') {
+                    pos++
+                    break
+                } else break
+            }
+            return LlsdValue.MapVal(map)
+        }
+
+        private fun readArray(): LlsdValue.ArrayVal {
+            pos++ // '['
+            val list = ArrayList<LlsdValue>()
+            skipWs()
+            if (pos < src.length && src[pos] == ']') {
+                pos++
+                return LlsdValue.ArrayVal(list)
+            }
+            while (pos < src.length) {
+                skipWs()
+                if (pos >= src.length || src[pos] == ']') {
+                    if (pos < src.length) pos++
+                    break
+                }
+                list.add(readValue())
+                skipWs()
+                if (pos < src.length && src[pos] == ',') {
+                    pos++
+                } else if (pos < src.length && src[pos] == ']') {
+                    pos++
+                    break
+                } else break
+            }
+            return LlsdValue.ArrayVal(list)
+        }
+
+        private fun readString(): String {
+            pos++ // '"'
+            val sb = StringBuilder()
+            while (pos < src.length) {
+                val c = src[pos++]
+                if (c == '"') break
+                if (c == '\\' && pos < src.length) {
+                    when (val esc = src[pos++]) {
+                        '"', '\\', '/' -> sb.append(esc)
+                        'b' -> sb.append('\b')
+                        'f' -> sb.append('\u000C')
+                        'n' -> sb.append('\n')
+                        'r' -> sb.append('\r')
+                        't' -> sb.append('\t')
+                        'u' -> if (pos + 4 <= src.length) {
+                            val hex = src.substring(pos, pos + 4)
+                            pos += 4
+                            hex.toIntOrNull(16)?.let { sb.append(it.toChar()) }
+                        }
+                        else -> sb.append(esc)
+                    }
+                } else {
+                    sb.append(c)
+                }
+            }
+            return sb.toString()
+        }
+
+        private fun readNumber(): LlsdValue {
+            val start = pos
+            while (pos < src.length && src[pos] in "-+0123456789.eE") pos++
+            val token = src.substring(start, pos)
+            return if ('.' in token || 'e' in token || 'E' in token) {
+                LlsdValue.Real(token.toDoubleOrNull() ?: 0.0)
+            } else {
+                val asInt = token.toIntOrNull()
+                if (asInt != null) LlsdValue.IntVal(asInt) else LlsdValue.Real(token.toDoubleOrNull() ?: 0.0)
+            }
+        }
+
+        private fun skipWs() {
+            while (pos < src.length && src[pos].isWhitespace()) pos++
+        }
+    }
+
+    @Suppress("NewApi")
+    private fun encodeBase64(bytes: ByteArray): String {
+        return runCatching { Base64.encodeToString(bytes, Base64.NO_WRAP) }.getOrNull()
+            ?: java.util.Base64.getEncoder().encodeToString(bytes)
+    }
+
+    @Suppress("NewApi")
+    private fun decodeBase64(raw: String): ByteArray {
+        if (raw.isEmpty()) return ByteArray(0)
+        return runCatching { Base64.decode(raw, Base64.DEFAULT) }.getOrNull()
+            ?: runCatching { java.util.Base64.getMimeDecoder().decode(raw) }.getOrDefault(ByteArray(0))
     }
 
     fun escapeXml(input: String): String = buildString(input.length) {

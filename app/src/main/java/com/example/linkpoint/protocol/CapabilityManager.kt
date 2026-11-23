@@ -39,6 +39,8 @@ sealed class CapsEvent {
     data class ParcelProperties(val parcelName: String, val parcelDesc: String) : CapsEvent()
     data class ScriptDialog(val objectName: String, val message: String, val buttons: List<String>, val channel: Int) : CapsEvent()
     data class AttachmentsUpdated(val updates: List<CapsAttachmentTransform>) : CapsEvent()
+    data class EnvironmentUpdated(val settings: com.example.linkpoint.scene.RegionEnvironmentSettings) : CapsEvent()
+    data class RenderMaterialsUpdated(val materials: Map<UUID, com.example.linkpoint.scene.FaceMaterialParams>) : CapsEvent()
     data class GenericNotice(val title: String, val message: String) : CapsEvent()
     data class HealthChanged(
         val status: LayerHealthStatus,
@@ -100,7 +102,7 @@ class CapabilityManager(
 
     companion object {
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
-        private val REQUESTED_CAPS = listOf(
+        val REQUESTED_CAPS = listOf(
             "EventQueueGet",
             "FetchInventoryDescendents2",
             "FetchInventory2",
@@ -116,7 +118,9 @@ class CapabilityManager(
             "UpdateAgentInformation",
             "ChatSessionRequest",
             "MapLayer",
-            "EnvironmentSettings"
+            "RenderMaterials",
+            "EnvironmentSettings",
+            "ExtEnvironment"
         )
 
         /**
@@ -242,6 +246,168 @@ class CapabilityManager(
                 node[k].asQuatOrNull()?.let { return it }
             }
             return null
+        }
+
+        /**
+         * Builds a canonical Second Life `RenderMaterials` POST request LLSD payload containing
+         * `"Zipped"` (zlib-compressed binary LLSD array of 16-byte material UUIDs) and `"MaterialIDs"`
+         * for cross-grid SL + OpenSimulator compatibility.
+         */
+        fun buildRenderMaterialsRequestLlsd(materialIds: Collection<UUID>): LlsdValue {
+            val unique = materialIds.filter { it != UUID(0L, 0L) }.distinct()
+            val binItems = unique.map { id ->
+                val bb = java.nio.ByteBuffer.allocate(16).order(java.nio.ByteOrder.BIG_ENDIAN)
+                bb.putLong(id.mostSignificantBits)
+                bb.putLong(id.leastSignificantBits)
+                LlsdValue.Binary(bb.array())
+            }
+            val rawBinLlsd = LlsdCodec.toBinary(LlsdValue.ArrayVal(binItems), includeHeader = false)
+            val deflated = java.io.ByteArrayOutputStream().use { baos ->
+                java.util.zip.DeflaterOutputStream(baos).use { dos -> dos.write(rawBinLlsd) }
+                baos.toByteArray()
+            }
+            return LlsdValue.MapVal(
+                linkedMapOf(
+                    "Zipped" to LlsdValue.Binary(deflated),
+                    "MaterialIDs" to LlsdValue.ArrayVal(unique.map { LlsdValue.Uuid(it) })
+                )
+            )
+        }
+
+        /**
+         * Parses a Second Life / OpenSimulator `RenderMaterials` capability response into a map of
+         * material UUID -> [com.example.linkpoint.scene.FaceMaterialParams], supporting:
+         * - `"Zipped"` zlib-compressed binary/XML LLSD arrays (`[{ "ID": <16B|UUID>, "Material": <glTF JSON|LLSD> }]`),
+         * - Uncompressed `"entries"` / `"materials"` / `"RenderMaterials"` arrays, and
+         * - Direct UUID-keyed LLSD maps (`{ "<uuid>": <glTF 2.0 JSON string or LLSD map> }`).
+         */
+        fun parseRenderMaterialsResponse(body: LlsdValue): Map<UUID, com.example.linkpoint.scene.FaceMaterialParams> {
+            val resolved = LinkedHashMap<UUID, com.example.linkpoint.scene.FaceMaterialParams>()
+            val zeroUuid = UUID(0L, 0L)
+
+            fun decodeUuidNode(node: LlsdValue?): UUID? {
+                if (node == null || node is LlsdValue.Undef) return null
+                node.asUuidOrNull()?.let { return it }
+                if (node is LlsdValue.Binary && node.bytes.size == 16) {
+                    val bb = java.nio.ByteBuffer.wrap(node.bytes).order(java.nio.ByteOrder.BIG_ENDIAN)
+                    return UUID(bb.long, bb.long).takeIf { it != zeroUuid }
+                }
+                return null
+            }
+
+            fun decodeMaterialPayload(
+                matNode: LlsdValue?,
+                materialId: UUID
+            ): com.example.linkpoint.scene.FaceMaterialParams? {
+                if (matNode == null || matNode is LlsdValue.Undef) return null
+                val base = com.example.linkpoint.scene.FaceMaterialParams(renderMaterialId = materialId)
+                return when (matNode) {
+                    is LlsdValue.Str -> {
+                        val trimmed = matNode.value.trim()
+                        if (trimmed.startsWith("<")) {
+                            SlBinaryParsers.parseGltfMaterialOverride(LlsdCodec.parseXml(trimmed), base)
+                        } else {
+                            SlBinaryParsers.parseGltfMaterialJson(trimmed, base)
+                        }
+                    }
+                    is LlsdValue.Binary -> {
+                        val utf8 = String(matNode.bytes, Charsets.UTF_8).trim()
+                        if (utf8.startsWith("{")) {
+                            SlBinaryParsers.parseGltfMaterialJson(utf8, base)
+                        } else if (utf8.startsWith("<")) {
+                            SlBinaryParsers.parseGltfMaterialOverride(LlsdCodec.parseXml(utf8), base)
+                        } else {
+                            SlBinaryParsers.parseGltfMaterialOverride(LlsdCodec.parseBinary(matNode.bytes), base)
+                        }
+                    }
+                    is LlsdValue.MapVal -> {
+                        // Check if this map wraps an inner glTF JSON string under "Data" / "gltf_json" / "data" / "Override" / "Material"
+                        val innerJson = firstString(
+                            matNode,
+                            "Data", "data", "gltf_json", "GLTF", "gltf", "JSON", "json", "Override", "override"
+                        )?.trim()
+                        if (innerJson != null && innerJson.startsWith("{")) {
+                            SlBinaryParsers.parseGltfMaterialJson(innerJson, base)
+                        } else {
+                            SlBinaryParsers.parseGltfMaterialOverride(matNode, base)
+                        }
+                    }
+                    else -> null
+                }?.copy(renderMaterialId = materialId)
+            }
+
+            fun consumeNode(node: LlsdValue) {
+                when (node) {
+                    is LlsdValue.ArrayVal -> {
+                        for (item in node.items) {
+                            if (item !is LlsdValue.MapVal) continue
+                            val id = decodeUuidNode(item["ID"])
+                                ?: decodeUuidNode(item["id"])
+                                ?: decodeUuidNode(item["material_id"])
+                                ?: decodeUuidNode(item["MaterialID"])
+                                ?: continue
+                            val matPayload = item["Material"].takeIf { it !is LlsdValue.Undef }
+                                ?: item["material"].takeIf { it !is LlsdValue.Undef }
+                                ?: item["Override"].takeIf { it !is LlsdValue.Undef }
+                                ?: item["data"].takeIf { it !is LlsdValue.Undef }
+                                ?: item["gltf_json"].takeIf { it !is LlsdValue.Undef }
+                                ?: item
+                            decodeMaterialPayload(matPayload, id)?.let { resolved[id] = it }
+                        }
+                    }
+                    is LlsdValue.MapVal -> {
+                        val zipped = node["Zipped"]
+                        if (zipped is LlsdValue.Binary && zipped.bytes.isNotEmpty()) {
+                            val inflated = runCatching {
+                                java.util.zip.InflaterInputStream(java.io.ByteArrayInputStream(zipped.bytes)).use { it.readBytes() }
+                            }.getOrNull()
+                            if (inflated != null && inflated.isNotEmpty()) {
+                                val textPrefix = String(inflated, 0, minOf(inflated.size, 24), Charsets.ISO_8859_1).trimStart()
+                                val unzippedLlsd = when {
+                                    textPrefix.startsWith("<?xml") || textPrefix.startsWith("<llsd") || textPrefix.startsWith("<array") || textPrefix.startsWith("<map") ->
+                                        LlsdCodec.parseXml(String(inflated, Charsets.UTF_8))
+                                    textPrefix.startsWith("{") && textPrefix.contains("\"") ->
+                                        LlsdCodec.parseJson(String(inflated, Charsets.UTF_8))
+                                    else ->
+                                        LlsdCodec.parseBinary(inflated)
+                                }
+                                if (unzippedLlsd !is LlsdValue.Undef) {
+                                    consumeNode(unzippedLlsd)
+                                }
+                            }
+                        }
+
+                        for (listKey in listOf("entries", "materials", "Materials", "RenderMaterials")) {
+                            val sub = node[listKey]
+                            if (sub is LlsdValue.ArrayVal) consumeNode(sub)
+                            else if (sub is LlsdValue.MapVal) consumeNode(sub)
+                        }
+
+                        // Direct single-entry map `{ "ID": <uuid>, "Material": ... }`
+                        val singleId = decodeUuidNode(node["ID"])
+                            ?: decodeUuidNode(node["id"])
+                            ?: decodeUuidNode(node["material_id"])
+                        if (singleId != null) {
+                            val payload = node["Material"].takeIf { it !is LlsdValue.Undef }
+                                ?: node["material"].takeIf { it !is LlsdValue.Undef }
+                                ?: node["gltf_json"].takeIf { it !is LlsdValue.Undef }
+                                ?: node
+                            decodeMaterialPayload(payload, singleId)?.let { resolved[singleId] = it }
+                        }
+
+                        // Map keyed directly by material UUID string: `{ "aaaaaaaa-...": <map | glTF JSON string> }`
+                        for ((k, v) in node.entries) {
+                            val keyUuid = runCatching { UUID.fromString(k.trim()) }.getOrNull()
+                                ?.takeIf { it != zeroUuid } ?: continue
+                            decodeMaterialPayload(v, keyUuid)?.let { resolved[keyUuid] = it }
+                        }
+                    }
+                    else -> Unit
+                }
+            }
+
+            consumeNode(body)
+            return resolved
         }
     }
 
@@ -605,8 +771,70 @@ class CapabilityManager(
                     _capsEvents.tryEmit(CapsEvent.AttachmentsUpdated(updates))
                 }
             }
+            "RegionEnvironment",
+            "EnvironmentSettings",
+            "ExtEnvironment",
+            "ParcelEnvironment",
+            "WindLight" -> {
+                val settings = EepEnvironmentParser.parse(body)
+                if (settings != null) {
+                    _capsEvents.tryEmit(CapsEvent.EnvironmentUpdated(settings))
+                }
+            }
+            "RenderMaterials" -> {
+                val materials = parseRenderMaterialsResponse(body)
+                if (materials.isNotEmpty()) {
+                    _capsEvents.tryEmit(CapsEvent.RenderMaterialsUpdated(materials))
+                }
+            }
         }
     }
+
+    internal fun dispatchCapsEventForTesting(message: String, body: LlsdValue) {
+        dispatchCapsEvent(message, body)
+    }
+
+    /**
+     * Fetches the live region `EnvironmentSettings` (or `ExtEnvironment`) HTTP capability via GET,
+     * parses LLSD sky/water day-cycle parameters, and emits [CapsEvent.EnvironmentUpdated].
+     */
+    suspend fun fetchEnvironmentSettings(): com.example.linkpoint.scene.RegionEnvironmentSettings? =
+        withContext(Dispatchers.IO) {
+            val url = capabilities["EnvironmentSettings"]
+                ?: capabilities["ExtEnvironment"]
+                ?: return@withContext null
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                .header("Accept", "application/llsd+xml, application/llsd+binary, text/xml, */*")
+                .get()
+                .build()
+            try {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@withContext null
+                    val rawBytes = resp.body?.bytes() ?: return@withContext null
+                    if (rawBytes.isEmpty()) return@withContext null
+                    val contentType = resp.header("Content-Type").orEmpty().lowercase()
+                    val isBinary = contentType.contains("binary") ||
+                        (rawBytes.size >= 18 && String(rawBytes, 0, 18, Charsets.ISO_8859_1).startsWith("<? llsd/binary")) ||
+                        (rawBytes[0] == '{'.code.toByte())
+                    val parsedLlsd = if (isBinary) {
+                        LlsdCodec.parseBinary(rawBytes)
+                    } else {
+                        LlsdCodec.parseXml(String(rawBytes, Charsets.UTF_8))
+                    }
+                    val settings = EepEnvironmentParser.parse(parsedLlsd)
+                    if (settings != null) {
+                        _capsEvents.tryEmit(CapsEvent.EnvironmentUpdated(settings))
+                    }
+                    settings
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+        }
 
     /**
      * Queries the negotiated `AttachmentResources` HTTP capability (if supported by the region)
@@ -704,6 +932,66 @@ class CapabilityManager(
             }
             emptyList()
         }
+
+    /**
+     * Fetches glTF 2.0 / PBR material entries by material UUID(s) from the negotiated `RenderMaterials`
+     * HTTP capability via POST, parses LLSD / `"Zipped"` / glTF 2.0 JSON definitions, and emits
+     * [CapsEvent.RenderMaterialsUpdated].
+     */
+    suspend fun fetchRenderMaterials(
+        materialIds: Collection<UUID>
+    ): Map<UUID, com.example.linkpoint.scene.FaceMaterialParams> = withContext(Dispatchers.IO) {
+        val uniqueIds = materialIds.filter { it != UUID(0L, 0L) }.distinct()
+        if (uniqueIds.isEmpty()) return@withContext emptyMap()
+        val url = capabilities["RenderMaterials"] ?: return@withContext emptyMap()
+
+        val reqLlsd = buildRenderMaterialsRequestLlsd(uniqueIds)
+        val reqXml = LlsdCodec.toXml(reqLlsd)
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, application/llsd+binary, application/json, text/xml, */*")
+            .post(reqXml.toRequestBody(LLSD_XML_MEDIA))
+            .build()
+
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext emptyMap()
+                val rawBytes = resp.body?.bytes() ?: return@withContext emptyMap()
+                if (rawBytes.isEmpty()) return@withContext emptyMap()
+                val contentType = resp.header("Content-Type").orEmpty().lowercase()
+                val prefix = String(rawBytes, 0, minOf(rawBytes.size, 24), Charsets.ISO_8859_1).trimStart()
+                val parsedLlsd = when {
+                    contentType.contains("binary") || prefix.startsWith("<? llsd/binary") ->
+                        LlsdCodec.parseBinary(rawBytes)
+                    contentType.contains("json") || (prefix.startsWith("{") && prefix.contains("\"")) ->
+                        LlsdCodec.parseJson(String(rawBytes, Charsets.UTF_8))
+                    prefix.startsWith("{") || prefix.startsWith("[") ->
+                        LlsdCodec.parseBinary(rawBytes)
+                    else ->
+                        LlsdCodec.parseXml(String(rawBytes, Charsets.UTF_8))
+                }
+                val materials = parseRenderMaterialsResponse(parsedLlsd)
+                if (materials.isNotEmpty()) {
+                    _capsEvents.tryEmit(CapsEvent.RenderMaterialsUpdated(materials))
+                }
+                materials
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    suspend fun fetchRenderMaterial(materialId: UUID): com.example.linkpoint.scene.FaceMaterialParams? =
+        fetchRenderMaterials(listOf(materialId))[materialId]
+
+    internal fun setCapabilityUrlForTesting(name: String, url: String) {
+        capabilities[name] = url
+    }
+
+    fun hasCapability(name: String): Boolean = capabilities.containsKey(name)
 
     fun getCapabilityUrl(name: String): String? = capabilities[name]
 
