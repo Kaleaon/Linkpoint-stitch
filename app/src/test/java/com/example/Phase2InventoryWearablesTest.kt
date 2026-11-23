@@ -23,13 +23,21 @@ import com.example.linkpoint.client.ViewerSessionViewModel
 import com.example.linkpoint.designsystem.LinkpointPanelSurface
 import com.example.linkpoint.designsystem.LinkpointTheme
 import com.example.linkpoint.designsystem.PersonalDesignState
+import com.example.linkpoint.protocol.AisLinkRequest
+import com.example.linkpoint.protocol.AvatarTextureIndex
 import com.example.linkpoint.protocol.CapabilityManager
 import com.example.linkpoint.protocol.GridAssetManager
 import com.example.linkpoint.protocol.InventoryDescendentsParser
 import com.example.linkpoint.protocol.LindenNotecardParser
 import com.example.linkpoint.protocol.LlsdCodec
 import com.example.linkpoint.protocol.LludpPackets
+import com.example.linkpoint.protocol.SlAssetType
+import com.example.linkpoint.protocol.SlBinaryParsers
+import com.example.linkpoint.protocol.SlFolderType
+import com.example.linkpoint.protocol.SlInventoryType
 import com.example.linkpoint.protocol.SlWearableType
+import com.example.linkpoint.scene.AvatarEntity
+import com.example.linkpoint.scene.Vec3
 import com.example.linkpoint.store.InventoryEntry
 import com.example.linkpoint.ui.InventoryFloaterContent
 import com.example.linkpoint.ui.buildVisibleTree
@@ -42,6 +50,7 @@ import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -416,6 +425,484 @@ class Phase2InventoryWearablesUnitTest {
         assertEquals(listOf(0, 1, 2, 3, 4), fullTree.map { it.depth })
         assertEquals("Neon Trenchcoat", fullTree.last().entry.name)
     }
+
+    @Test
+    fun `requests AIS3, Library, and IncrementCOFVersion capabilities during seed negotiation`() = runBlocking {
+        val expectedCaps = listOf(
+            "InventoryAPIv3",
+            "LibraryAPIv3",
+            "FetchLib2",
+            "FetchLibDescendents2",
+            "IncrementCOFVersion"
+        )
+        for (capName in expectedCaps) {
+            assertTrue(
+                "Expected $capName in CapabilityManager.REQUESTED_CAPS",
+                capName in CapabilityManager.REQUESTED_CAPS
+            )
+        }
+
+        var capturedSeedRequestBody = ""
+        val seedClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val buf = Buffer()
+                req.body?.writeTo(buf)
+                capturedSeedRequestBody = buf.readUtf8()
+                val responseXml = """
+                    <?xml version="1.0" encoding="UTF-8"?>
+                    <llsd><map>
+                      <key>InventoryAPIv3</key><string>https://sim.agni.lindenlab.com:12043/cap/inv-v3</string>
+                      <key>LibraryAPIv3</key><string>https://sim.agni.lindenlab.com:12043/cap/lib-v3</string>
+                      <key>FetchLib2</key><string>https://sim.agni.lindenlab.com:12043/cap/fetch-lib2</string>
+                      <key>FetchLibDescendents2</key><string>https://sim.agni.lindenlab.com:12043/cap/fetch-lib-desc2</string>
+                      <key>IncrementCOFVersion</key><string>https://sim.agni.lindenlab.com:12043/cap/inc-cof</string>
+                    </map></llsd>
+                """.trimIndent()
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "application/llsd+xml")
+                    .body(responseXml.toResponseBody("application/llsd+xml".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val capMgr = CapabilityManager(httpClient = seedClient, seedHttpClient = seedClient)
+        try {
+            val result = capMgr.requestSeedCapabilities("https://sim.agni.lindenlab.com:12043/cap/seed-0001")
+            val requestedNames = LlsdCodec.parseXml(capturedSeedRequestBody).asList().map { it.asString() }
+            assertTrue(requestedNames.containsAll(expectedCaps))
+            assertTrue(capMgr.hasAis3Support())
+            assertTrue(capMgr.hasLibraryAis3Support())
+            assertTrue(capMgr.hasCofVersionSupport())
+            assertEquals("https://sim.agni.lindenlab.com:12043/cap/inv-v3", result.capabilities["InventoryAPIv3"])
+            assertEquals("https://sim.agni.lindenlab.com:12043/cap/inc-cof", result.capabilities["IncrementCOFVersion"])
+        } finally {
+            capMgr.shutdown()
+        }
+    }
+
+    @Test
+    fun `creates and removes AIS3 Current Outfit links and bumps IncrementCOFVersion on Agni with OpenSim UDP fallback`() = runBlocking {
+        val cofFolderId = UUID.fromString("c0f00000-0000-4000-8000-000000000046")
+        val oldJacketItemId = UUID.fromString("20000000-0000-4000-8000-000000000011")
+        val oldJacketCofLinkId = UUID.fromString("c0f11111-1111-4111-8111-111111111111")
+        val universalWearableItemId = UUID.fromString("20000000-0000-4000-8000-000000000017")
+        val createdUniversalLinkId = UUID.fromString("c0f22222-2222-4222-8222-222222222222")
+
+        val recordedRequests = mutableListOf<Triple<String, String, String>>()
+        val cofVersionCounter = AtomicInteger(41)
+
+        val agniHttpClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val bodyBuf = Buffer()
+                req.body?.writeTo(bodyBuf)
+                val reqBody = bodyBuf.readUtf8()
+                recordedRequests.add(Triple(req.method, req.url.toString(), reqBody))
+
+                val path = req.url.encodedPath
+                val (statusCode, respXml) = when {
+                    req.method == "DELETE" && path.endsWith("/item/$oldJacketCofLinkId") -> {
+                        200 to """
+                            <?xml version="1.0" encoding="UTF-8"?>
+                            <llsd><map>
+                              <key>_updated_category_versions</key>
+                              <map><key>$cofFolderId</key><integer>${cofVersionCounter.get()}</integer></map>
+                            </map></llsd>
+                        """.trimIndent()
+                    }
+                    req.method == "POST" && path.endsWith("/category/$cofFolderId") -> {
+                        201 to """
+                            <?xml version="1.0" encoding="UTF-8"?>
+                            <llsd><map>
+                              <key>_embedded</key>
+                              <map>
+                                <key>links</key>
+                                <map>
+                                  <key>$createdUniversalLinkId</key>
+                                  <map>
+                                    <key>item_id</key><uuid>$createdUniversalLinkId</uuid>
+                                    <key>parent_id</key><uuid>$cofFolderId</uuid>
+                                    <key>linked_id</key><uuid>$universalWearableItemId</uuid>
+                                    <key>type</key><integer>24</integer>
+                                    <key>inv_type</key><integer>18</integer>
+                                    <key>name</key><string>BoM Aux Tattoo</string>
+                                    <key>desc</key><string>@1700</string>
+                                  </map>
+                                </map>
+                              </map>
+                              <key>_updated_category_versions</key>
+                              <map><key>$cofFolderId</key><integer>${cofVersionCounter.get()}</integer></map>
+                            </map></llsd>
+                        """.trimIndent()
+                    }
+                    req.method == "GET" && path.endsWith("/cap/inc-cof") -> {
+                        val bumped = cofVersionCounter.incrementAndGet()
+                        200 to """
+                            <?xml version="1.0" encoding="UTF-8"?>
+                            <llsd><map><key>version</key><integer>$bumped</integer></map></llsd>
+                        """.trimIndent()
+                    }
+                    req.method == "GET" && path.endsWith("/category/current/links") -> {
+                        200 to """
+                            <?xml version="1.0" encoding="UTF-8"?>
+                            <llsd><map>
+                              <key>category_id</key><uuid>$cofFolderId</uuid>
+                              <key>version</key><integer>${cofVersionCounter.get()}</integer>
+                              <key>_embedded</key>
+                              <map>
+                                <key>categories</key>
+                                <map>
+                                  <key>$cofFolderId</key>
+                                  <map>
+                                    <key>category_id</key><uuid>$cofFolderId</uuid>
+                                    <key>parent_id</key><uuid>aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa</uuid>
+                                    <key>name</key><string>Current Outfit</string>
+                                    <key>type_default</key><integer>46</integer>
+                                    <key>version</key><integer>${cofVersionCounter.get()}</integer>
+                                  </map>
+                                </map>
+                                <key>links</key>
+                                <map>
+                                  <key>$createdUniversalLinkId</key>
+                                  <map>
+                                    <key>item_id</key><uuid>$createdUniversalLinkId</uuid>
+                                    <key>parent_id</key><uuid>$cofFolderId</uuid>
+                                    <key>linked_id</key><uuid>$universalWearableItemId</uuid>
+                                    <key>type</key><integer>24</integer>
+                                    <key>inv_type</key><integer>18</integer>
+                                    <key>name</key><string>BoM Aux Tattoo</string>
+                                    <key>desc</key><string>@1700</string>
+                                  </map>
+                                </map>
+                              </map>
+                            </map></llsd>
+                        """.trimIndent()
+                    }
+                    else -> 404 to "<llsd><undef/></llsd>"
+                }
+
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(statusCode)
+                    .message("OK")
+                    .header("Content-Type", "application/llsd+xml")
+                    .body(respXml.toResponseBody("application/llsd+xml".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val agniCaps = CapabilityManager(httpClient = agniHttpClient, seedHttpClient = agniHttpClient)
+        agniCaps.configureCapabilities(
+            mapOf(
+                "InventoryAPIv3" to "https://sim.agni.lindenlab.com:12043/cap/ais3",
+                "IncrementCOFVersion" to "https://sim.agni.lindenlab.com:12043/cap/inc-cof"
+            )
+        )
+
+        var udpFallbackCount = 0
+        val agniSync = agniCaps.syncWearableCofOrFallback(
+            cofFolderId = cofFolderId,
+            linkToCreate = AisLinkRequest(
+                linkedId = universalWearableItemId,
+                assetType = SlAssetType.LINK,
+                inventoryType = SlInventoryType.WEARABLE,
+                name = "BoM Aux Tattoo",
+                description = CapabilityManager.buildCofOrderDescription(SlWearableType.UNIVERSAL.code, 0)
+            ),
+            linkItemIdsToRemove = listOf(oldJacketCofLinkId),
+            onUdpFallback = { udpFallbackCount++ }
+        )
+
+        assertTrue(agniSync.usedAis3Cof)
+        assertFalse(agniSync.usedUdpFallback)
+        assertEquals(0, udpFallbackCount)
+        assertEquals(listOf(oldJacketCofLinkId), agniSync.removedLinkItemIds)
+        assertEquals(createdUniversalLinkId, agniSync.createdLinkItemId)
+        assertEquals(42, agniSync.updatedCofVersion)
+
+        // Verify exact AIS3 HTTP request sequence: DELETE old COF link -> POST new COF link (?tid=...) -> GET IncrementCOFVersion
+        assertEquals(3, recordedRequests.size)
+        assertEquals("DELETE", recordedRequests[0].first)
+        assertTrue(recordedRequests[0].second.endsWith("/cap/ais3/item/$oldJacketCofLinkId"))
+
+        assertEquals("POST", recordedRequests[1].first)
+        assertTrue(recordedRequests[1].second.contains("/cap/ais3/category/$cofFolderId?tid="))
+        val postPayload = LlsdCodec.parseXml(recordedRequests[1].third)
+        val linkNode = postPayload["links"].asList().single()
+        assertEquals(universalWearableItemId, linkNode["linked_id"].asUuidOrNull())
+        assertEquals(SlAssetType.LINK.code, linkNode["type"].asInt(-1))
+        assertEquals(SlInventoryType.WEARABLE.code, linkNode["inv_type"].asInt(-1))
+        assertEquals("@1700", linkNode["desc"].asString())
+
+        assertEquals("GET", recordedRequests[2].first)
+        assertEquals("https://sim.agni.lindenlab.com:12043/cap/inc-cof", recordedRequests[2].second)
+
+        // Verify FetchCOF (`GET /category/current/links`) parses COF folder + AT_LINK without conflating linkItemId and linkedId
+        val fetchedCof = agniCaps.fetchCofLinks()
+        assertEquals(1, fetchedCof.folders.size)
+        assertTrue(fetchedCof.folders.single().isCurrentOutfitFolder)
+        assertEquals(SlFolderType.CURRENT_OUTFIT, fetchedCof.folders.single().preferredFolderType)
+        assertEquals(1, fetchedCof.links.size)
+        val cofLink = fetchedCof.links.single()
+        assertEquals(createdUniversalLinkId, cofLink.linkItemId)
+        assertEquals(cofFolderId, cofLink.parentFolderId)
+        assertEquals(universalWearableItemId, cofLink.linkedId)
+        assertNotEquals(cofLink.linkItemId, cofLink.linkedId)
+
+        // Verify OpenSimulator fallback: when InventoryAPIv3 / IncrementCOFVersion are absent, UDP AgentIsNowWearing is used
+        val openSimCaps = CapabilityManager(httpClient = agniHttpClient, seedHttpClient = agniHttpClient)
+        openSimCaps.configureCapabilities(
+            mapOf("FetchInventoryDescendents2" to "http://opensim.example.org:8002/caps/fetch-desc")
+        )
+        assertFalse(openSimCaps.hasAis3Support())
+        assertFalse(openSimCaps.hasCofVersionSupport())
+
+        var udpPacketBytes: ByteArray? = null
+        val openSimSync = openSimCaps.syncWearableCofOrFallback(
+            cofFolderId = cofFolderId,
+            linkToCreate = AisLinkRequest(
+                linkedId = universalWearableItemId,
+                assetType = SlAssetType.LINK,
+                inventoryType = SlInventoryType.WEARABLE,
+                name = "BoM Aux Tattoo",
+                description = "@1700"
+            ),
+            onUdpFallback = {
+                udpFallbackCount++
+                udpPacketBytes = LludpPackets.buildAgentIsNowWearing(
+                    agentId = UUID.fromString("11111111-1111-4111-8111-111111111111"),
+                    sessionId = UUID.fromString("22222222-2222-4222-8222-222222222222"),
+                    wearables = listOf(oldJacketItemId to SlWearableType.JACKET.code, universalWearableItemId to SlWearableType.UNIVERSAL.code)
+                )
+            }
+        )
+        assertFalse(openSimSync.usedAis3Cof)
+        assertTrue(openSimSync.usedUdpFallback)
+        assertEquals(1, udpFallbackCount)
+        assertNotNull(udpPacketBytes)
+    }
+
+    @Test
+    fun `supports wearable type 17 (Universal) and preserves distinct SlAssetType, SlInventoryType, asset_id, item_id, and folder_id`() {
+        // 1. All wearable types 0..17 map cleanly, with UNIVERSAL = 17 alongside 0..16
+        for (code in 0..17) {
+            assertNotNull("Expected SlWearableType for code $code", SlWearableType.fromCode(code))
+        }
+        assertEquals(17, SlWearableType.UNIVERSAL.code)
+        assertEquals("Universal", SlWearableType.UNIVERSAL.label)
+        assertFalse(SlWearableType.UNIVERSAL.isBodyPart)
+        assertTrue(SlWearableType.UNIVERSAL.isUniversal)
+        assertEquals(SlWearableType.UNIVERSAL, SlWearableType.fromCode(17))
+        assertEquals(
+            17,
+            SlWearableType.resolveWearableType(SlAssetType.CLOTHING.code, flags = 17, name = "Custom Aux Layer")
+        )
+        assertEquals(
+            17,
+            SlWearableType.resolveWearableType(SlAssetType.CLOTHING.code, flags = 0, name = "Maitreya Bakes on Mesh Universal")
+        )
+
+        // Verify UDP AgentIsNowWearing (0xFFFF017F) frames and encodes wearable type 17 (0x11) accurately
+        val agentId = UUID.fromString("aaaaaaaa-1111-4111-8111-111111111111")
+        val sessionId = UUID.fromString("bbbbbbbb-2222-4222-8222-222222222222")
+        val universalItemId = UUID.fromString("cccccccc-3333-4333-8333-333333333333")
+        val wearableBody = LludpPackets.buildAgentIsNowWearing(
+            agentId = agentId,
+            sessionId = sessionId,
+            wearables = listOf(universalItemId to SlWearableType.UNIVERSAL.code)
+        )
+        val framedPacket = LludpPackets.framePacket(
+            sequenceNumber = 42,
+            reliable = true,
+            messageId = LludpPackets.MSG_AGENT_IS_NOW_WEARING,
+            body = wearableBody
+        )
+        val decodedPacket = LludpPackets.decodePacket(framedPacket, framedPacket.size)
+        assertNotNull(decodedPacket)
+        assertEquals(LludpPackets.MSG_AGENT_IS_NOW_WEARING, decodedPacket!!.messageId)
+        val buf = decodedPacket.payload.order(ByteOrder.LITTLE_ENDIAN)
+        assertEquals(agentId, LludpPackets.readUuid(buf))
+        assertEquals(sessionId, LludpPackets.readUuid(buf))
+        assertEquals(1, buf.get().toInt() and 0xFF) // 1 WearableData block
+        assertEquals(universalItemId, LludpPackets.readUuid(buf))
+        assertEquals(17, buf.get().toInt() and 0xFF)
+
+        // 2. SlAssetType (llassettype.h) and SlInventoryType (llinventorytype.h) are strictly distinct enums
+        assertNotEquals(SlAssetType.CLOTHING as Any, SlInventoryType.WEARABLE as Any)
+        assertNotEquals(SlAssetType::class.java, SlInventoryType::class.java)
+        assertEquals(5, SlAssetType.CLOTHING.code)
+        assertEquals(13, SlAssetType.BODYPART.code)
+        assertEquals(24, SlAssetType.LINK.code)
+        assertEquals(25, SlAssetType.LINK_FOLDER.code)
+        assertEquals(49, SlAssetType.MESH.code)
+        assertEquals(56, SlAssetType.SETTINGS.code)
+        assertEquals(58, SlAssetType.GLTF.code)
+
+        assertEquals(17, SlInventoryType.ATTACHMENT.code)
+        assertEquals(18, SlInventoryType.WEARABLE.code)
+        assertEquals(22, SlInventoryType.MESH.code)
+        assertEquals(25, SlInventoryType.SETTINGS.code)
+        assertEquals(27, SlInventoryType.GLTF.code)
+
+        // 3. folder_id, item_id, asset_id, and linked_id are never conflated
+        val folderUuid = UUID.fromString("f01de200-0000-4000-8000-000000000001")
+        val itemUuid = UUID.fromString("17e40000-0000-4000-8000-000000000002")
+        val assetUuid = UUID.fromString("a55e7000-0000-4000-8000-000000000003")
+        val linkItemUuid = UUID.fromString("119c0000-0000-4000-8000-000000000004")
+
+        val llsdXml = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <llsd><map>
+              <key>folders</key>
+              <array>
+                <map>
+                  <key>folder_id</key><uuid>$folderUuid</uuid>
+                  <key>items</key>
+                  <array>
+                    <map>
+                      <key>item_id</key><uuid>$itemUuid</uuid>
+                      <key>parent_id</key><uuid>$folderUuid</uuid>
+                      <key>asset_id</key><uuid>$assetUuid</uuid>
+                      <key>type</key><integer>5</integer>
+                      <key>inv_type</key><integer>18</integer>
+                      <key>flags</key><integer>17</integer>
+                      <key>name</key><string>Universal Freckles</string>
+                    </map>
+                    <map>
+                      <key>item_id</key><uuid>$linkItemUuid</uuid>
+                      <key>parent_id</key><uuid>$folderUuid</uuid>
+                      <key>asset_id</key><uuid>$itemUuid</uuid>
+                      <key>type</key><integer>24</integer>
+                      <key>inv_type</key><integer>18</integer>
+                      <key>name</key><string>Universal Freckles (COF Link)</string>
+                    </map>
+                  </array>
+                </map>
+              </array>
+            </map></llsd>
+        """.trimIndent()
+
+        val parsed = InventoryDescendentsParser.parse(LlsdCodec.parseXml(llsdXml), folderUuid)
+        assertEquals(1, parsed.items.size)
+        assertEquals(1, parsed.links.size)
+
+        val concrete = parsed.items.single()
+        assertEquals(itemUuid, concrete.itemId)
+        assertEquals(folderUuid, concrete.parentId)
+        assertEquals(assetUuid, concrete.assetId)
+        assertEquals(SlAssetType.CLOTHING, concrete.slAssetType)
+        assertEquals(SlInventoryType.WEARABLE, concrete.slInventoryType)
+        assertEquals(17, concrete.wearableType)
+
+        // Link item (AT_LINK = 24) routes into parsed.links with linkItemId != linkedId and never pollutes concrete assetId items
+        val link = parsed.links.single()
+        assertEquals(linkItemUuid, link.linkItemId)
+        assertEquals(folderUuid, link.parentFolderId)
+        assertEquals(itemUuid, link.linkedId)
+        assertEquals(SlAssetType.LINK, link.assetType)
+        assertEquals(SlInventoryType.WEARABLE, link.inventoryType)
+
+        val folderEntry = InventoryEntry(id = folderUuid, parentId = UUID(0L, 0L), name = "Clothing", isFolder = true, assetType = 5, folderType = 5)
+        val itemEntry = InventoryEntry(id = itemUuid, parentId = folderUuid, name = concrete.name, isFolder = false, assetType = concrete.assetType, assetId = concrete.assetId, invType = concrete.invType, flags = concrete.flags, wearableType = concrete.wearableType)
+        assertEquals(folderUuid, folderEntry.folderId)
+        assertNull(folderEntry.itemId)
+        assertEquals(itemUuid, itemEntry.itemId)
+        assertNull(itemEntry.folderId)
+        assertEquals(assetUuid, itemEntry.assetId)
+        assertNotEquals(itemEntry.itemId, itemEntry.assetId)
+        assertNotEquals(itemEntry.parentId, itemEntry.assetId)
+    }
+
+    @Test
+    fun `maps AvatarTextureIndex Bakes on Mesh and Universal tattoo channels 0 to 44 and resolves mesh body BoM textures`() {
+        // 1. Canonical bake channels (8..11, 19..20, 40..44)
+        assertEquals(8, AvatarTextureIndex.HeadBaked.index)
+        assertEquals(9, AvatarTextureIndex.UpperBaked.index)
+        assertEquals(10, AvatarTextureIndex.LowerBaked.index)
+        assertEquals(11, AvatarTextureIndex.EyesBaked.index)
+        assertEquals(19, AvatarTextureIndex.SkirtBaked.index)
+        assertEquals(20, AvatarTextureIndex.HairBaked.index)
+        assertEquals(40, AvatarTextureIndex.LeftArmBaked.index)
+        assertEquals(41, AvatarTextureIndex.LegLegBaked.index)
+        assertEquals(AvatarTextureIndex.LegLegBaked, AvatarTextureIndex.LeftLegBaked)
+        assertEquals(42, AvatarTextureIndex.Aux1Baked.index)
+        assertEquals(43, AvatarTextureIndex.Aux2Baked.index)
+        assertEquals(44, AvatarTextureIndex.Aux3Baked.index)
+        assertEquals(11, AvatarTextureIndex.BAKE_CHANNELS.size)
+        assertTrue(AvatarTextureIndex.BAKE_CHANNELS.all { it.isBaked })
+
+        // 2. Canonical Universal wearable (17) tattoo channels (29..39) and target server bake routing
+        assertEquals(29, AvatarTextureIndex.HeadUniversalTattoo.index)
+        assertEquals(30, AvatarTextureIndex.UpperUniversalTattoo.index)
+        assertEquals(31, AvatarTextureIndex.LowerUniversalTattoo.index)
+        assertEquals(32, AvatarTextureIndex.SkirtTattoo.index)
+        assertEquals(33, AvatarTextureIndex.HairTattoo.index)
+        assertEquals(34, AvatarTextureIndex.EyesTattoo.index)
+        assertEquals(35, AvatarTextureIndex.LeftArmTattoo.index)
+        assertEquals(36, AvatarTextureIndex.LeftLegTattoo.index)
+        assertEquals(37, AvatarTextureIndex.Aux1Tattoo.index)
+        assertEquals(38, AvatarTextureIndex.Aux2Tattoo.index)
+        assertEquals(39, AvatarTextureIndex.Aux3Tattoo.index)
+        assertEquals(11, AvatarTextureIndex.UNIVERSAL_TATTOO_CHANNELS.size)
+        assertTrue(AvatarTextureIndex.UNIVERSAL_TATTOO_CHANNELS.all { it.isUniversalTattoo })
+
+        assertEquals(AvatarTextureIndex.HeadBaked, AvatarTextureIndex.HeadUniversalTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.UpperBaked, AvatarTextureIndex.UpperUniversalTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.LowerBaked, AvatarTextureIndex.LowerUniversalTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.SkirtBaked, AvatarTextureIndex.SkirtTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.HairBaked, AvatarTextureIndex.HairTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.EyesBaked, AvatarTextureIndex.EyesTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.LeftArmBaked, AvatarTextureIndex.LeftArmTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.LegLegBaked, AvatarTextureIndex.LeftLegTattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.Aux1Baked, AvatarTextureIndex.Aux1Tattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.Aux2Baked, AvatarTextureIndex.Aux2Tattoo.targetBakeChannel)
+        assertEquals(AvatarTextureIndex.Aux3Baked, AvatarTextureIndex.Aux3Tattoo.targetBakeChannel)
+
+        // 3. 64-bit TextureEntry round-trip across extended BoM channels >= 32 (40..44)
+        val serverBakedByChannel = AvatarTextureIndex.BAKE_CHANNELS.associateWith { ch ->
+            UUID.fromString("ba4e0000-0000-4000-8000-%012d".format(ch.index))
+        }
+        val teBytes = SlBinaryParsers.buildTextureEntryBytes(
+            faceTextures = serverBakedByChannel.mapKeys { it.key.index }
+        )
+        val unpackedTe = SlBinaryParsers.parseTextureEntry(teBytes)
+        val extractedBakes = AvatarTextureIndex.extractBakedTextures(unpackedTe)
+        assertEquals(serverBakedByChannel, extractedBakes)
+
+        // 4. Mesh body / head attachment IMG_USE_BAKED_* sentinel substitution prevents grey mesh rendering
+        val avatar = AvatarEntity(
+            agentId = UUID.fromString("11111111-1111-4111-8111-111111111111"),
+            localId = 1,
+            displayName = "BoM Resident",
+            position = Vec3(128f, 128f, 25f),
+            bakedTextures = extractedBakes
+        )
+        for ((magicUuid, bakeChannel) in AvatarTextureIndex.BOM_MAGIC_UUID_TO_BAKE) {
+            assertFalse(
+                "BoM sentinel UUID $magicUuid ($bakeChannel) must never be fetched via GetTexture",
+                SlBinaryParsers.isUsefulTexture(magicUuid)
+            )
+            assertEquals(
+                "Expected $magicUuid to substitute composited $bakeChannel texture",
+                serverBakedByChannel[bakeChannel],
+                avatar.resolveAttachmentFaceTexture(magicUuid)
+            )
+        }
+
+        // Non-BoM custom mesh texture passes through unchanged; unbaked BoM channel returns null (warm skin fallback, not sentinel UUID)
+        val customApplierTex = UUID.fromString("99999999-8888-4777-8666-555555555555")
+        assertTrue(SlBinaryParsers.isUsefulTexture(customApplierTex))
+        assertEquals(customApplierTex, avatar.resolveAttachmentFaceTexture(customApplierTex))
+
+        val unbakedAvatar = avatar.copy(bakedTextures = emptyMap())
+        assertNull(unbakedAvatar.resolveAttachmentFaceTexture(AvatarTextureIndex.IMG_USE_BAKED_AUX2))
+    }
 }
 
 @RunWith(RobolectricTestRunner::class)
@@ -457,6 +944,16 @@ class Phase2InventoryRobolectricUiTest {
             // Compulsory bodypart stays worn when tapped directly
             vm.toggleWearInventoryItem(shape.id)
             assertTrue(vm.state.value.inventoryEntries.first { it.id == shape.id }.isWorn)
+
+            // Universal wearable (type 17) wears and takes off cleanly without attaching as a HUD
+            val universalTattoo = vm.state.value.inventoryEntries.first { it.name == "Bakes-on-Mesh Aux Universal Tattoo" }
+            assertEquals(SlWearableType.UNIVERSAL.code, universalTattoo.wearableType)
+            assertFalse(universalTattoo.isWorn)
+            vm.toggleWearInventoryItem(universalTattoo.id)
+            assertTrue(vm.state.value.inventoryEntries.first { it.id == universalTattoo.id }.isWorn)
+            assertEquals(0, vm.state.value.inventoryEntries.first { it.id == universalTattoo.id }.attachmentPoint)
+            vm.toggleWearInventoryItem(universalTattoo.id)
+            assertFalse(vm.state.value.inventoryEntries.first { it.id == universalTattoo.id }.isWorn)
 
             // 2. Verify 3D Object / HUD Add (stacking) vs Replace vs Detach
             val compassHud = vm.state.value.inventoryEntries.first { it.name == "Tactical Radar Compass HUD" }

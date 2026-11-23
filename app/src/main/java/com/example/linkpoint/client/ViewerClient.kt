@@ -91,6 +91,8 @@ interface ViewerClient {
     fun toggleWearInventoryItem(itemId: UUID, targetHudSlot: Int? = null)
     fun attachObjectFromInventory(itemId: UUID, attachmentPoint: Int = 0, add: Boolean = false) {}
     fun detachInventoryItem(itemId: UUID) {}
+    fun syncCurrentOutfitFolder() {}
+    fun isAis3CofActive(): Boolean = false
     fun openInventoryNotecard(itemId: UUID) {}
     fun dismissNotecardViewer() {}
     fun openInventoryTexture(itemId: UUID) {}

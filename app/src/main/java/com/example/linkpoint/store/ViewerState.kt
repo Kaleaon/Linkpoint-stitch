@@ -11,6 +11,9 @@ import com.example.linkpoint.protocol.AssetStreamStats
 import com.example.linkpoint.protocol.ConnectionHealthSnapshot
 import com.example.linkpoint.protocol.NetworkDiagnosticReport
 import com.example.linkpoint.protocol.NetworkErrorCategory
+import com.example.linkpoint.protocol.SlAssetType
+import com.example.linkpoint.protocol.SlFolderType
+import com.example.linkpoint.protocol.SlInventoryType
 import com.example.linkpoint.render.RenderSceneSnapshot
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
@@ -105,15 +108,32 @@ data class InventoryEntry(
     val parentId: UUID,
     val name: String,
     val isFolder: Boolean,
-    val assetType: Int, // 0=Texture, 3=Landmark, 5=Clothing, 6=Object, 7=Notecard, 10=Script, 13=Bodypart
+    val assetType: Int, // SlAssetType code for items; folder preferred type code for folders
     val isWorn: Boolean = false,
     val attachmentPoint: Int = 0,
     val assetId: UUID? = null,
     val description: String = "",
     val invType: Int = 0,
     val flags: Int = 0,
-    val wearableType: Int? = null
-)
+    val wearableType: Int? = null,
+    val linkedItemId: UUID? = null,
+    val folderType: Int = -1
+) {
+    /** Strictly the category `folder_id` when [isFolder] is true; never conflated with [itemId] or [assetId]. */
+    val folderId: UUID? get() = if (isFolder) id else null
+
+    /** Strictly the inventory `item_id` when [isFolder] is false; never conflated with [folderId] or [assetId]. */
+    val itemId: UUID? get() = if (!isFolder) id else null
+
+    val slAssetType: SlAssetType
+        get() = if (isFolder) SlAssetType.CATEGORY else SlAssetType.fromCode(assetType)
+
+    val slInventoryType: SlInventoryType
+        get() = if (isFolder) SlInventoryType.CATEGORY else SlInventoryType.fromCode(invType)
+
+    val slFolderType: SlFolderType
+        get() = SlFolderType.fromCode(if (folderType != -1) folderType else assetType)
+}
 
 data class NotecardViewerState(
     val itemId: UUID,
@@ -192,6 +212,8 @@ data class ViewerState(
     val nearbyAvatars: List<NearbyAvatarInfo> = emptyList(),
     val inventoryEntries: List<InventoryEntry> = emptyList(),
     val expandedFolderIds: Set<UUID> = emptySet(),
+    val currentOutfitFolderId: UUID? = null,
+    val cofVersion: Int = 0,
     val activeNotecard: NotecardViewerState? = null,
     val activeTexturePreview: TexturePreviewState? = null,
     val mapRegions: List<MapRegionTile> = emptyList(),

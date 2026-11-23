@@ -20,7 +20,9 @@ import com.example.linkpoint.designsystem.JoystickSide
 import com.example.linkpoint.designsystem.PersonalDesignState
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.designsystem.UiDensity
+import com.example.linkpoint.protocol.AisLinkRequest
 import com.example.linkpoint.protocol.AssetStreamEvent
+import com.example.linkpoint.protocol.AvatarTextureIndex
 import com.example.linkpoint.protocol.CapabilityManager
 import com.example.linkpoint.protocol.CapsAttachmentTransform
 import com.example.linkpoint.protocol.CapsEvent
@@ -33,7 +35,10 @@ import com.example.linkpoint.protocol.LoginRequestParams
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
+import com.example.linkpoint.protocol.SlAssetType
 import com.example.linkpoint.protocol.SlBinaryParsers
+import com.example.linkpoint.protocol.SlFolderType
+import com.example.linkpoint.protocol.SlInventoryType
 import com.example.linkpoint.protocol.SlWearableType
 import com.example.linkpoint.protocol.XmlRpcLoginClient
 import com.example.linkpoint.render.LinkpointGlRenderer
@@ -107,6 +112,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private val manualHudAttachments = LinkedHashMap<Int, SceneObject>()
     private val nextManualAttachmentLocalId = AtomicInteger(9200)
     private val wornWearablesByType = ConcurrentHashMap<Int, UUID>()
+    private val cofLinksByTargetItemId = ConcurrentHashMap<UUID, UUID>()
+    @Volatile private var currentCofFolderId: UUID? = null
     private val capsAttachmentOverridesByUuid = ConcurrentHashMap<UUID, CapsAttachmentTransform>()
     private val capsAttachmentOverridesByLocalId = ConcurrentHashMap<Int, CapsAttachmentTransform>()
     private val avatars = LinkedHashMap<UUID, AvatarEntity>()
@@ -248,13 +255,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         val yawRad = 2f * atan2(evt.rotation.z, evt.rotation.w)
                         val heightM = evt.scale.z.takeIf { it in 1.1f..2.8f } ?: existing?.heightMeters ?: 1.82f
                         val baked = evt.textureEntry
-                        val headTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HEAD] ?: existing?.bakedHeadTextureId
-                        val upperTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_UPPER] ?: existing?.bakedUpperTextureId
-                        val lowerTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_LOWER] ?: existing?.bakedLowerTextureId
-                        val eyesTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_EYES] ?: existing?.bakedEyesTextureId
-                        val hairTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HAIR] ?: existing?.bakedHairTextureId
+                        val mergedBakes = AvatarTextureIndex.extractBakedTextures(
+                            baked,
+                            existing?.effectiveBakedTextures().orEmpty()
+                        )
+                        val headTex = mergedBakes[AvatarTextureIndex.HeadBaked] ?: existing?.bakedHeadTextureId
+                        val upperTex = mergedBakes[AvatarTextureIndex.UpperBaked] ?: existing?.bakedUpperTextureId
+                        val lowerTex = mergedBakes[AvatarTextureIndex.LowerBaked] ?: existing?.bakedLowerTextureId
+                        val eyesTex = mergedBakes[AvatarTextureIndex.EyesBaked] ?: existing?.bakedEyesTextureId
+                        val hairTex = mergedBakes[AvatarTextureIndex.HairBaked] ?: existing?.bakedHairTextureId
 
-                        listOfNotNull(headTex, upperTex, lowerTex, eyesTex, hairTex, baked.defaultTextureId)
+                        (mergedBakes.values + listOfNotNull(baked.defaultTextureId))
                             .forEach { assetManager.requestTexture(it, highPriority = true) }
 
                         val updatedAvatar = (existing ?: AvatarEntity(
@@ -276,7 +287,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             bakedUpperTextureId = upperTex,
                             bakedLowerTextureId = lowerTex,
                             bakedEyesTextureId = eyesTex,
-                            bakedHairTextureId = hairTex
+                            bakedHairTextureId = hairTex,
+                            bakedTextures = mergedBakes
                         )
                         avatars[evt.agentId] = updatedAvatar
 
@@ -309,14 +321,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         val matchingAvatar = avatars.values.firstOrNull { it.localId == evt.localId }
                         if (matchingAvatar != null) {
                             val te = evt.textureEntry
-                            val headTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_HEAD) ?: matchingAvatar.bakedHeadTextureId
-                            val upperTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_UPPER) ?: matchingAvatar.bakedUpperTextureId
-                            val lowerTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_LOWER) ?: matchingAvatar.bakedLowerTextureId
-                            val eyesTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_EYES) ?: matchingAvatar.bakedEyesTextureId
-                            val hairTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_HAIR) ?: matchingAvatar.bakedHairTextureId
+                            val mergedBakes = AvatarTextureIndex.extractBakedTextures(
+                                te,
+                                matchingAvatar.effectiveBakedTextures()
+                            )
+                            val headTex = mergedBakes[AvatarTextureIndex.HeadBaked] ?: matchingAvatar.bakedHeadTextureId
+                            val upperTex = mergedBakes[AvatarTextureIndex.UpperBaked] ?: matchingAvatar.bakedUpperTextureId
+                            val lowerTex = mergedBakes[AvatarTextureIndex.LowerBaked] ?: matchingAvatar.bakedLowerTextureId
+                            val eyesTex = mergedBakes[AvatarTextureIndex.EyesBaked] ?: matchingAvatar.bakedEyesTextureId
+                            val hairTex = mergedBakes[AvatarTextureIndex.HairBaked] ?: matchingAvatar.bakedHairTextureId
                             if (te != null) {
-                                listOfNotNull(headTex, upperTex, lowerTex, eyesTex, hairTex)
-                                    .forEach { assetManager.requestTexture(it, highPriority = true) }
+                                mergedBakes.values.forEach { assetManager.requestTexture(it, highPriority = true) }
                             }
 
                             val isActivelySteeringSelf = matchingAvatar.isSelf && isSelfActivelySteering()
@@ -332,7 +347,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                     bakedUpperTextureId = upperTex,
                                     bakedLowerTextureId = lowerTex,
                                     bakedEyesTextureId = eyesTex,
-                                    bakedHairTextureId = hairTex
+                                    bakedHairTextureId = hairTex,
+                                    bakedTextures = mergedBakes
                                 )
                                 if (matchingAvatar.isSelf) {
                                     lludpEngine.avatarPos = evt.position
@@ -351,7 +367,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                     bakedUpperTextureId = upperTex,
                                     bakedLowerTextureId = lowerTex,
                                     bakedEyesTextureId = eyesTex,
-                                    bakedHairTextureId = hairTex
+                                    bakedHairTextureId = hairTex,
+                                    bakedTextures = mergedBakes
                                 )
                             }
                             refreshNearbyRadar()
@@ -381,13 +398,18 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     }
                     is SimEvent.AvatarAppearanceReceived -> {
                         val baked = evt.bakedTextures
-                        val headTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HEAD]
-                        val upperTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_UPPER]
-                        val lowerTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_LOWER]
-                        val eyesTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_EYES]
-                        val hairTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HAIR]
+                        val existing = avatars[evt.agentId]
+                        val mergedBakes = AvatarTextureIndex.extractBakedTextures(
+                            baked,
+                            existing?.effectiveBakedTextures().orEmpty()
+                        )
+                        val headTex = mergedBakes[AvatarTextureIndex.HeadBaked]
+                        val upperTex = mergedBakes[AvatarTextureIndex.UpperBaked]
+                        val lowerTex = mergedBakes[AvatarTextureIndex.LowerBaked]
+                        val eyesTex = mergedBakes[AvatarTextureIndex.EyesBaked]
+                        val hairTex = mergedBakes[AvatarTextureIndex.HairBaked]
 
-                        listOfNotNull(headTex, upperTex, lowerTex, eyesTex, hairTex, baked.defaultTextureId)
+                        (mergedBakes.values + listOfNotNull(baked.defaultTextureId))
                             .forEach { assetManager.requestTexture(it, highPriority = true) }
                         baked.faceTextures.values.forEach { assetManager.requestTexture(it, highPriority = true) }
 
@@ -397,7 +419,6 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             return minS + norm * (maxS - minS)
                         }
 
-                        val existing = avatars[evt.agentId]
                         val isSelf = evt.agentId == selfAgentId
                         val base = existing ?: AvatarEntity(
                             agentId = evt.agentId,
@@ -418,6 +439,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             bakedLowerTextureId = lowerTex ?: base.bakedLowerTextureId,
                             bakedEyesTextureId = eyesTex ?: base.bakedEyesTextureId,
                             bakedHairTextureId = hairTex ?: base.bakedHairTextureId,
+                            bakedTextures = mergedBakes,
                             visualParamsCount = evt.visualParams.size
                         )
                         if (!isSelf && !knownNames.containsKey(evt.agentId)) {
@@ -1106,6 +1128,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             allSceneObjects.clear()
             manualHudAttachments.clear()
             wornWearablesByType.clear()
+            cofLinksByTargetItemId.clear()
+            currentCofFolderId = null
             capsAttachmentOverridesByUuid.clear()
             capsAttachmentOverridesByLocalId.clear()
             avatars.clear()
@@ -1124,13 +1148,20 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 isSelf = true
             )
 
+            val cofFolder = response.inventorySkeleton.firstOrNull { f ->
+                f.typeDefault == SlFolderType.CURRENT_OUTFIT.code ||
+                    f.name.equals("Current Outfit", ignoreCase = true)
+            }
+            currentCofFolderId = cofFolder?.folderId
+
             val invEntries = response.inventorySkeleton.map { f ->
                 InventoryEntry(
                     id = f.folderId,
                     parentId = f.parentId,
                     name = f.name,
                     isFolder = true,
-                    assetType = f.typeDefault
+                    assetType = f.typeDefault,
+                    folderType = f.typeDefault
                 )
             }
 
@@ -1139,6 +1170,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             lludpEngine.connect(response)
             if (capsResult.capabilities.containsKey("AttachmentResources")) {
                 viewModelScope.launch { capabilityManager.fetchAttachmentResources() }
+            }
+            if (capabilityManager.hasAis3Support()) {
+                syncCurrentOutfitFolder()
             }
 
             _state.update { s ->
@@ -1153,6 +1187,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     ),
                     avatarPosition = Vec3(128f, 128f, 23f),
                     inventoryEntries = invEntries,
+                    currentOutfitFolderId = currentCofFolderId,
+                    cofVersion = cofFolder?.version ?: 0,
                     activeNotecard = null,
                     activeTexturePreview = null,
                     localChat = listOf(
@@ -1211,6 +1247,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
         manualHudAttachments.clear()
         wornWearablesByType.clear()
+        cofLinksByTargetItemId.clear()
+        currentCofFolderId = null
         capsAttachmentOverridesByUuid.clear()
         capsAttachmentOverridesByLocalId.clear()
         knownNames.clear()
@@ -1247,6 +1285,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val coatItemId = UUID.fromString("20000000-0000-4000-8000-000000000002")
         val pantsItemId = UUID.fromString("20000000-0000-4000-8000-000000000003")
         val bootsItemId = UUID.fromString("20000000-0000-4000-8000-000000000004")
+        val universalTattooItemId = UUID.fromString("20000000-0000-4000-8000-000000000005")
 
         val welcomeNotecardAssetId = UUID.fromString("70000000-0000-4000-8000-000000000001")
         val lslGuideNotecardAssetId = UUID.fromString("70000000-0000-4000-8000-000000000002")
@@ -1371,12 +1410,24 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 parentId = everydayLayersFolder,
                 name = "Grid Strider Boots",
                 isFolder = false,
-                assetType = 5,
+                assetType = SlAssetType.CLOTHING.code,
                 isWorn = false,
                 description = "All-terrain system footwear",
-                invType = 18,
+                invType = SlInventoryType.WEARABLE.code,
                 flags = SlWearableType.SHOES.code,
                 wearableType = SlWearableType.SHOES.code
+            ),
+            InventoryEntry(
+                id = universalTattooItemId,
+                parentId = everydayLayersFolder,
+                name = "Bakes-on-Mesh Aux Universal Tattoo",
+                isFolder = false,
+                assetType = SlAssetType.CLOTHING.code,
+                isWorn = false,
+                description = "BoM Universal wearable (type 17) targeting Aux1..Aux3 & LeftArm/LeftLeg bakes",
+                invType = SlInventoryType.WEARABLE.code,
+                flags = SlWearableType.UNIVERSAL.code,
+                wearableType = SlWearableType.UNIVERSAL.code
             ),
 
             // 3D Objects & HUDs (assetType = 6) inside nested subfolders
@@ -2250,6 +2301,33 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch { cacheRepo.deleteLandmark(landmarkId) }
     }
 
+    override fun isAis3CofActive(): Boolean =
+        capabilityManager.hasAis3Support() && currentCofFolderId != null
+
+    override fun syncCurrentOutfitFolder() {
+        if (!capabilityManager.hasAis3Support()) return
+        viewModelScope.launch {
+            val fetched = capabilityManager.fetchCofLinks(currentCofFolderId)
+            if (fetched.isNotEmpty()) {
+                val resolvedCofFolder = fetched.folders.firstOrNull { it.isCurrentOutfitFolder }
+                    ?: fetched.folders.firstOrNull()
+                if (resolvedCofFolder != null && currentCofFolderId == null) {
+                    currentCofFolderId = resolvedCofFolder.folderId
+                }
+                fetched.links.forEach { link ->
+                    cofLinksByTargetItemId[link.linkedId] = link.linkItemId
+                }
+                val nextVer = currentCofFolderId?.let { fetched.categoryVersions[it] } ?: resolvedCofFolder?.version
+                _state.update { s ->
+                    s.copy(
+                        currentOutfitFolderId = currentCofFolderId ?: s.currentOutfitFolderId,
+                        cofVersion = nextVer ?: s.cofVersion
+                    )
+                }
+            }
+        }
+    }
+
     override fun toggleInventoryFolder(folderId: UUID) {
         val currentlyExpanded = folderId in _state.value.expandedFolderIds
         _state.update { s ->
@@ -2260,18 +2338,27 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             viewModelScope.launch {
                 val fetched = capabilityManager.fetchFolderContents(folderId, selfAgentId)
                 if (fetched.isNotEmpty()) {
+                    if (folderId == currentCofFolderId) {
+                        fetched.links.forEach { link ->
+                            cofLinksByTargetItemId[link.linkedId] = link.linkItemId
+                        }
+                    }
                     _state.update { s ->
                         val existingIds = s.inventoryEntries.map { it.id }.toSet()
                         val newFolders = fetched.folders.filterNot { it.folderId in existingIds }.map { folder ->
+                            if (folder.isCurrentOutfitFolder && currentCofFolderId == null) {
+                                currentCofFolderId = folder.folderId
+                            }
                             InventoryEntry(
                                 id = folder.folderId,
                                 parentId = folder.parentId,
                                 name = folder.name,
                                 isFolder = true,
-                                assetType = folder.typeDefault
+                                assetType = folder.typeDefault,
+                                folderType = folder.typeDefault
                             )
                         }
-                        val wornItemIds = wornWearablesByType.values.toSet()
+                        val wornItemIds = wornWearablesByType.values.toSet() + cofLinksByTargetItemId.keys
                         val newItems = fetched.items.filterNot { it.itemId in existingIds }.map { item ->
                             val wType = item.wearableType
                             InventoryEntry(
@@ -2288,7 +2375,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                 wearableType = wType
                             )
                         }
-                        s.copy(inventoryEntries = s.inventoryEntries + newFolders + newItems)
+                        s.copy(
+                            inventoryEntries = s.inventoryEntries + newFolders + newItems,
+                            currentOutfitFolderId = currentCofFolderId ?: s.currentOutfitFolderId
+                        )
                     }
                 }
             }
@@ -2334,8 +2424,24 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             }
             wornWearablesByType.remove(wTypeCode)
             if (_state.value.connection is ConnectionState.Connected) {
-                val payload = wornWearablesByType.entries.map { (wt, id) -> id to wt } + (UUID(0L, 0L) to wTypeCode)
-                lludpEngine.sendAgentIsNowWearing(payload)
+                val udpPayload = wornWearablesByType.entries.map { (wt, id) -> id to wt } + (UUID(0L, 0L) to wTypeCode)
+                val linkToRemove = cofLinksByTargetItemId.remove(entry.id)
+                val cofId = currentCofFolderId
+                if (capabilityManager.hasAis3Support() && cofId != null && linkToRemove != null) {
+                    viewModelScope.launch {
+                        val res = capabilityManager.syncWearableCofOrFallback(
+                            cofFolderId = cofId,
+                            linkToCreate = null,
+                            linkItemIdsToRemove = listOf(linkToRemove),
+                            onUdpFallback = { lludpEngine.sendAgentIsNowWearing(udpPayload) }
+                        )
+                        if (res.updatedCofVersion != null) {
+                            _state.update { it.copy(cofVersion = res.updatedCofVersion) }
+                        }
+                    }
+                } else {
+                    lludpEngine.sendAgentIsNowWearing(udpPayload)
+                }
             }
             _state.update { s ->
                 s.copy(
@@ -2352,8 +2458,34 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         } else {
             val previousItemId = wornWearablesByType.put(wTypeCode, entry.id)
             if (_state.value.connection is ConnectionState.Connected) {
-                val payload = wornWearablesByType.entries.map { (wt, id) -> id to wt }
-                lludpEngine.sendAgentIsNowWearing(payload)
+                val udpPayload = wornWearablesByType.entries.map { (wt, id) -> id to wt }
+                val replacedLinkId = previousItemId?.let { cofLinksByTargetItemId.remove(it) }
+                val cofId = currentCofFolderId
+                if (capabilityManager.hasAis3Support() && cofId != null) {
+                    val linkReq = AisLinkRequest(
+                        linkedId = entry.id,
+                        assetType = SlAssetType.LINK,
+                        inventoryType = SlInventoryType.WEARABLE,
+                        name = entry.name,
+                        description = CapabilityManager.buildCofOrderDescription(wTypeCode, 0)
+                    )
+                    viewModelScope.launch {
+                        val res = capabilityManager.syncWearableCofOrFallback(
+                            cofFolderId = cofId,
+                            linkToCreate = linkReq,
+                            linkItemIdsToRemove = listOfNotNull(replacedLinkId),
+                            onUdpFallback = { lludpEngine.sendAgentIsNowWearing(udpPayload) }
+                        )
+                        if (res.createdLinkItemId != null) {
+                            cofLinksByTargetItemId[entry.id] = res.createdLinkItemId
+                        }
+                        if (res.updatedCofVersion != null) {
+                            _state.update { it.copy(cofVersion = res.updatedCofVersion) }
+                        }
+                    }
+                } else {
+                    lludpEngine.sendAgentIsNowWearing(udpPayload)
+                }
             }
             _state.update { s ->
                 s.copy(
@@ -2395,6 +2527,29 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
         if (_state.value.connection is ConnectionState.Connected) {
             lludpEngine.attachInventoryItem(itemId, resolvedPoint, entry.name, append = add)
+            val cofId = currentCofFolderId
+            if (capabilityManager.hasAis3Support() && cofId != null) {
+                val invType = if (entry.invType == SlInventoryType.ATTACHMENT.code) {
+                    SlInventoryType.ATTACHMENT
+                } else {
+                    SlInventoryType.OBJECT
+                }
+                viewModelScope.launch {
+                    val created = capabilityManager.createCofLink(
+                        cofFolderId = cofId,
+                        targetItemId = itemId,
+                        inventoryType = invType,
+                        name = entry.name,
+                        description = entry.description
+                    )
+                    created.createdLinks.firstOrNull()?.let { cofLinksByTargetItemId[itemId] = it.linkItemId }
+                    if (capabilityManager.hasCofVersionSupport()) {
+                        capabilityManager.incrementCofVersion()?.let { v ->
+                            _state.update { it.copy(cofVersion = v) }
+                        }
+                    }
+                }
+            }
         }
 
         val replacedIds = mutableSetOf<UUID>()
@@ -2461,6 +2616,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
         if (_state.value.connection is ConnectionState.Connected) {
             lludpEngine.detachInventoryItem(itemId)
+            val linkToRemove = cofLinksByTargetItemId.remove(itemId)
+            if (capabilityManager.hasAis3Support() && linkToRemove != null) {
+                viewModelScope.launch {
+                    capabilityManager.removeInventoryItem(linkToRemove)
+                    if (capabilityManager.hasCofVersionSupport()) {
+                        capabilityManager.incrementCofVersion()?.let { v ->
+                            _state.update { it.copy(cofVersion = v) }
+                        }
+                    }
+                }
+            }
         }
 
         val matchingHudKeys = manualHudAttachments.entries

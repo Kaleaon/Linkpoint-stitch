@@ -19,7 +19,6 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import java.net.URI
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.TimeUnit
 
 data class CapsAttachmentTransform(
     val objectId: UUID? = null,
@@ -32,6 +31,40 @@ data class CapsAttachmentTransform(
     val scale: com.example.linkpoint.scene.Vec3? = null,
     val name: String? = null,
     val meshAssetId: UUID? = null
+)
+
+/**
+ * Request descriptor for creating an AISv3 symbolic link (`AT_LINK = 24` or `AT_LINK_FOLDER = 25`)
+ * inside an inventory folder such as the `Current Outfit` (`COF`) folder via `InventoryAPIv3`.
+ */
+data class AisLinkRequest(
+    val linkedId: UUID,
+    val assetType: SlAssetType = SlAssetType.LINK,
+    val inventoryType: SlInventoryType = SlInventoryType.WEARABLE,
+    val name: String,
+    val description: String = ""
+)
+
+/**
+ * Result of an AISv3 (`InventoryAPIv3`) mutation (`CreateInventory`, `RemoveItem`, `SlamFolder`).
+ */
+data class AisMutationResult(
+    val success: Boolean,
+    val createdLinks: List<FetchedInventoryLink> = emptyList(),
+    val categoryVersions: Map<UUID, Int> = emptyMap(),
+    val statusCode: Int = 0
+)
+
+/**
+ * Result of synchronizing an outfit change through Agni AISv3 (`InventoryAPIv3` + `IncrementCOFVersion`)
+ * or falling back to OpenSimulator LLUDP `AgentIsNowWearing` (`0xFFFF017F`).
+ */
+data class OutfitCofSyncResult(
+    val usedAis3Cof: Boolean,
+    val usedUdpFallback: Boolean,
+    val createdLinkItemId: UUID? = null,
+    val removedLinkItemIds: List<UUID> = emptyList(),
+    val updatedCofVersion: Int? = null
 )
 
 sealed class CapsEvent {
@@ -63,8 +96,9 @@ data class CapsNegotiationResult(
 )
 
 /**
- * Manages Second Life & OpenSimulator HTTP Capabilities (CAPS) with robust exception handling,
- * exponential-backoff retries, live EventQueueGet health tracking, and manual recovery.
+ * Manages Second Life & OpenSimulator HTTP Capabilities (CAPS) with AISv3 (`InventoryAPIv3` /
+ * `LibraryAPIv3`), `IncrementCOFVersion`, exponential-backoff retries, live `EventQueueGet`
+ * health tracking, and OpenSim capability fallbacks.
  */
 class CapabilityManager(
     private val httpClient: OkHttpClient = NetworkResilience.buildResilientOkHttpClient(
@@ -92,10 +126,22 @@ class CapabilityManager(
 
     companion object {
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
-        private val REQUESTED_CAPS = listOf(
+
+        const val CAP_INVENTORY_API_V3 = "InventoryAPIv3"
+        const val CAP_LIBRARY_API_V3 = "LibraryAPIv3"
+        const val CAP_FETCH_LIB_2 = "FetchLib2"
+        const val CAP_FETCH_LIB_DESCENDENTS_2 = "FetchLibDescendents2"
+        const val CAP_INCREMENT_COF_VERSION = "IncrementCOFVersion"
+
+        val REQUESTED_CAPS: List<String> = listOf(
             "EventQueueGet",
             "FetchInventoryDescendents2",
             "FetchInventory2",
+            CAP_FETCH_LIB_2,
+            CAP_FETCH_LIB_DESCENDENTS_2,
+            CAP_INVENTORY_API_V3,
+            CAP_LIBRARY_API_V3,
+            CAP_INCREMENT_COF_VERSION,
             "ViewerAsset",
             "GetTexture",
             "GetMesh2",
@@ -110,6 +156,13 @@ class CapabilityManager(
             "MapLayer",
             "EnvironmentSettings"
         )
+
+        /**
+         * Formats the canonical COF clothing layer order description string (`@<type><index>`, e.g. `@800`)
+         * matching `build_order_string` in `indra/newview/llappearancemgr.cpp`.
+         */
+        fun buildCofOrderDescription(wearableTypeCode: Int, layerIndex: Int = 0): String =
+            "@%d%02d".format(wearableTypeCode.coerceAtLeast(0), layerIndex.coerceIn(0, 99))
 
         /**
          * Parses Second Life / OpenSimulator CAPS LLSD attachment payloads (EventQueueGet or HTTP CAPS)
@@ -236,6 +289,22 @@ class CapabilityManager(
             return null
         }
     }
+
+    /** Populates capability URLs directly (used on region handoff or isolated protocol tests). */
+    fun configureCapabilities(caps: Map<String, String>) {
+        capabilities.clear()
+        caps.forEach { (name, url) ->
+            if (url.isNotBlank()) {
+                capabilities[name] = url.trim().trimEnd('/')
+            }
+        }
+    }
+
+    fun hasAis3Support(): Boolean = !capabilities[CAP_INVENTORY_API_V3].isNullOrBlank()
+
+    fun hasLibraryAis3Support(): Boolean = !capabilities[CAP_LIBRARY_API_V3].isNullOrBlank()
+
+    fun hasCofVersionSupport(): Boolean = !capabilities[CAP_INCREMENT_COF_VERSION].isNullOrBlank()
 
     suspend fun requestSeedCapabilities(
         seedUrl: String,
@@ -631,56 +700,418 @@ class CapabilityManager(
 
     suspend fun fetchFolderContents(folderId: UUID, ownerId: UUID): FetchedInventoryContents =
         withContext(Dispatchers.IO) {
-            val url = capabilities["FetchInventoryDescendents2"] ?: return@withContext FetchedInventoryContents()
-            val folderReq = LlsdValue.MapVal(
-                mapOf(
-                    "folder_id" to LlsdValue.Uuid(folderId),
-                    "owner_id" to LlsdValue.Uuid(ownerId),
-                    "fetch_folders" to LlsdValue.Bool(true),
-                    "fetch_items" to LlsdValue.Bool(true),
-                    "sort_order" to LlsdValue.IntVal(0)
-                )
-            )
-            val payload = LlsdValue.MapVal(mapOf("folders" to LlsdValue.ArrayVal(listOf(folderReq))))
-            val xmlPayload = LlsdCodec.toXml(payload)
-
-            var lastError: ClassifiedNetworkError? = null
-            for (attempt in 1..2) {
-                val req = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
-                    .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
-                    .build()
-                try {
-                    httpClient.newCall(req).execute().use { resp ->
-                        if (resp.isSuccessful) {
-                            val parsed = LlsdCodec.parseXml(resp.body?.string().orEmpty())
-                            return@withContext InventoryDescendentsParser.parse(parsed, folderId)
-                        }
-                        lastError = NetworkResilience.classifyHttpStatus(
-                            ProtocolLayer.CAPS_SEED,
-                            resp.code,
-                            "FetchInventoryDescendents2"
-                        )
-                    }
-                } catch (e: CancellationException) {
-                    throw e
-                } catch (e: Exception) {
-                    lastError = NetworkResilience.classifyException(
-                        ProtocolLayer.CAPS_SEED,
-                        "FetchInventoryDescendents2",
-                        e
-                    )
+            // Prefer AISv3 (`InventoryAPIv3`) category children when granted and FetchInventoryDescendents2 is absent
+            val descUrl = capabilities["FetchInventoryDescendents2"]
+            if (descUrl == null) {
+                val aisCap = capabilities[CAP_INVENTORY_API_V3]?.trimEnd('/')
+                if (aisCap != null) {
+                    return@withContext fetchAisCategoryChildren(aisCap, folderId)
                 }
-                if (attempt == 1 && lastError?.category?.isRetryable == true) {
-                    delay(800L)
-                } else break
+                return@withContext FetchedInventoryContents()
             }
-            lastError?.let {
-                _capsEvents.tryEmit(CapsEvent.CapsError(it.layer, it.category, it.userMessage, it.technicalDetail))
+            fetchDescendentsViaCap(descUrl, "FetchInventoryDescendents2", folderId, ownerId)
+        }
+
+    /**
+     * Fetches Second Life Library folder contents via `LibraryAPIv3` when available, falling back
+     * to `FetchLibDescendents2` (`POST` LLSD).
+     */
+    suspend fun fetchLibraryFolderContents(folderId: UUID, ownerId: UUID): FetchedInventoryContents =
+        withContext(Dispatchers.IO) {
+            val libAisCap = capabilities[CAP_LIBRARY_API_V3]?.trimEnd('/')
+            if (libAisCap != null) {
+                val aisContents = fetchAisCategoryChildren(libAisCap, folderId)
+                if (aisContents.isNotEmpty()) return@withContext aisContents
             }
+            val descUrl = capabilities[CAP_FETCH_LIB_DESCENDENTS_2] ?: return@withContext FetchedInventoryContents()
+            fetchDescendentsViaCap(descUrl, CAP_FETCH_LIB_DESCENDENTS_2, folderId, ownerId)
+        }
+
+    private suspend fun fetchAisCategoryChildren(baseCapUrl: String, folderId: UUID): FetchedInventoryContents {
+        val url = "$baseCapUrl/category/$folderId/children"
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .get()
+            .build()
+        return try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return FetchedInventoryContents()
+                val parsed = LlsdCodec.parseXml(resp.body?.string().orEmpty())
+                InventoryDescendentsParser.parse(parsed, folderId)
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
             FetchedInventoryContents()
         }
+    }
+
+    private suspend fun fetchDescendentsViaCap(
+        url: String,
+        capName: String,
+        folderId: UUID,
+        ownerId: UUID
+    ): FetchedInventoryContents {
+        val folderReq = LlsdValue.MapVal(
+            mapOf(
+                "folder_id" to LlsdValue.Uuid(folderId),
+                "owner_id" to LlsdValue.Uuid(ownerId),
+                "fetch_folders" to LlsdValue.Bool(true),
+                "fetch_items" to LlsdValue.Bool(true),
+                "sort_order" to LlsdValue.IntVal(0)
+            )
+        )
+        val payload = LlsdValue.MapVal(mapOf("folders" to LlsdValue.ArrayVal(listOf(folderReq))))
+        val xmlPayload = LlsdCodec.toXml(payload)
+
+        var lastError: ClassifiedNetworkError? = null
+        for (attempt in 1..2) {
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
+                .build()
+            try {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (resp.isSuccessful) {
+                        val parsed = LlsdCodec.parseXml(resp.body?.string().orEmpty())
+                        return InventoryDescendentsParser.parse(parsed, folderId)
+                    }
+                    lastError = NetworkResilience.classifyHttpStatus(
+                        ProtocolLayer.CAPS_SEED,
+                        resp.code,
+                        capName
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastError = NetworkResilience.classifyException(
+                    ProtocolLayer.CAPS_SEED,
+                    capName,
+                    e
+                )
+            }
+            if (attempt == 1 && lastError?.category?.isRetryable == true) {
+                delay(800L)
+            } else break
+        }
+        lastError?.let {
+            _capsEvents.tryEmit(CapsEvent.CapsError(it.layer, it.category, it.userMessage, it.technicalDetail))
+        }
+        return FetchedInventoryContents()
+    }
+
+    /**
+     * AISv3 `AISAPI::FetchCOF` / `AISAPI::FetchCategoryLinks` (`indra/newview/llaisapi.cpp`):
+     * `GET <InventoryAPIv3>/category/<cofFolderId ?: "current">/links`.
+     */
+    suspend fun fetchCofLinks(cofFolderId: UUID? = null): FetchedInventoryContents =
+        withContext(Dispatchers.IO) {
+            val invCap = capabilities[CAP_INVENTORY_API_V3]?.trimEnd('/')
+                ?: return@withContext FetchedInventoryContents()
+            val selector = cofFolderId?.toString() ?: "current"
+            val url = "$invCap/category/$selector/links"
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                .header("Accept", "application/llsd+xml, text/xml")
+                .get()
+                .build()
+            try {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@withContext FetchedInventoryContents()
+                    val parsed = LlsdCodec.parseXml(resp.body?.string().orEmpty())
+                    InventoryDescendentsParser.parse(parsed, cofFolderId ?: UUID(0L, 0L))
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                FetchedInventoryContents()
+            }
+        }
+
+    /**
+     * AISv3 `AISAPI::CreateInventory` (`indra/newview/llaisapi.cpp`):
+     * `POST <InventoryAPIv3>/category/<parentFolderId>?tid=<uuid>` with LLSD `{"links": [...]}`
+     * where each link carries `linked_id`, `type` (`AT_LINK = 24` or `AT_LINK_FOLDER = 25`),
+     * `inv_type` (`SlInventoryType`), `name`, and `desc`.
+     */
+    suspend fun createInventoryLinks(
+        parentFolderId: UUID,
+        links: List<AisLinkRequest>,
+        transactionId: UUID = UUID.randomUUID()
+    ): AisMutationResult = withContext(Dispatchers.IO) {
+        if (links.isEmpty()) return@withContext AisMutationResult(success = true, statusCode = 200)
+        val invCap = capabilities[CAP_INVENTORY_API_V3]?.trimEnd('/')
+            ?: return@withContext AisMutationResult(success = false)
+        val url = "$invCap/category/$parentFolderId?tid=$transactionId"
+        val payload = buildLinksPayload(links)
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .post(LlsdCodec.toXml(payload).toRequestBody(LLSD_XML_MEDIA))
+            .build()
+
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    ProtocolAuditLogger.logWarn(
+                        "[AIS3] CreateInventory links failed HTTP ${resp.code} on ${ProtocolAuditLogger.redactCapabilityUrl(url)} (parent=$parentFolderId)"
+                    )
+                    return@withContext AisMutationResult(success = false, statusCode = resp.code)
+                }
+                val body = resp.body?.string().orEmpty()
+                val parsed = if (body.isNotBlank()) LlsdCodec.parseXml(body) else LlsdValue.Undef
+                val contents = InventoryDescendentsParser.parse(parsed, parentFolderId)
+                AisMutationResult(
+                    success = true,
+                    createdLinks = contents.links,
+                    categoryVersions = contents.categoryVersions,
+                    statusCode = resp.code
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ProtocolAuditLogger.logWarn(
+                "[AIS3] CreateInventory links exception on ${ProtocolAuditLogger.redactCapabilityUrl(url)}: ${e.message}"
+            )
+            AisMutationResult(success = false)
+        }
+    }
+
+    /**
+     * Convenience helper for adding a single item link (`AT_LINK = 24`) to the Current Outfit Folder (`COF`).
+     */
+    suspend fun createCofLink(
+        cofFolderId: UUID,
+        targetItemId: UUID,
+        inventoryType: SlInventoryType = SlInventoryType.WEARABLE,
+        name: String,
+        description: String = ""
+    ): AisMutationResult = createInventoryLinks(
+        parentFolderId = cofFolderId,
+        links = listOf(
+            AisLinkRequest(
+                linkedId = targetItemId,
+                assetType = SlAssetType.LINK,
+                inventoryType = inventoryType,
+                name = name,
+                description = description
+            )
+        )
+    )
+
+    /**
+     * AISv3 `AISAPI::SlamFolder` (`indra/newview/llaisapi.cpp`):
+     * `PUT <InventoryAPIv3>/category/<cofFolderId>/links?tid=<uuid>` replacing all links in `cofFolderId`.
+     */
+    suspend fun slamCofLinks(
+        cofFolderId: UUID,
+        links: List<AisLinkRequest>,
+        transactionId: UUID = UUID.randomUUID()
+    ): AisMutationResult = withContext(Dispatchers.IO) {
+        val invCap = capabilities[CAP_INVENTORY_API_V3]?.trimEnd('/')
+            ?: return@withContext AisMutationResult(success = false)
+        val url = "$invCap/category/$cofFolderId/links?tid=$transactionId"
+        val payload = buildLinksPayload(links)
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .put(LlsdCodec.toXml(payload).toRequestBody(LLSD_XML_MEDIA))
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return@withContext AisMutationResult(success = false, statusCode = resp.code)
+                }
+                val body = resp.body?.string().orEmpty()
+                val parsed = if (body.isNotBlank()) LlsdCodec.parseXml(body) else LlsdValue.Undef
+                val contents = InventoryDescendentsParser.parse(parsed, cofFolderId)
+                AisMutationResult(
+                    success = true,
+                    createdLinks = contents.links,
+                    categoryVersions = contents.categoryVersions,
+                    statusCode = resp.code
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            AisMutationResult(success = false)
+        }
+    }
+
+    /**
+     * AISv3 `AISAPI::RemoveItem` (`indra/newview/llaisapi.cpp`):
+     * `DELETE <InventoryAPIv3>/item/<itemId>` (treats HTTP `2xx` and `410 Gone` as success).
+     */
+    suspend fun removeInventoryItem(itemId: UUID): AisMutationResult = withContext(Dispatchers.IO) {
+        val invCap = capabilities[CAP_INVENTORY_API_V3]?.trimEnd('/')
+            ?: return@withContext AisMutationResult(success = false)
+        val url = "$invCap/item/$itemId"
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .delete()
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                val ok = resp.isSuccessful || resp.code == 410
+                if (!ok) {
+                    ProtocolAuditLogger.logWarn(
+                        "[AIS3] RemoveItem failed HTTP ${resp.code} on ${ProtocolAuditLogger.redactCapabilityUrl(url)} (item=$itemId)"
+                    )
+                    return@withContext AisMutationResult(success = false, statusCode = resp.code)
+                }
+                val body = resp.body?.string().orEmpty()
+                val parsed = if (body.isNotBlank()) LlsdCodec.parseXml(body) else LlsdValue.Undef
+                val contents = InventoryDescendentsParser.parse(parsed, UUID(0L, 0L))
+                AisMutationResult(
+                    success = true,
+                    categoryVersions = contents.categoryVersions,
+                    statusCode = resp.code
+                )
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            AisMutationResult(success = false)
+        }
+    }
+
+    /**
+     * Bumps the Current Outfit Folder (`COF`) version on Agni via `GET <IncrementCOFVersion>`
+     * (`llappearancemgr.cpp` / LibreMetaverse `AppearanceManager`), returning the updated version.
+     */
+    suspend fun incrementCofVersion(): Int? = withContext(Dispatchers.IO) {
+        val url = capabilities[CAP_INCREMENT_COF_VERSION]?.trim()
+            ?: return@withContext null
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .get()
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    ProtocolAuditLogger.logWarn(
+                        "[COF] IncrementCOFVersion failed HTTP ${resp.code} on ${ProtocolAuditLogger.redactCapabilityUrl(url)}"
+                    )
+                    return@withContext null
+                }
+                val body = resp.body?.string().orEmpty()
+                if (body.isBlank()) return@withContext null
+                val parsed = LlsdCodec.parseXml(body)
+                when {
+                    parsed["version"] != LlsdValue.Undef -> parsed["version"].asInt(0)
+                    parsed["folder_version"] != LlsdValue.Undef -> parsed["folder_version"].asInt(0)
+                    parsed is LlsdValue.IntVal -> parsed.value
+                    else -> {
+                        val updatedMap = parsed["_updated_category_versions"].asMap()
+                        updatedMap.values.firstOrNull()?.asInt(0)
+                    }
+                }
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ProtocolAuditLogger.logWarn(
+                "[COF] IncrementCOFVersion exception on ${ProtocolAuditLogger.redactCapabilityUrl(url)}: ${e.message}"
+            )
+            null
+        }
+    }
+
+    /**
+     * Synchronizes a wearable outfit change using Agni AISv3 (`InventoryAPIv3` link creation/removal in
+     * `Current Outfit` + `IncrementCOFVersion` bump) when granted, or falls back to OpenSim UDP
+     * `AgentIsNowWearing` (`0xFFFF017F`) via [onUdpFallback].
+     */
+    suspend fun syncWearableCofOrFallback(
+        cofFolderId: UUID?,
+        linkToCreate: AisLinkRequest? = null,
+        linkItemIdsToRemove: List<UUID> = emptyList(),
+        onUdpFallback: () -> Unit
+    ): OutfitCofSyncResult {
+        if (!hasAis3Support() || cofFolderId == null) {
+            onUdpFallback()
+            return OutfitCofSyncResult(usedAis3Cof = false, usedUdpFallback = true)
+        }
+
+        val removed = mutableListOf<UUID>()
+        for (linkItemId in linkItemIdsToRemove) {
+            val delRes = removeInventoryItem(linkItemId)
+            if (!delRes.success) {
+                onUdpFallback()
+                return OutfitCofSyncResult(
+                    usedAis3Cof = false,
+                    usedUdpFallback = true,
+                    removedLinkItemIds = removed
+                )
+            }
+            removed.add(linkItemId)
+        }
+
+        var createdLinkId: UUID? = null
+        var nextVersion: Int? = null
+        if (linkToCreate != null) {
+            val createRes = createInventoryLinks(cofFolderId, listOf(linkToCreate))
+            if (!createRes.success) {
+                onUdpFallback()
+                return OutfitCofSyncResult(
+                    usedAis3Cof = false,
+                    usedUdpFallback = true,
+                    removedLinkItemIds = removed
+                )
+            }
+            createdLinkId = createRes.createdLinks.firstOrNull { it.linkedId == linkToCreate.linkedId }?.linkItemId
+                ?: createRes.createdLinks.firstOrNull()?.linkItemId
+            nextVersion = createRes.categoryVersions[cofFolderId]
+        }
+
+        if (hasCofVersionSupport()) {
+            val bumped = incrementCofVersion()
+            if (bumped != null) {
+                nextVersion = bumped
+            }
+        }
+
+        return OutfitCofSyncResult(
+            usedAis3Cof = true,
+            usedUdpFallback = false,
+            createdLinkItemId = createdLinkId,
+            removedLinkItemIds = removed,
+            updatedCofVersion = nextVersion
+        )
+    }
+
+    private fun buildLinksPayload(links: List<AisLinkRequest>): LlsdValue.MapVal {
+        val arrayItems = links.map { link ->
+            val linkType = if (link.assetType == SlAssetType.LINK_FOLDER) {
+                SlAssetType.LINK_FOLDER
+            } else {
+                SlAssetType.LINK
+            }
+            LlsdValue.MapVal(
+                linkedMapOf(
+                    "linked_id" to LlsdValue.Uuid(link.linkedId),
+                    "type" to LlsdValue.IntVal(linkType.code),
+                    "inv_type" to LlsdValue.IntVal(link.inventoryType.code),
+                    "name" to LlsdValue.Str(link.name),
+                    "desc" to LlsdValue.Str(link.description)
+                )
+            )
+        }
+        return LlsdValue.MapVal(mapOf("links" to LlsdValue.ArrayVal(arrayItems)))
+    }
 
     fun getCapabilityUrl(name: String): String? = capabilities[name]
 

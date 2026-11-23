@@ -5,6 +5,7 @@ import android.opengl.GLES30
 import android.opengl.GLSurfaceView
 import android.opengl.GLUtils
 import android.opengl.Matrix
+import com.example.linkpoint.protocol.AvatarTextureIndex
 import com.example.linkpoint.protocol.DecodedMeshAsset
 import com.example.linkpoint.protocol.DecodedSubmesh
 import com.example.linkpoint.protocol.SlBinaryParsers
@@ -925,16 +926,18 @@ class LinkpointGlRenderer(
             }
 
             // 1. Sculpted Organic Classic Humanoid Base (only draws zones NOT covered by loaded rigged meshes)
+            val avBakes = av.effectiveBakedTextures()
             if (!riggedCoversLower) {
-                drawClassicPart(avatarLowerMesh, torsoS, torsoS, hScale * legS, AVATAR_PANTS_COLOR, av.bakedLowerTextureId)
+                drawClassicPart(avatarLowerMesh, torsoS, torsoS, hScale * legS, AVATAR_PANTS_COLOR, avBakes[AvatarTextureIndex.LowerBaked])
             }
             if (!riggedCoversUpper) {
-                drawClassicPart(avatarUpperMesh, torsoS, shoulderS, hScale, av.shirtColor, av.bakedUpperTextureId)
+                drawClassicPart(avatarUpperMesh, torsoS, shoulderS, hScale, av.shirtColor, avBakes[AvatarTextureIndex.UpperBaked])
             }
             if (!riggedCoversHead) {
-                drawClassicPart(avatarHeadMesh, headS, headS, hScale * headS, AVATAR_SKIN_COLOR, av.bakedHeadTextureId)
-                if (av.bakedHairTextureId != null && gpuTextureCache.containsKey(av.bakedHairTextureId)) {
-                    drawClassicPart(avatarHairCapMesh, headS, headS, hScale * headS, COLOR_WHITE, av.bakedHairTextureId)
+                drawClassicPart(avatarHeadMesh, headS, headS, hScale * headS, AVATAR_SKIN_COLOR, avBakes[AvatarTextureIndex.HeadBaked])
+                val hairBake = avBakes[AvatarTextureIndex.HairBaked]
+                if (hairBake != null && gpuTextureCache.containsKey(hairBake)) {
+                    drawClassicPart(avatarHairCapMesh, headS, headS, hScale * headS, COLOR_WHITE, hairBake)
                 }
             }
 
@@ -965,8 +968,15 @@ class LinkpointGlRenderer(
                         val faceTex = att.faceTextures[faceIdx] ?: att.defaultTextureId
                         val faceCol = att.faceColors[faceIdx] ?: att.color
                         if (SlBinaryParsers.isTransparentFace(faceTex, faceCol)) continue
-                        bindTextureCached(faceTex, primLocs.uUseTex)
-                        GLES30.glUniform4f(primLocs.uColor, faceCol.r, faceCol.g, faceCol.b, faceCol.a)
+                        val isBomFace = AvatarTextureIndex.isBomMagicTexture(faceTex)
+                        val resolvedTex = if (isBomFace) av.resolveAttachmentFaceTexture(faceTex) else faceTex
+                        val textured = bindTextureCached(resolvedTex, primLocs.uUseTex)
+                        val effectiveCol = when {
+                            isBomFace && textured -> COLOR_WHITE
+                            isBomFace -> AVATAR_SKIN_COLOR
+                            else -> faceCol
+                        }
+                        GLES30.glUniform4f(primLocs.uColor, effectiveCol.r, effectiveCol.g, effectiveCol.b, effectiveCol.a)
                         drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, submesh)
                     }
                 } else {
@@ -978,8 +988,15 @@ class LinkpointGlRenderer(
                         PrimShape.PRISM -> prismMesh
                         else -> boxMesh
                     }
-                    bindTextureCached(att.defaultTextureId, primLocs.uUseTex)
-                    GLES30.glUniform4f(primLocs.uColor, att.color.r, att.color.g, att.color.b, att.color.a)
+                    val isBomFace = AvatarTextureIndex.isBomMagicTexture(att.defaultTextureId)
+                    val resolvedTex = if (isBomFace) av.resolveAttachmentFaceTexture(att.defaultTextureId) else att.defaultTextureId
+                    val textured = bindTextureCached(resolvedTex, primLocs.uUseTex)
+                    val effectiveCol = when {
+                        isBomFace && textured -> COLOR_WHITE
+                        isBomFace -> AVATAR_SKIN_COLOR
+                        else -> att.color
+                    }
+                    GLES30.glUniform4f(primLocs.uColor, effectiveCol.r, effectiveCol.g, effectiveCol.b, effectiveCol.a)
                     drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, fallbackMesh)
                 }
             }
