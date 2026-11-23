@@ -14,6 +14,7 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
+import kotlinx.coroutines.withContext
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.util.UUID
@@ -30,6 +31,7 @@ data class AssetStreamStats(
 sealed class AssetStreamEvent {
     data class MeshReady(val meshId: UUID, val asset: DecodedMeshAsset) : AssetStreamEvent()
     data class TextureReady(val textureId: UUID, val bitmap: Bitmap) : AssetStreamEvent()
+    data class NotecardReady(val assetId: UUID, val text: String) : AssetStreamEvent()
     data class DisplayNamesResolved(val names: Map<UUID, String>) : AssetStreamEvent()
     data class StatsUpdated(val stats: AssetStreamStats) : AssetStreamEvent()
 }
@@ -57,11 +59,15 @@ class GridAssetManager(
     private val avatarMeshSemaphore = Semaphore(6)
     private val textureSemaphore = Semaphore(8)
     private val avatarTextureSemaphore = Semaphore(6)
+    private val notecardSemaphore = Semaphore(4)
 
     // Memory-bounded LRU caches sized for dense Second Life / OpenSim regions
     private val meshCache = LruCache<UUID, DecodedMeshAsset>(240)
     private val textureCache = object : LruCache<UUID, Bitmap>(32 * 1024) { // 32 MB KB budget
         override fun sizeOf(key: UUID, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
+    }
+    private val notecardCache = object : LinkedHashMap<UUID, String>(128, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<UUID, String>?): Boolean = size > 128
     }
 
     private val inFlightMeshes = ConcurrentHashMap.newKeySet<UUID>()
@@ -70,6 +76,7 @@ class GridAssetManager(
     private val inFlightTextures = ConcurrentHashMap.newKeySet<UUID>()
     private val failedTextures = ConcurrentHashMap.newKeySet<UUID>()
     private val transientTextureFailures = ConcurrentHashMap<UUID, Int>()
+    private val failedNotecards = ConcurrentHashMap.newKeySet<UUID>()
     private val pendingPreCapMeshes = ConcurrentHashMap<UUID, Boolean>()
     private val pendingPreCapTextures = ConcurrentHashMap<UUID, Boolean>()
     private val pendingPreCapNames = ConcurrentHashMap.newKeySet<UUID>()
@@ -118,7 +125,21 @@ class GridAssetManager(
 
     fun getCachedMesh(meshId: UUID): DecodedMeshAsset? = synchronized(meshCache) { meshCache.get(meshId) }
     fun getCachedTexture(textureId: UUID): Bitmap? = synchronized(textureCache) { textureCache.get(textureId) }
+    fun getCachedNotecard(assetId: UUID): String? = synchronized(notecardCache) { notecardCache.get(assetId) }
     fun getResolvedName(agentId: UUID): String? = resolvedNames[agentId]
+
+    fun putCachedTexture(textureId: UUID, bitmap: Bitmap) {
+        if (textureId == ZERO_UUID) return
+        synchronized(textureCache) { textureCache.put(textureId, bitmap) }
+        _events.tryEmit(AssetStreamEvent.TextureReady(textureId, bitmap))
+    }
+
+    fun putCachedNotecard(assetId: UUID, text: String) {
+        if (assetId == ZERO_UUID) return
+        val parsed = LindenNotecardParser.parse(text)
+        synchronized(notecardCache) { notecardCache.put(assetId, parsed) }
+        _events.tryEmit(AssetStreamEvent.NotecardReady(assetId, parsed))
+    }
 
     fun snapshotMeshes(): Map<UUID, DecodedMeshAsset> = synchronized(meshCache) { meshCache.snapshot() }
     fun snapshotTextures(): Map<UUID, Bitmap> = synchronized(textureCache) { textureCache.snapshot() }
@@ -240,6 +261,40 @@ class GridAssetManager(
         transientMeshFailures.remove(assetId)
         failedTextures.remove(assetId)
         transientTextureFailures.remove(assetId)
+        failedNotecards.remove(assetId)
+    }
+
+    /**
+     * Streams a Second Life / OpenSimulator Notecard asset via HTTP `ViewerAsset`
+     * (`?notecard_id=<asset_uuid>`) and extracts its body using [LindenNotecardParser].
+     */
+    suspend fun fetchNotecard(assetId: UUID): String? = withContext(Dispatchers.IO) {
+        if (assetId == ZERO_UUID) return@withContext null
+        getCachedNotecard(assetId)?.let { return@withContext it }
+        if (failedNotecards.contains(assetId)) return@withContext null
+
+        val urls = buildNotecardUrls(assetId)
+        if (urls.isEmpty()) return@withContext null
+
+        notecardSemaphore.withPermit {
+            getCachedNotecard(assetId)?.let { return@withPermit it }
+            var allPermanent = true
+            for (url in urls) {
+                val outcome = downloadBytesWithStatus(url)
+                if (outcome.bytes != null) {
+                    val parsed = LindenNotecardParser.parse(outcome.bytes)
+                    synchronized(notecardCache) { notecardCache.put(assetId, parsed) }
+                    _events.tryEmit(AssetStreamEvent.NotecardReady(assetId, parsed))
+                    return@withPermit parsed
+                } else if (!outcome.permanentFailure) {
+                    allPermanent = false
+                }
+            }
+            if (allPermanent) {
+                failedNotecards.add(assetId)
+            }
+            null
+        }
     }
 
     fun requestDisplayNames(agentIds: Collection<UUID>) {
@@ -308,6 +363,12 @@ class GridAssetManager(
             val sep = if (base.contains("?")) "&" else "?"
             "$base${sep}texture_id=$textureId"
         }
+    }
+
+    internal fun buildNotecardUrls(assetId: UUID): List<String> {
+        val base = viewerAssetCap ?: return emptyList()
+        val sep = if (base.contains("?")) "&" else "?"
+        return listOf("$base${sep}notecard_id=$assetId")
     }
 
     private fun downloadBytesWithStatus(url: String): DownloadOutcome {
@@ -404,6 +465,7 @@ class GridAssetManager(
         inFlightTextures.clear()
         failedTextures.clear()
         transientTextureFailures.clear()
+        failedNotecards.clear()
         pendingPreCapMeshes.clear()
         pendingPreCapTextures.clear()
         pendingPreCapNames.clear()
@@ -413,6 +475,7 @@ class GridAssetManager(
         texturesLoadedCount.set(0)
         synchronized(meshCache) { meshCache.evictAll() }
         synchronized(textureCache) { textureCache.evictAll() }
+        synchronized(notecardCache) { notecardCache.clear() }
         emitStats(force = true)
     }
 

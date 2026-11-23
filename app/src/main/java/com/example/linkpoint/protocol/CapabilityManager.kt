@@ -62,14 +62,6 @@ data class CapsNegotiationResult(
     val diagnostics: List<String> = emptyList()
 )
 
-data class FetchedInventoryItem(
-    val itemId: UUID,
-    val parentId: UUID,
-    val name: String,
-    val assetType: Int,
-    val description: String
-)
-
 /**
  * Manages Second Life & OpenSimulator HTTP Capabilities (CAPS) with robust exception handling,
  * exponential-backoff retries, live EventQueueGet health tracking, and manual recovery.
@@ -637,9 +629,9 @@ class CapabilityManager(
         }
     }
 
-    suspend fun fetchFolderContents(folderId: UUID, ownerId: UUID): List<FetchedInventoryItem> =
+    suspend fun fetchFolderContents(folderId: UUID, ownerId: UUID): FetchedInventoryContents =
         withContext(Dispatchers.IO) {
-            val url = capabilities["FetchInventoryDescendents2"] ?: return@withContext emptyList()
+            val url = capabilities["FetchInventoryDescendents2"] ?: return@withContext FetchedInventoryContents()
             val folderReq = LlsdValue.MapVal(
                 mapOf(
                     "folder_id" to LlsdValue.Uuid(folderId),
@@ -662,23 +654,8 @@ class CapabilityManager(
                 try {
                     httpClient.newCall(req).execute().use { resp ->
                         if (resp.isSuccessful) {
-                            val items = mutableListOf<FetchedInventoryItem>()
                             val parsed = LlsdCodec.parseXml(resp.body?.string().orEmpty())
-                            parsed["folders"].asList().forEach { folder ->
-                                folder["items"].asList().forEach { item ->
-                                    val id = (item["item_id"] as? LlsdValue.Uuid)?.value ?: return@forEach
-                                    items.add(
-                                        FetchedInventoryItem(
-                                            itemId = id,
-                                            parentId = folderId,
-                                            name = item["name"].asString("Unnamed Item"),
-                                            assetType = item["type"].asInt(0),
-                                            description = item["desc"].asString()
-                                        )
-                                    )
-                                }
-                            }
-                            return@withContext items
+                            return@withContext InventoryDescendentsParser.parse(parsed, folderId)
                         }
                         lastError = NetworkResilience.classifyHttpStatus(
                             ProtocolLayer.CAPS_SEED,
@@ -702,7 +679,7 @@ class CapabilityManager(
             lastError?.let {
                 _capsEvents.tryEmit(CapsEvent.CapsError(it.layer, it.category, it.userMessage, it.technicalDetail))
             }
-            emptyList()
+            FetchedInventoryContents()
         }
 
     fun getCapabilityUrl(name: String): String? = capabilities[name]

@@ -105,9 +105,33 @@ data class InventoryEntry(
     val parentId: UUID,
     val name: String,
     val isFolder: Boolean,
-    val assetType: Int, // 0=Texture, 3=Landmark, 6=Object, 7=Notecard, 10=Script, 13=Bodypart, 5=Clothing
+    val assetType: Int, // 0=Texture, 3=Landmark, 5=Clothing, 6=Object, 7=Notecard, 10=Script, 13=Bodypart
     val isWorn: Boolean = false,
-    val attachmentPoint: Int = 0
+    val attachmentPoint: Int = 0,
+    val assetId: UUID? = null,
+    val description: String = "",
+    val invType: Int = 0,
+    val flags: Int = 0,
+    val wearableType: Int? = null
+)
+
+data class NotecardViewerState(
+    val itemId: UUID,
+    val assetId: UUID?,
+    val title: String,
+    val description: String = "",
+    val body: String = "",
+    val isLoading: Boolean = false,
+    val error: String? = null
+)
+
+data class TexturePreviewState(
+    val itemId: UUID,
+    val textureId: UUID?,
+    val title: String,
+    val description: String = "",
+    val isLoading: Boolean = false,
+    val error: String? = null
 )
 
 data class MapRegionTile(
@@ -168,6 +192,8 @@ data class ViewerState(
     val nearbyAvatars: List<NearbyAvatarInfo> = emptyList(),
     val inventoryEntries: List<InventoryEntry> = emptyList(),
     val expandedFolderIds: Set<UUID> = emptySet(),
+    val activeNotecard: NotecardViewerState? = null,
+    val activeTexturePreview: TexturePreviewState? = null,
     val mapRegions: List<MapRegionTile> = emptyList(),
     val scriptDialog: ScriptDialogPrompt? = null,
     val toastMessage: String? = null

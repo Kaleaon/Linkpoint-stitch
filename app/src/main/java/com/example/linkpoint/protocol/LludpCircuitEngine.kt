@@ -93,7 +93,8 @@ sealed class SimEvent {
     data class AgentWearablesReceived(
         val agentId: UUID,
         val wearableCount: Int,
-        val wearableAssetIds: List<Pair<Int, UUID>>
+        val wearableAssetIds: List<Pair<Int, UUID>>,
+        val wearableItems: List<Triple<Int, UUID, UUID>> = emptyList()
     ) : SimEvent()
     data class UuidNamesResolved(val names: Map<UUID, String>) : SimEvent()
     data class ObjectKilled(val localId: Int) : SimEvent()
@@ -1100,16 +1101,21 @@ class LludpCircuitEngine {
         buf.int // SerialNum
         val count = buf.get().toInt() and 0xFF
         val wearables = mutableListOf<Pair<Int, UUID>>()
+        val wearableItems = mutableListOf<Triple<Int, UUID, UUID>>()
+        val zeroUuid = UUID(0L, 0L)
         repeat(count) {
             if (buf.remaining() < 33) return@repeat
-            LludpPackets.readUuid(buf) // ItemID
+            val itemId = LludpPackets.readUuid(buf)
             val assetId = LludpPackets.readUuid(buf)
             val wearableType = buf.get().toInt() and 0xFF
-            if (assetId != UUID(0L, 0L)) {
+            if (assetId != zeroUuid) {
                 wearables.add(wearableType to assetId)
             }
+            if (itemId != zeroUuid || assetId != zeroUuid) {
+                wearableItems.add(Triple(wearableType, itemId, assetId))
+            }
         }
-        _events.tryEmit(SimEvent.AgentWearablesReceived(avatarId, wearables.size, wearables))
+        _events.tryEmit(SimEvent.AgentWearablesReceived(avatarId, wearables.size, wearables, wearableItems))
     }
 
     private fun parseUuidNameReply(buf: ByteBuffer) {
@@ -1299,9 +1305,15 @@ class LludpCircuitEngine {
         send(LludpPackets.MSG_MAP_BLOCK_REQUEST, body, reliable = true)
     }
 
-    fun attachInventoryItem(itemId: UUID, attachmentPoint: Int, name: String) {
+    fun sendAgentIsNowWearing(wearables: List<Pair<UUID, Int>>) {
         if (!running.get()) return
-        val body = LludpPackets.buildRezSingleAttachment(agentId, sessionId, itemId, agentId, attachmentPoint, name)
+        val body = LludpPackets.buildAgentIsNowWearing(agentId, sessionId, wearables)
+        send(LludpPackets.MSG_AGENT_IS_NOW_WEARING, body, reliable = true)
+    }
+
+    fun attachInventoryItem(itemId: UUID, attachmentPoint: Int, name: String, append: Boolean = false) {
+        if (!running.get()) return
+        val body = LludpPackets.buildRezSingleAttachment(agentId, sessionId, itemId, agentId, attachmentPoint, name, append = append)
         send(LludpPackets.MSG_REZ_SINGLE_ATTACHMENT, body, reliable = true)
     }
 

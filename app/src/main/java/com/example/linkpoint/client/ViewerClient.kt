@@ -89,6 +89,12 @@ interface ViewerClient {
     fun deleteLandmark(landmarkId: String)
     fun toggleInventoryFolder(folderId: UUID)
     fun toggleWearInventoryItem(itemId: UUID, targetHudSlot: Int? = null)
+    fun attachObjectFromInventory(itemId: UUID, attachmentPoint: Int = 0, add: Boolean = false) {}
+    fun detachInventoryItem(itemId: UUID) {}
+    fun openInventoryNotecard(itemId: UUID) {}
+    fun dismissNotecardViewer() {}
+    fun openInventoryTexture(itemId: UUID) {}
+    fun dismissTexturePreview() {}
     fun respondScriptDialog(buttonLabel: String, channel: Int)
     fun dismissScriptDialog()
     fun dismissToast()
