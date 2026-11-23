@@ -69,6 +69,43 @@ object LludpPackets {
     const val MSG_MAP_BLOCK_REPLY: Int = 0xFFFF0199.toInt()
     const val MSG_PACKET_ACK: Int = 0xFFFFFFFB.toInt()
 
+    /**
+     * Messages explicitly declared `Unencoded` in `indra/llmessage/message_template.msg`.
+     * Zero-coding (`FLAG_ZEROCODED = 0x80`) MUST NEVER be applied to these messages.
+     */
+    val UNENCODED_MESSAGE_IDS: Set<Int> = setOf(
+        MSG_PACKET_ACK,
+        MSG_START_PING_CHECK,
+        MSG_COMPLETE_PING_CHECK,
+        MSG_LAYER_DATA,
+        MSG_OBJECT_UPDATE_COMPRESSED,
+        MSG_IMPROVED_TERSE_OBJECT_UPDATE,
+        MSG_KILL_OBJECT,
+        MSG_COARSE_LOCATION_UPDATE,
+        MSG_USE_CIRCUIT_CODE,
+        MSG_TELEPORT_LOCATION_REQUEST,
+        MSG_START_LURE,
+        MSG_TELEPORT_LURE_REQUEST,
+        MSG_OBJECT_DEGRAB,
+        MSG_CHAT_FROM_SIMULATOR,
+        MSG_AVATAR_PROPERTIES_REQUEST,
+        MSG_UUID_NAME_REQUEST,
+        MSG_UUID_NAME_REPLY,
+        MSG_COMPLETE_AGENT_MOVEMENT,
+        MSG_LOGOUT_REQUEST,
+        MSG_ACCEPT_FRIENDSHIP,
+        MSG_DECLINE_FRIENDSHIP,
+        MSG_TERMINATE_FRIENDSHIP,
+        MSG_ONLINE_NOTIFICATION,
+        MSG_OFFLINE_NOTIFICATION,
+        MSG_AGENT_WEARABLES_REQUEST,
+        MSG_DETACH_ATTACHMENT,
+        MSG_MAP_BLOCK_REQUEST,
+        MSG_MAP_BLOCK_REPLY
+    )
+
+    fun isZeroCodedMessage(messageId: Int): Boolean = messageId !in UNENCODED_MESSAGE_IDS
+
     // RegionHandshakeReply flags (tells SL Server-Side Appearance to bake & stream self appearance)
     const val REGION_HANDSHAKE_SUPPORTS_SELF_APPEARANCE: Int = 0x00000004
 
@@ -260,8 +297,9 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        val canZeroCode = useZeroCoding && isZeroCodedMessage(messageId)
+        val encoded = if (canZeroCode) zeroEncode(msgBytes) else msgBytes
+        val actuallyZeroCoded = canZeroCode && encoded.size < msgBytes.size
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0

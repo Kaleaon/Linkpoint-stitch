@@ -32,6 +32,7 @@ import com.example.linkpoint.protocol.LlsdCodec
 import com.example.linkpoint.protocol.LludpCircuitEngine
 import com.example.linkpoint.protocol.LludpPackets
 import com.example.linkpoint.protocol.LoginRequestParams
+import com.example.linkpoint.protocol.LoginSessionResponse
 import com.example.linkpoint.protocol.SimEvent
 import com.example.linkpoint.protocol.SocialProtocolPackets
 import com.example.linkpoint.protocol.XmlRpcLoginClient
@@ -69,10 +70,15 @@ import org.robolectric.annotation.GraphicsMode
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.net.InetSocketAddress
+import java.net.SocketTimeoutException
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -215,14 +221,16 @@ class Phase3SocialParityTest {
         val buddy2 = UUID.fromString("12345678-2222-4222-8222-222222222222")
 
         // 1. Frame and decode OnlineNotification (0xFFFF0142) & OfflineNotification (0xFFFF0143)
+        // Both are declared Trusted Unencoded in message_template.msg
         val onlinePayload = SocialProtocolPackets.buildPresenceNotification(listOf(buddy1, buddy2))
         val framedOnline = LludpPackets.framePacket(
             sequenceNumber = 10,
             reliable = true,
             messageId = LludpPackets.MSG_ONLINE_NOTIFICATION,
             body = onlinePayload,
-            useZeroCoding = true
+            useZeroCoding = false
         )
+        assertEquals(0, framedOnline[0].toInt() and LludpPackets.FLAG_ZEROCODED)
         val decodedOnlinePkt = LludpPackets.decodePacket(framedOnline, framedOnline.size)
         assertNotNull(decodedOnlinePkt)
         assertEquals(LludpPackets.MSG_ONLINE_NOTIFICATION, decodedOnlinePkt!!.messageId)
@@ -245,8 +253,9 @@ class Phase3SocialParityTest {
             reliable = true,
             messageId = LludpPackets.MSG_OFFLINE_NOTIFICATION,
             body = offlinePayload,
-            useZeroCoding = true
+            useZeroCoding = false
         )
+        assertEquals(0, framedOffline[0].toInt() and LludpPackets.FLAG_ZEROCODED)
         val decodedOfflinePkt = LludpPackets.decodePacket(framedOffline, framedOffline.size)!!
         var offlineEvt: SimEvent.FriendOnlineStatusChanged? = null
         val offlineJob = launch {
@@ -260,7 +269,7 @@ class Phase3SocialParityTest {
         assertFalse(verifiedOffline!!.isOnline)
         assertEquals(listOf(buddy2), verifiedOffline.agentIds)
 
-        // 2. Binary packet framing & round-trip verification for StartLure (0xFFFF0046)
+        // 2. Binary packet framing & round-trip verification for StartLure (0xFFFF0046, Unencoded)
         val selfAgent = UUID.fromString("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         val selfSession = UUID.fromString("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         val targetFriend = UUID.fromString("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
@@ -278,8 +287,9 @@ class Phase3SocialParityTest {
             reliable = true,
             messageId = LludpPackets.MSG_START_LURE,
             body = startLureBytes,
-            useZeroCoding = true
+            useZeroCoding = false
         )
+        assertEquals(0, framedStartLure[0].toInt() and LludpPackets.FLAG_ZEROCODED)
         val decodedStartLurePkt = LludpPackets.decodePacket(framedStartLure, framedStartLure.size)!!
         assertEquals(LludpPackets.MSG_START_LURE, decodedStartLurePkt.messageId)
         val parsedStartLure = SocialProtocolPackets.parseStartLure(decodedStartLurePkt.payload)
@@ -290,7 +300,7 @@ class Phase3SocialParityTest {
         assertEquals(lureMsg, parsedStartLure.message)
         assertEquals(listOf(targetFriend), parsedStartLure.targetIds)
 
-        // 3. Binary packet framing & round-trip verification for TeleportLureRequest (0xFFFF0047)
+        // 3. Binary packet framing & round-trip verification for TeleportLureRequest (0xFFFF0047, Unencoded)
         val lureId = UUID.fromString("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
         val tpLureReqBytes = LludpPackets.buildTeleportLureRequest(
             agentId = selfAgent,
@@ -303,8 +313,9 @@ class Phase3SocialParityTest {
             reliable = true,
             messageId = LludpPackets.MSG_TELEPORT_LURE_REQUEST,
             body = tpLureReqBytes,
-            useZeroCoding = true
+            useZeroCoding = false
         )
+        assertEquals(0, framedTpReq[0].toInt() and LludpPackets.FLAG_ZEROCODED)
         val decodedTpReqPkt = LludpPackets.decodePacket(framedTpReq, framedTpReq.size)!!
         assertEquals(LludpPackets.MSG_TELEPORT_LURE_REQUEST, decodedTpReqPkt.messageId)
         val parsedTpReq = SocialProtocolPackets.parseTeleportLureRequest(decodedTpReqPkt.payload)
@@ -314,11 +325,43 @@ class Phase3SocialParityTest {
         assertEquals(lureId, parsedTpReq.lureId)
         assertEquals(SocialProtocolPackets.TELEPORT_FLAGS_VIA_LURE, parsedTpReq.teleportFlags)
 
-        // 4. Verify AcceptFriendship (65B) & DeclineFriendship (48B) binary sizes
+        // 4. Verify AcceptFriendship (65B), DeclineFriendship (48B), TerminateFriendship (48B) & Unencoded enforcement
         val txId = UUID.randomUUID()
-        val folderId = UUID.randomUUID()
-        assertEquals(65, SocialProtocolPackets.buildAcceptFriendship(selfAgent, selfSession, txId, folderId).size)
-        assertEquals(48, SocialProtocolPackets.buildDeclineFriendship(selfAgent, selfSession, txId).size)
+        val folderId = UUID(0L, 0L) // All-zero UUID ensures zero-run bytes exist in payload
+        val acceptBytes = SocialProtocolPackets.buildAcceptFriendship(selfAgent, selfSession, txId, folderId)
+        val declineBytes = SocialProtocolPackets.buildDeclineFriendship(selfAgent, selfSession, txId)
+        val terminateBytes = SocialProtocolPackets.buildTerminateFriendship(selfAgent, selfSession, targetFriend)
+        assertEquals(65, acceptBytes.size)
+        assertEquals(48, declineBytes.size)
+        assertEquals(48, terminateBytes.size)
+
+        val unencodedCases = listOf(
+            LludpPackets.MSG_ONLINE_NOTIFICATION to SocialProtocolPackets.buildPresenceNotification(listOf(UUID(0L, 0L))),
+            LludpPackets.MSG_OFFLINE_NOTIFICATION to SocialProtocolPackets.buildPresenceNotification(listOf(UUID(0L, 0L))),
+            LludpPackets.MSG_ACCEPT_FRIENDSHIP to acceptBytes,
+            LludpPackets.MSG_DECLINE_FRIENDSHIP to declineBytes,
+            LludpPackets.MSG_TERMINATE_FRIENDSHIP to terminateBytes,
+            LludpPackets.MSG_START_LURE to SocialProtocolPackets.buildStartLure(UUID(0L, 0L), UUID(0L, 0L), UUID(0L, 0L), "Hi"),
+            LludpPackets.MSG_TELEPORT_LURE_REQUEST to SocialProtocolPackets.buildTeleportLureRequest(UUID(0L, 0L), UUID(0L, 0L), UUID(0L, 0L))
+        )
+        for ((msgId, bodyBytes) in unencodedCases) {
+            assertFalse("Message 0x${msgId.toUInt().toString(16)} must be Unencoded per message_template.msg", LludpPackets.isZeroCodedMessage(msgId))
+            assertFalse(SocialProtocolPackets.isTemplateZeroCoded(msgId))
+            val framedEvenWhenRequested = LludpPackets.framePacket(
+                sequenceNumber = 99,
+                reliable = true,
+                messageId = msgId,
+                body = bodyBytes,
+                useZeroCoding = true
+            )
+            assertEquals(
+                "FLAG_ZEROCODED must never be set on Unencoded message 0x${msgId.toUInt().toString(16)}",
+                0,
+                framedEvenWhenRequested[0].toInt() and LludpPackets.FLAG_ZEROCODED
+            )
+        }
+        assertTrue(LludpPackets.isZeroCodedMessage(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE))
+        assertTrue(LludpPackets.isZeroCodedMessage(LludpPackets.MSG_CHAT_FROM_VIEWER))
     }
 
     @Test
@@ -551,6 +594,255 @@ class Phase3SocialParityTest {
             assertEquals("Lyra Architect", verifiedInvite.fromName)
             assertEquals("Join our live LSL Q&A!", verifiedInvite.message)
         } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `routes AcceptFriendship and DeclineFriendship via Agni HTTP capabilities when granted and falls back to Unencoded UDP on OpenSim`() = runBlocking {
+        // 1. Verify CapabilityManager.REQUESTED_CAPS includes Agni social & group capabilities
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("AcceptFriendship"))
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("DeclineFriendship"))
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("GroupAPIv1"))
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("GroupMemberData"))
+
+        data class RecordedHttpCall(val method: String, val pathAndQuery: String, val body: String)
+        val recordedCalls = CopyOnWriteArrayList<RecordedHttpCall>()
+        val seedRequestedCaps = CopyOnWriteArrayList<String>()
+
+        val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
+        val udpSimSocket = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply {
+            soTimeout = 350
+        }
+
+        val selfAgent = UUID.fromString("11111111-2222-4333-8444-555555555555")
+        val selfSession = UUID.fromString("aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee")
+        val callingCardFolder = UUID.fromString("22222222-3333-4444-8555-666677778888")
+        val offerFromA = UUID.fromString("77777777-1111-4222-8333-444444444444")
+        val offerFromB = UUID.fromString("88888888-2222-4333-8444-555555555555")
+        val txAcceptAgni = UUID.fromString("99990001-aaaa-4bbb-8ccc-dddddddddddd")
+        val txDeclineAgni = UUID.fromString("99990002-aaaa-4bbb-8ccc-dddddddddddd")
+        val txAcceptOpenSim = UUID.fromString("99990003-aaaa-4bbb-8ccc-dddddddddddd")
+        val txDeclineOpenSim = UUID.fromString("99990004-aaaa-4bbb-8ccc-dddddddddddd")
+
+        server.createContext("/cap/seed") { exchange ->
+            val reqXml = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
+            LlsdCodec.parseXml(reqXml).asList().forEach { seedRequestedCaps.add(it.asString()) }
+            val port = server.address.port
+            val replyXml = """
+                <?xml version="1.0" encoding="UTF-8"?>
+                <llsd><map>
+                  <key>AcceptFriendship</key><uri>http://127.0.0.1:$port/cap/accept-friendship</uri>
+                  <key>DeclineFriendship</key><uri>http://127.0.0.1:$port/cap/decline-friendship</uri>
+                  <key>GroupAPIv1</key><uri>http://127.0.0.1:$port/cap/group-api-v1</uri>
+                  <key>GroupMemberData</key><uri>http://127.0.0.1:$port/cap/group-member-data</uri>
+                </map></llsd>
+            """.trimIndent()
+            val bytes = replyXml.toByteArray(Charsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/llsd+xml")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.createContext("/cap/accept-friendship") { exchange ->
+            val body = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
+            recordedCalls.add(RecordedHttpCall(exchange.requestMethod, exchange.requestURI.toString(), body))
+            val bytes = """<?xml version="1.0" encoding="UTF-8"?><llsd><map><key>success</key><boolean>1</boolean></map></llsd>"""
+                .toByteArray(Charsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/llsd+xml")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.createContext("/cap/decline-friendship") { exchange ->
+            val body = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
+            recordedCalls.add(RecordedHttpCall(exchange.requestMethod, exchange.requestURI.toString(), body))
+            val bytes = """<?xml version="1.0" encoding="UTF-8"?><llsd><map><key>success</key><boolean>1</boolean></map></llsd>"""
+                .toByteArray(Charsets.UTF_8)
+            exchange.responseHeaders.add("Content-Type", "application/llsd+xml")
+            exchange.sendResponseHeaders(200, bytes.size.toLong())
+            exchange.responseBody.use { it.write(bytes) }
+        }
+        server.start()
+
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val vm = ViewerSessionViewModel(app)
+        try {
+            val httpPort = server.address.port
+            val udpPort = udpSimSocket.localPort
+            val testSession = LoginSessionResponse(
+                success = true,
+                message = "Welcome",
+                reason = "",
+                agentId = selfAgent,
+                sessionId = selfSession,
+                secureSessionId = UUID.randomUUID(),
+                circuitCode = 424242,
+                simIp = "127.0.0.1",
+                simPort = udpPort,
+                regionX = 256000,
+                regionY = 256000,
+                seedCapability = "http://127.0.0.1:$httpPort/cap/seed",
+                firstName = "Kaleaon",
+                lastName = "Resident",
+                inventoryRootId = UUID.randomUUID(),
+                inventorySkeleton = emptyList(),
+                buddyList = emptyList(),
+                lookAt = Triple(1f, 0f, 0f),
+                homeRegionName = "Agni Sandbox"
+            )
+
+            // Negotiate Agni Seed CAPS
+            val seedRes = vm.capabilityManager.requestSeedCapabilities(testSession.seedCapability)
+            assertTrue(seedRequestedCaps.containsAll(listOf("AcceptFriendship", "DeclineFriendship", "GroupAPIv1", "GroupMemberData")))
+            assertTrue(seedRes.capabilities.containsKey("AcceptFriendship"))
+            assertTrue(seedRes.capabilities.containsKey("DeclineFriendship"))
+
+            vm.attachConnectedSessionForTesting(testSession, gridName = "Second Life", callingCardFolder = callingCardFolder)
+
+            fun drainUdpPackets(waitMs: Long = 250L): List<Pair<Int, LludpPackets.DecodedPacket>> {
+                val collected = mutableListOf<Pair<Int, LludpPackets.DecodedPacket>>()
+                val deadline = System.currentTimeMillis() + waitMs
+                val rawBuf = ByteArray(2048)
+                while (System.currentTimeMillis() < deadline) {
+                    val remaining = (deadline - System.currentTimeMillis()).toInt().coerceAtLeast(25)
+                    udpSimSocket.soTimeout = remaining
+                    try {
+                        val dp = DatagramPacket(rawBuf, rawBuf.size)
+                        udpSimSocket.receive(dp)
+                        val rawCopy = dp.data.copyOf(dp.length)
+                        val decoded = LludpPackets.decodePacket(rawCopy, rawCopy.size)
+                        if (decoded != null) {
+                            collected.add((rawCopy[0].toInt() and 0xFF) to decoded)
+                        }
+                    } catch (_: SocketTimeoutException) {
+                        break
+                    }
+                }
+                return collected
+            }
+
+            // Drain initial circuit handshake packets
+            drainUdpPackets(260L)
+
+            // 2. Agni HTTP Capability Path: AcceptFriendship & DeclineFriendship granted
+            fun dispatchIncomingFriendshipOffer(seq: Int, fromId: UUID, fromName: String, txId: UUID) {
+                val pktBytes = SocialProtocolPackets.buildImprovedInstantMessage(
+                    agentId = fromId,
+                    sessionId = UUID.randomUUID(),
+                    toAgentId = selfAgent,
+                    imSessionId = txId,
+                    fromName = fromName,
+                    message = "Let's be friends!",
+                    dialog = SocialProtocolPackets.IM_FRIENDSHIP_OFFERED
+                )
+                vm.lludpEngine.decodeAndDispatchForTesting(
+                    LludpPackets.DecodedPacket(
+                        flags = 0,
+                        sequenceNumber = seq,
+                        messageId = LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE,
+                        payload = ByteBuffer.wrap(pktBytes).order(ByteOrder.LITTLE_ENDIAN),
+                        acks = emptyList()
+                    )
+                )
+                shadowOf(Looper.getMainLooper()).idle()
+            }
+
+            dispatchIncomingFriendshipOffer(70, offerFromA, "Aria Agni", txAcceptAgni)
+            assertNotNull(vm.state.value.incomingFriendshipOffer)
+
+            // Exercise ViewerClient.acceptFriendshipOffer() and verify HTTP POST with ?transaction=<imSessionId>
+            vm.acceptFriendshipOffer()
+            val deadlineAcceptHttp = System.currentTimeMillis() + 1500L
+            while (recordedCalls.none { it.pathAndQuery.startsWith("/cap/accept-friendship") } && System.currentTimeMillis() < deadlineAcceptHttp) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(20)
+            }
+            val acceptHttp = recordedCalls.firstOrNull { it.pathAndQuery.startsWith("/cap/accept-friendship") }
+            assertNotNull("Expected HTTP POST to AcceptFriendship capability", acceptHttp)
+            assertEquals("POST", acceptHttp!!.method)
+            assertTrue(acceptHttp.pathAndQuery.contains("transaction=$txAcceptAgni"))
+            assertTrue(acceptHttp.pathAndQuery.contains("from=$offerFromA"))
+            val acceptLlsd = LlsdCodec.parseXml(acceptHttp.body)
+            assertEquals(txAcceptAgni.toString(), acceptLlsd["transaction_id"].asString())
+            assertEquals(callingCardFolder.toString(), acceptLlsd["folder_id"].asString())
+            assertTrue(vm.state.value.friends.any { it.agentId == offerFromA && it.isOnline })
+            val udpDuringAgniAccept = drainUdpPackets(180L)
+            assertFalse(
+                "Must not send duplicate UDP AcceptFriendship when Agni HTTP capability succeeds",
+                udpDuringAgniAccept.any { it.second.messageId == LludpPackets.MSG_ACCEPT_FRIENDSHIP }
+            )
+
+            // Exercise ViewerClient.declineFriendshipOffer() on Agni HTTP capability
+            dispatchIncomingFriendshipOffer(71, offerFromB, "Bram Agni", txDeclineAgni)
+            assertNotNull(vm.state.value.incomingFriendshipOffer)
+            vm.declineFriendshipOffer()
+            val deadlineDeclineHttp = System.currentTimeMillis() + 1500L
+            while (recordedCalls.none { it.pathAndQuery.startsWith("/cap/decline-friendship") } && System.currentTimeMillis() < deadlineDeclineHttp) {
+                shadowOf(Looper.getMainLooper()).idle()
+                Thread.sleep(20)
+            }
+            val declineHttp = recordedCalls.firstOrNull { it.pathAndQuery.startsWith("/cap/decline-friendship") }
+            assertNotNull("Expected HTTP POST to DeclineFriendship capability", declineHttp)
+            assertEquals("POST", declineHttp!!.method)
+            assertTrue(declineHttp.pathAndQuery.contains("transaction=$txDeclineAgni"))
+            assertTrue(declineHttp.pathAndQuery.contains("from=$offerFromB"))
+            val declineLlsd = LlsdCodec.parseXml(declineHttp.body)
+            assertEquals(txDeclineAgni.toString(), declineLlsd["transaction_id"].asString())
+            val udpDuringAgniDecline = drainUdpPackets(180L)
+            assertFalse(
+                "Must not send duplicate UDP DeclineFriendship when Agni HTTP capability succeeds",
+                udpDuringAgniDecline.any { it.second.messageId == LludpPackets.MSG_DECLINE_FRIENDSHIP }
+            )
+
+            // 3. OpenSim Fallback Path: Clear capabilities (simulating OpenSimulator region without AcceptFriendship/DeclineFriendship caps)
+            vm.capabilityManager.shutdown()
+            assertNull(vm.capabilityManager.getCapabilityUrl("AcceptFriendship"))
+            assertNull(vm.capabilityManager.getCapabilityUrl("DeclineFriendship"))
+
+            val openSimFriend = UUID.fromString("66666666-3333-4444-8555-777777777777")
+            dispatchIncomingFriendshipOffer(72, openSimFriend, "Orion OpenSim", txAcceptOpenSim)
+            vm.acceptFriendshipOffer()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            var udpAcceptPkt: Pair<Int, LludpPackets.DecodedPacket>? = null
+            val acceptUdpDeadline = System.currentTimeMillis() + 1500L
+            while (udpAcceptPkt == null && System.currentTimeMillis() < acceptUdpDeadline) {
+                udpAcceptPkt = drainUdpPackets(200L).firstOrNull {
+                    it.second.messageId == LludpPackets.MSG_ACCEPT_FRIENDSHIP
+                }
+            }
+            assertNotNull("OpenSim without AcceptFriendship cap must fall back to UDP 0xFFFF0129", udpAcceptPkt)
+            assertEquals(0, udpAcceptPkt!!.first and LludpPackets.FLAG_ZEROCODED)
+            assertTrue((udpAcceptPkt.first and LludpPackets.FLAG_RELIABLE) != 0)
+            val parsedUdpAccept = SocialProtocolPackets.parseAcceptFriendship(udpAcceptPkt.second.payload)
+            assertNotNull(parsedUdpAccept)
+            assertEquals(selfAgent, parsedUdpAccept!!.agentId)
+            assertEquals(selfSession, parsedUdpAccept.sessionId)
+            assertEquals(txAcceptOpenSim, parsedUdpAccept.transactionId)
+            assertEquals(listOf(callingCardFolder), parsedUdpAccept.folderIds)
+
+            val openSimDeclinePeer = UUID.fromString("55555555-4444-4555-8666-888888888888")
+            dispatchIncomingFriendshipOffer(73, openSimDeclinePeer, "Daria OpenSim", txDeclineOpenSim)
+            vm.declineFriendshipOffer()
+            shadowOf(Looper.getMainLooper()).idle()
+
+            var udpDeclinePkt: Pair<Int, LludpPackets.DecodedPacket>? = null
+            val declineUdpDeadline = System.currentTimeMillis() + 1500L
+            while (udpDeclinePkt == null && System.currentTimeMillis() < declineUdpDeadline) {
+                udpDeclinePkt = drainUdpPackets(200L).firstOrNull {
+                    it.second.messageId == LludpPackets.MSG_DECLINE_FRIENDSHIP
+                }
+            }
+            assertNotNull("OpenSim without DeclineFriendship cap must fall back to UDP 0xFFFF012A", udpDeclinePkt)
+            assertEquals(0, udpDeclinePkt!!.first and LludpPackets.FLAG_ZEROCODED)
+            assertTrue((udpDeclinePkt.first and LludpPackets.FLAG_RELIABLE) != 0)
+            val parsedUdpDecline = SocialProtocolPackets.parseDeclineFriendship(udpDeclinePkt.second.payload)
+            assertNotNull(parsedUdpDecline)
+            assertEquals(selfAgent, parsedUdpDecline!!.agentId)
+            assertEquals(selfSession, parsedUdpDecline.sessionId)
+            assertEquals(txDeclineOpenSim, parsedUdpDecline.transactionId)
+        } finally {
+            vm.disconnect()
+            udpSimSocket.close()
             server.stop(0)
         }
     }

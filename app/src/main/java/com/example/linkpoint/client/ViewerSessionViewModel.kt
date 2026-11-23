@@ -30,6 +30,7 @@ import com.example.linkpoint.protocol.LayerHealthStatus
 import com.example.linkpoint.protocol.LludpCircuitEngine
 import com.example.linkpoint.protocol.LludpPackets
 import com.example.linkpoint.protocol.LoginRequestParams
+import com.example.linkpoint.protocol.LoginSessionResponse
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
@@ -2338,11 +2339,82 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         )
     }
 
+    internal enum class FriendshipResponseTransport {
+        HTTP_CAPABILITY,
+        UDP_FALLBACK
+    }
+
+    internal fun attachConnectedSessionForTesting(
+        session: LoginSessionResponse,
+        gridName: String = "Test Grid",
+        callingCardFolder: UUID = UUID(0L, 0L)
+    ) {
+        selfAgentId = session.agentId
+        selfAvatarName = "${session.firstName} ${session.lastName}".trim().ifBlank { "Resident" }
+        callingCardFolderId = callingCardFolder
+        lludpEngine.connect(session)
+        _state.update { s ->
+            s.copy(
+                connection = ConnectionState.Connected(
+                    gridName = gridName,
+                    regionName = session.homeRegionName.ifBlank { "Test Region" },
+                    avatarName = selfAvatarName,
+                    agentId = session.agentId,
+                    simIp = session.simIp,
+                    simPort = session.simPort
+                )
+            )
+        }
+    }
+
+    internal suspend fun respondToFriendshipOffer(
+        accept: Boolean,
+        transactionId: UUID,
+        fromAgentId: UUID,
+        callingCardFolderId: UUID = this.callingCardFolderId
+    ): FriendshipResponseTransport {
+        if (accept) {
+            if (capabilityManager.getCapabilityUrl("AcceptFriendship") != null) {
+                val handledByCap = capabilityManager.acceptFriendship(
+                    transactionId = transactionId,
+                    fromAgentId = fromAgentId,
+                    callingCardFolderId = callingCardFolderId,
+                    agentName = selfAvatarName
+                )
+                if (handledByCap) {
+                    return FriendshipResponseTransport.HTTP_CAPABILITY
+                }
+            }
+            lludpEngine.sendAcceptFriendship(transactionId, callingCardFolderId)
+            return FriendshipResponseTransport.UDP_FALLBACK
+        } else {
+            if (capabilityManager.getCapabilityUrl("DeclineFriendship") != null) {
+                val handledByCap = capabilityManager.declineFriendship(
+                    transactionId = transactionId,
+                    fromAgentId = fromAgentId
+                )
+                if (handledByCap) {
+                    return FriendshipResponseTransport.HTTP_CAPABILITY
+                }
+            }
+            lludpEngine.sendDeclineFriendship(transactionId)
+            return FriendshipResponseTransport.UDP_FALLBACK
+        }
+    }
+
     override fun acceptFriendshipOffer() {
         val offer = _state.value.incomingFriendshipOffer ?: return
         _state.update { it.copy(incomingFriendshipOffer = null) }
         if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendAcceptFriendship(offer.sessionId, callingCardFolderId)
+            val folderId = callingCardFolderId
+            viewModelScope.launch {
+                respondToFriendshipOffer(
+                    accept = true,
+                    transactionId = offer.sessionId,
+                    fromAgentId = offer.fromAgentId,
+                    callingCardFolderId = folderId
+                )
+            }
         }
         upsertFriend(offer.fromAgentId, offer.fromName, isOnline = true)
         appendLocalChat(
@@ -2359,7 +2431,14 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         val offer = _state.value.incomingFriendshipOffer ?: return
         _state.update { it.copy(incomingFriendshipOffer = null) }
         if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendDeclineFriendship(offer.sessionId)
+            viewModelScope.launch {
+                respondToFriendshipOffer(
+                    accept = false,
+                    transactionId = offer.sessionId,
+                    fromAgentId = offer.fromAgentId,
+                    callingCardFolderId = callingCardFolderId
+                )
+            }
         }
         showToast("Declined friendship offer from ${offer.fromName}")
     }

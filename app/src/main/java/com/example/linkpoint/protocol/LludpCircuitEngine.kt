@@ -1296,7 +1296,8 @@ class LludpCircuitEngine {
     fun sendChat(message: String, chatType: Byte = 1, channel: Int = 0) {
         if (!running.get()) return
         val body = LludpPackets.buildChatFromViewer(agentId, sessionId, message, chatType, channel)
-        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true)
+        // ChatFromViewer (Low 80) is Zerocoded in message_template.msg
+        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true, zeroCode = true)
     }
 
     fun sendInstantMessage(
@@ -1316,7 +1317,8 @@ class LludpCircuitEngine {
             message = message,
             dialog = dialog
         )
-        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true)
+        // ImprovedInstantMessage (Low 254) is Zerocoded in message_template.msg
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
     }
 
     fun sendTypingIndicator(toAgentId: UUID, imSessionId: UUID, fromName: String, isTyping: Boolean) {
@@ -1335,13 +1337,14 @@ class LludpCircuitEngine {
             message = "",
             dialog = dialog
         )
-        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true)
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
     }
 
     fun sendStartLure(targetAgentId: UUID, message: String) {
         if (!running.get()) return
         val body = SocialProtocolPackets.buildStartLure(agentId, sessionId, targetAgentId, message)
-        send(LludpPackets.MSG_START_LURE, body, reliable = true)
+        // StartLure (Low 70 / 0xFFFF0046) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_START_LURE, body, reliable = true, zeroCode = false)
     }
 
     fun sendTeleportLureRequest(
@@ -1350,7 +1353,8 @@ class LludpCircuitEngine {
     ) {
         if (!running.get()) return
         val body = SocialProtocolPackets.buildTeleportLureRequest(agentId, sessionId, lureId, teleportFlags)
-        send(LludpPackets.MSG_TELEPORT_LURE_REQUEST, body, reliable = true)
+        // TeleportLureRequest (Low 71 / 0xFFFF0047) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_TELEPORT_LURE_REQUEST, body, reliable = true, zeroCode = false)
     }
 
     fun sendFriendshipOffer(targetAgentId: UUID, fromName: String, message: String) {
@@ -1365,25 +1369,28 @@ class LludpCircuitEngine {
             message = message,
             dialog = SocialProtocolPackets.IM_FRIENDSHIP_OFFERED
         )
-        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true)
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
     }
 
     fun sendAcceptFriendship(transactionId: UUID, callingCardFolderId: UUID = UUID(0L, 0L)) {
         if (!running.get()) return
         val body = SocialProtocolPackets.buildAcceptFriendship(agentId, sessionId, transactionId, callingCardFolderId)
-        send(LludpPackets.MSG_ACCEPT_FRIENDSHIP, body, reliable = true)
+        // AcceptFriendship (Low 297 / 0xFFFF0129) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_ACCEPT_FRIENDSHIP, body, reliable = true, zeroCode = false)
     }
 
     fun sendDeclineFriendship(transactionId: UUID) {
         if (!running.get()) return
         val body = SocialProtocolPackets.buildDeclineFriendship(agentId, sessionId, transactionId)
-        send(LludpPackets.MSG_DECLINE_FRIENDSHIP, body, reliable = true)
+        // DeclineFriendship (Low 298 / 0xFFFF012A) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_DECLINE_FRIENDSHIP, body, reliable = true, zeroCode = false)
     }
 
     fun sendTerminateFriendship(otherAgentId: UUID) {
         if (!running.get()) return
         val body = SocialProtocolPackets.buildTerminateFriendship(agentId, sessionId, otherAgentId)
-        send(LludpPackets.MSG_TERMINATE_FRIENDSHIP, body, reliable = true)
+        // TerminateFriendship (Low 300 / 0xFFFF012C) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_TERMINATE_FRIENDSHIP, body, reliable = true, zeroCode = false)
     }
 
     fun sendGroupSessionStart(groupId: UUID, fromName: String) {
@@ -1398,7 +1405,7 @@ class LludpCircuitEngine {
             dialog = SocialProtocolPackets.IM_SESSION_GROUP_START,
             binaryBucket = byteArrayOf(0)
         )
-        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true)
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
     }
 
     fun sendGroupChat(groupId: UUID, fromName: String, message: String) {
@@ -1413,7 +1420,7 @@ class LludpCircuitEngine {
             dialog = SocialProtocolPackets.IM_SESSION_SEND,
             binaryBucket = byteArrayOf(0)
         )
-        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true)
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
     }
 
     internal fun dispatchRoutedInstantMessage(routed: SocialProtocolPackets.RoutedInstantMessage) {

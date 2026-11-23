@@ -1,6 +1,7 @@
 package com.example.linkpoint.protocol
 
 import com.example.linkpoint.scene.Vec3
+import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
@@ -18,6 +19,25 @@ object SocialProtocolPackets {
     const val MSG_TERMINATE_FRIENDSHIP: Int = 0xFFFF012C.toInt()  // Low 300
     const val MSG_ONLINE_NOTIFICATION: Int = 0xFFFF0142.toInt()   // Low 322
     const val MSG_OFFLINE_NOTIFICATION: Int = 0xFFFF0143.toInt()  // Low 323
+
+    /**
+     * Canonical `indra/llmessage/message_template.msg` encoding verification:
+     * All 7 low-frequency social presence, friendship, and lure UDP messages are declared `Unencoded`
+     * (never zero-coded with `FLAG_ZEROCODED = 0x80`), whereas `ImprovedInstantMessage` (Low 254)
+     * and `ChatFromViewer` (Low 80) are `Zerocoded`.
+     */
+    val UNENCODED_SOCIAL_MESSAGE_IDS: Set<Int> = setOf(
+        MSG_START_LURE,            // Low 70  NotTrusted Unencoded
+        MSG_TELEPORT_LURE_REQUEST, // Low 71  NotTrusted Unencoded
+        MSG_ACCEPT_FRIENDSHIP,     // Low 297 NotTrusted Unencoded
+        MSG_DECLINE_FRIENDSHIP,    // Low 298 NotTrusted Unencoded
+        MSG_TERMINATE_FRIENDSHIP,  // Low 300 NotTrusted Unencoded
+        MSG_ONLINE_NOTIFICATION,   // Low 322 Trusted    Unencoded
+        MSG_OFFLINE_NOTIFICATION   // Low 323 Trusted    Unencoded
+    )
+
+    fun isTemplateZeroCoded(messageId: Int): Boolean =
+        messageId !in UNENCODED_SOCIAL_MESSAGE_IDS && LludpPackets.isZeroCodedMessage(messageId)
 
     // Canonical Second Life TeleportFlags bitmask for accepting a teleport lure
     const val TELEPORT_FLAGS_VIA_LURE: Int = 1 shl 22 // 0x00400000
@@ -49,6 +69,25 @@ object SocialProtocolPackets {
         val sessionId: UUID,
         val lureId: UUID,
         val teleportFlags: Int
+    )
+
+    data class ParsedAcceptFriendship(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val transactionId: UUID,
+        val folderIds: List<UUID>
+    )
+
+    data class ParsedDeclineFriendship(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val transactionId: UUID
+    )
+
+    data class ParsedTerminateFriendship(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val otherAgentId: UUID
     )
 
     data class DecodedInstantMessage(
@@ -312,6 +351,107 @@ object SocialProtocolPackets {
         LludpPackets.putUuid(buf, sessionId)
         LludpPackets.putUuid(buf, otherAgentId)
         return buf.array()
+    }
+
+    fun parseAcceptFriendship(buf: ByteBuffer): ParsedAcceptFriendship? {
+        if (buf.remaining() < 49) return null
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val transactionId = LludpPackets.readUuid(buf)
+        val folderCount = buf.get().toInt() and 0xFF
+        val folders = ArrayList<UUID>(folderCount)
+        repeat(folderCount) {
+            if (buf.remaining() >= 16) {
+                folders.add(LludpPackets.readUuid(buf))
+            }
+        }
+        return ParsedAcceptFriendship(agentId, sessionId, transactionId, folders)
+    }
+
+    fun parseDeclineFriendship(buf: ByteBuffer): ParsedDeclineFriendship? {
+        if (buf.remaining() < 48) return null
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val transactionId = LludpPackets.readUuid(buf)
+        return ParsedDeclineFriendship(agentId, sessionId, transactionId)
+    }
+
+    fun parseTerminateFriendship(buf: ByteBuffer): ParsedTerminateFriendship? {
+        if (buf.remaining() < 48) return null
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val otherAgentId = LludpPackets.readUuid(buf)
+        return ParsedTerminateFriendship(agentId, sessionId, otherAgentId)
+    }
+
+    // --- Agni HTTP AcceptFriendship / DeclineFriendship Capability Helpers ---
+
+    fun buildFriendshipCapabilityUrl(
+        baseUrl: String,
+        transactionId: UUID,
+        fromAgentId: UUID? = null,
+        agentName: String? = null
+    ): String {
+        val trimmed = baseUrl.trim()
+        val sep = if ('?' in trimmed) '&' else '?'
+        val sb = StringBuilder(trimmed.length + 96)
+        sb.append(trimmed).append(sep).append("transaction=").append(transactionId)
+        if (fromAgentId != null && fromAgentId != UUID(0L, 0L)) {
+            sb.append("&from=").append(fromAgentId)
+        }
+        val cleanName = agentName?.trim().orEmpty()
+        if (cleanName.isNotEmpty()) {
+            val encoded = URLEncoder.encode("\"$cleanName\"", Charsets.UTF_8.name())
+            sb.append("&agent_name=").append(encoded)
+        }
+        return sb.toString()
+    }
+
+    fun buildAcceptFriendshipLlsd(
+        transactionId: UUID,
+        fromAgentId: UUID? = null,
+        callingCardFolderId: UUID = UUID(0L, 0L)
+    ): LlsdValue.MapVal {
+        val map = LinkedHashMap<String, LlsdValue>()
+        map["transaction_id"] = LlsdValue.Uuid(transactionId)
+        if (fromAgentId != null && fromAgentId != UUID(0L, 0L)) {
+            map["from_id"] = LlsdValue.Uuid(fromAgentId)
+        }
+        if (callingCardFolderId != UUID(0L, 0L)) {
+            map["folder_id"] = LlsdValue.Uuid(callingCardFolderId)
+            map["folders"] = LlsdValue.ArrayVal(listOf(LlsdValue.Uuid(callingCardFolderId)))
+        }
+        return LlsdValue.MapVal(map)
+    }
+
+    fun buildDeclineFriendshipLlsd(
+        transactionId: UUID,
+        fromAgentId: UUID? = null
+    ): LlsdValue.MapVal {
+        val map = LinkedHashMap<String, LlsdValue>()
+        map["transaction_id"] = LlsdValue.Uuid(transactionId)
+        if (fromAgentId != null && fromAgentId != UUID(0L, 0L)) {
+            map["from_id"] = LlsdValue.Uuid(fromAgentId)
+        }
+        return LlsdValue.MapVal(map)
+    }
+
+    fun parseFriendshipCapabilityResponse(respBody: String): Boolean {
+        val trimmed = respBody.trim()
+        if (trimmed.isEmpty()) return true
+        val parsed = runCatching { LlsdCodec.parseXml(trimmed) }.getOrNull() ?: return true
+        return when (parsed) {
+            is LlsdValue.Bool -> parsed.value
+            is LlsdValue.MapVal -> {
+                when (val s = parsed["success"]) {
+                    is LlsdValue.Bool -> s.value
+                    is LlsdValue.IntVal -> s.value != 0
+                    is LlsdValue.Str -> !s.value.equals("false", ignoreCase = true) && s.value != "0"
+                    else -> true
+                }
+            }
+            else -> true
+        }
     }
 
     // --- ImprovedInstantMessage Codec & Dialog Router ---

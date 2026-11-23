@@ -90,7 +90,19 @@ interface ViewerClient {
     fun acceptTeleportOffer()
     fun declineTeleportOffer()
     fun offerFriendship(targetAgentId: UUID, targetName: String, message: String = "")
+    /**
+     * Accepts the active `IM_FRIENDSHIP_OFFERED` prompt using the region's `AcceptFriendship`
+     * HTTP capability (`?transaction=<imSessionId>` LLSD POST) when granted on Agni, and
+     * automatically falls back to LLUDP `AcceptFriendship` (`0xFFFF0129`) on OpenSim or
+     * regions without that capability.
+     */
     fun acceptFriendshipOffer()
+    /**
+     * Declines the active `IM_FRIENDSHIP_OFFERED` prompt using the region's `DeclineFriendship`
+     * HTTP capability (`?transaction=<imSessionId>` LLSD POST) when granted on Agni, and
+     * automatically falls back to LLUDP `DeclineFriendship` (`0xFFFF012A`) on OpenSim or
+     * regions without that capability.
+     */
     fun declineFriendshipOffer()
     fun toggleMuteAvatar(agentId: UUID, avatarName: String)
     fun searchMapRegions(query: String)

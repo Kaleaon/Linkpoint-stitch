@@ -115,7 +115,7 @@ class CapabilityManager(
 
     companion object {
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
-        private val REQUESTED_CAPS = listOf(
+        internal val REQUESTED_CAPS = listOf(
             "EventQueueGet",
             "FetchInventoryDescendents2",
             "FetchInventory2",
@@ -130,6 +130,10 @@ class CapabilityManager(
             "AttachmentResources",
             "UpdateAgentInformation",
             "ChatSessionRequest",
+            "GroupAPIv1",
+            "GroupMemberData",
+            "AcceptFriendship",
+            "DeclineFriendship",
             "MapLayer",
             "EnvironmentSettings"
         )
@@ -804,6 +808,88 @@ class CapabilityManager(
 
     suspend fun acceptGroupChatInvitation(sessionId: UUID): Boolean =
         requestChatSession(SocialProtocolPackets.ChatSessionRequestMethod.AcceptInvitation, sessionId)
+
+    /**
+     * Invokes the Second Life `AcceptFriendship` HTTP capability (`?transaction=<imSessionId>`
+     * with LLSD XML `POST`) when granted by the region. Returns `false` when the capability is
+     * absent (e.g. OpenSimulator) or fails so callers automatically fall back to UDP `0xFFFF0129`.
+     */
+    suspend fun acceptFriendship(
+        transactionId: UUID,
+        fromAgentId: UUID? = null,
+        callingCardFolderId: UUID = UUID(0L, 0L),
+        agentName: String = ""
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = capabilities["AcceptFriendship"]?.takeIf { it.isNotBlank() } ?: return@withContext false
+        val targetUrl = SocialProtocolPackets.buildFriendshipCapabilityUrl(
+            baseUrl = baseUrl,
+            transactionId = transactionId,
+            fromAgentId = fromAgentId,
+            agentName = agentName
+        )
+        val xmlPayload = LlsdCodec.toXml(
+            SocialProtocolPackets.buildAcceptFriendshipLlsd(
+                transactionId = transactionId,
+                fromAgentId = fromAgentId,
+                callingCardFolderId = callingCardFolderId
+            )
+        )
+        val req = Request.Builder()
+            .url(targetUrl)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext false
+                SocialProtocolPackets.parseFriendshipCapabilityResponse(resp.body?.string().orEmpty())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Invokes the Second Life `DeclineFriendship` HTTP capability (`?transaction=<imSessionId>`
+     * with LLSD XML `POST`) when granted by the region. Returns `false` when the capability is
+     * absent (e.g. OpenSimulator) or fails so callers automatically fall back to UDP `0xFFFF012A`.
+     */
+    suspend fun declineFriendship(
+        transactionId: UUID,
+        fromAgentId: UUID? = null
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = capabilities["DeclineFriendship"]?.takeIf { it.isNotBlank() } ?: return@withContext false
+        val targetUrl = SocialProtocolPackets.buildFriendshipCapabilityUrl(
+            baseUrl = baseUrl,
+            transactionId = transactionId,
+            fromAgentId = fromAgentId
+        )
+        val xmlPayload = LlsdCodec.toXml(
+            SocialProtocolPackets.buildDeclineFriendshipLlsd(
+                transactionId = transactionId,
+                fromAgentId = fromAgentId
+            )
+        )
+        val req = Request.Builder()
+            .url(targetUrl)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext false
+                SocialProtocolPackets.parseFriendshipCapabilityResponse(resp.body?.string().orEmpty())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
+    }
 
     fun getCapabilityUrl(name: String): String? = capabilities[name]
 
