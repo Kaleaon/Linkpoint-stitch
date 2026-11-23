@@ -14,7 +14,13 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -479,5 +485,340 @@ class TeleportAndSlurlTest {
             runCatching { sim1Socket.close() }
             runCatching { sim2Socket.close() }
         }
+    }
+
+    @Test
+    fun `frames CloseCircuit 0xFFFFFFFD unencoded and transmits LogoutRequest followed by CloseCircuit on session logout`() = runBlocking {
+        assertEquals(0xFFFFFFFD.toInt(), LludpPackets.MSG_CLOSE_CIRCUIT)
+        assertTrue(LludpPackets.isUnencodedMessage(LludpPackets.MSG_CLOSE_CIRCUIT))
+        assertTrue(LludpPackets.isUnencodedMessage(LludpPackets.MSG_LOGOUT_REQUEST))
+
+        // Verify CloseCircuit is never zerocoded even if caller passes useZeroCoding = true
+        val rawClose = LludpPackets.framePacket(
+            sequenceNumber = 42,
+            reliable = false,
+            messageId = LludpPackets.MSG_CLOSE_CIRCUIT,
+            body = LludpPackets.buildCloseCircuit(),
+            useZeroCoding = true
+        )
+        assertEquals(10, rawClose.size)
+        assertEquals("CloseCircuit must never set FLAG_ZEROCODED", 0, rawClose[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        assertEquals(0xFF.toByte(), rawClose[6])
+        assertEquals(0xFF.toByte(), rawClose[7])
+        assertEquals(0xFF.toByte(), rawClose[8])
+        assertEquals(0xFD.toByte(), rawClose[9])
+
+        val decodedClose = LludpPackets.decodePacket(rawClose, rawClose.size)
+        assertNotNull(decodedClose)
+        assertEquals(LludpPackets.MSG_CLOSE_CIRCUIT, decodedClose!!.messageId)
+        assertEquals(42, decodedClose.sequenceNumber)
+        assertEquals(0, decodedClose.payload.remaining())
+
+        // Verify live LludpCircuitEngine.disconnect(sendLogout = true) sends LogoutRequest then CloseCircuit
+        val simSocket = DatagramSocket(0, InetAddress.getByName("127.0.0.1")).apply { soTimeout = 1500 }
+        val engine = LludpCircuitEngine()
+        try {
+            val agentId = UUID.fromString("12121212-3434-4567-89ab-cdef01234567")
+            val sessionId = UUID.fromString("fedcba98-7654-4321-8fed-cba987654321")
+            val loginResp = LoginSessionResponse(
+                success = true,
+                message = "Welcome",
+                reason = "",
+                agentId = agentId,
+                sessionId = sessionId,
+                secureSessionId = UUID.randomUUID(),
+                circuitCode = 0x2468ACE0,
+                simIp = "127.0.0.1",
+                simPort = simSocket.localPort,
+                regionX = 1000 * 256,
+                regionY = 1000 * 256,
+                seedCapability = "http://127.0.0.1:9000/CAPS/seed-logout",
+                firstName = "Logout",
+                lastName = "Tester",
+                inventoryRootId = UUID.randomUUID(),
+                inventorySkeleton = emptyList(),
+                buddyList = emptyList(),
+                lookAt = Triple(1f, 0f, 0f),
+                homeRegionName = "Ahern"
+            )
+
+            engine.connect(loginResp)
+
+            // Drain initial handshake datagrams (UseCircuitCode, CompleteAgentMovement, AgentThrottle)
+            repeat(3) {
+                val hsBuf = ByteArray(1500)
+                simSocket.receive(DatagramPacket(hsBuf, hsBuf.size))
+            }
+
+            // Trigger explicit session logout
+            engine.disconnect(sendLogout = true)
+
+            val teardownRaw = mutableListOf<ByteArray>()
+            val teardownDecoded = mutableListOf<LludpPackets.DecodedPacket>()
+            while (teardownDecoded.size < 2) {
+                val rxBuf = ByteArray(1500)
+                val rxPkt = DatagramPacket(rxBuf, rxBuf.size)
+                simSocket.receive(rxPkt)
+                val copy = rxPkt.data.copyOf(rxPkt.length)
+                val dec = LludpPackets.decodePacket(copy, copy.size) ?: continue
+                if (dec.messageId == LludpPackets.MSG_LOGOUT_REQUEST ||
+                    dec.messageId == LludpPackets.MSG_CLOSE_CIRCUIT
+                ) {
+                    teardownRaw.add(copy)
+                    teardownDecoded.add(dec)
+                }
+            }
+
+            assertEquals(LludpPackets.MSG_LOGOUT_REQUEST, teardownDecoded[0].messageId)
+            assertEquals(0, teardownRaw[0][0].toInt() and LludpPackets.FLAG_ZEROCODED)
+            assertTrue((teardownDecoded[0].flags and LludpPackets.FLAG_RELIABLE) != 0)
+            assertEquals(agentId, LludpPackets.readUuid(teardownDecoded[0].payload))
+            assertEquals(sessionId, LludpPackets.readUuid(teardownDecoded[0].payload))
+
+            assertEquals(LludpPackets.MSG_CLOSE_CIRCUIT, teardownDecoded[1].messageId)
+            assertEquals(0, teardownRaw[1][0].toInt() and LludpPackets.FLAG_ZEROCODED)
+            assertEquals(0, teardownDecoded[1].flags and LludpPackets.FLAG_RELIABLE)
+            assertEquals(teardownDecoded[0].sequenceNumber + 1, teardownDecoded[1].sequenceNumber)
+            assertEquals(0, teardownDecoded[1].payload.remaining())
+        } finally {
+            engine.disconnect(sendLogout = false)
+            runCatching { simSocket.close() }
+        }
+    }
+
+    @Test
+    fun `negotiates SimulatorFeatures and clears stale region capabilities across teleports`() = runBlocking {
+        assertTrue(
+            "CapabilityManager.REQUESTED_CAPS must request SimulatorFeatures",
+            "SimulatorFeatures" in CapabilityManager.REQUESTED_CAPS
+        )
+
+        val xmlMedia = "application/llsd+xml; charset=utf-8".toMediaType()
+        val mockHttpClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val url = req.url.toString()
+                val bodyXml = when {
+                    url == "https://sim-a.agni.lindenlab.com:12043/cap/seed-a" -> """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <llsd>
+                          <map>
+                            <key>SimulatorFeatures</key><string>https://sim-a.agni.lindenlab.com:12043/cap/sim-features-a</string>
+                            <key>RenderMaterials</key><string>https://sim-a.agni.lindenlab.com:12043/cap/render-mat-a</string>
+                            <key>GetMesh2</key><string>https://sim-a.agni.lindenlab.com:12043/cap/get-mesh2-a</string>
+                            <key>RegionAExclusiveCap</key><string>https://sim-a.agni.lindenlab.com:12043/cap/exclusive-a</string>
+                          </map>
+                        </llsd>
+                    """.trimIndent()
+                    url == "https://sim-a.agni.lindenlab.com:12043/cap/sim-features-a" -> """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <llsd>
+                          <map>
+                            <key>MeshRezEnabled</key><boolean>1</boolean>
+                            <key>MeshUploadEnabled</key><boolean>1</boolean>
+                            <key>PhysicsShapeTypes</key>
+                            <map>
+                              <key>convex</key><boolean>1</boolean>
+                              <key>prim</key><boolean>1</boolean>
+                              <key>none</key><boolean>1</boolean>
+                              <key>disabled_shape</key><boolean>0</boolean>
+                            </map>
+                            <key>PBRMaterialEnabled</key><boolean>1</boolean>
+                            <key>RenderMaterialsCapability</key><real>1.0</real>
+                            <key>VoiceServerType</key><string>webrtc</string>
+                            <key>MaxMaterialsPerTransaction</key><integer>50</integer>
+                            <key>BakesOnMeshEnabled</key><boolean>1</boolean>
+                            <key>AnimatedObjects</key>
+                            <map>
+                              <key>AllowedAnimatedObjects</key><boolean>1</boolean>
+                            </map>
+                          </map>
+                        </llsd>
+                    """.trimIndent()
+                    url == "https://sim-b.grid.example.org:9000/cap/seed-b" -> """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <llsd>
+                          <map>
+                            <key>SimulatorFeatures</key><string>https://sim-b.grid.example.org:9000/cap/sim-features-b</string>
+                            <key>GetTexture</key><string>https://sim-b.grid.example.org:9000/cap/get-tex-b</string>
+                          </map>
+                        </llsd>
+                    """.trimIndent()
+                    url == "https://sim-b.grid.example.org:9000/cap/sim-features-b" -> """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <llsd>
+                          <map>
+                            <key>MeshRezEnabled</key><boolean>1</boolean>
+                            <key>MeshUploadEnabled</key><boolean>0</boolean>
+                            <key>PhysicsShapeTypes</key>
+                            <array>
+                              <string>prim</string>
+                              <string>convex</string>
+                            </array>
+                            <key>PBRMaterialEnabled</key><boolean>0</boolean>
+                            <key>voice_server_type</key><string>vivox</string>
+                            <key>MaxMaterialsPerTransaction</key><integer>16</integer>
+                            <key>RegionSizeX</key><integer>512</integer>
+                            <key>RegionSizeY</key><integer>512</integer>
+                          </map>
+                        </llsd>
+                    """.trimIndent()
+                    else -> return@addInterceptor Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(404)
+                        .message("Not Found")
+                        .body("".toResponseBody(xmlMedia))
+                        .build()
+                }
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(bodyXml.toResponseBody(xmlMedia))
+                    .build()
+            }
+            .build()
+
+        val manager = CapabilityManager(httpClient = mockHttpClient, seedHttpClient = mockHttpClient)
+        try {
+            // 1. Seed Region A and fetch SimulatorFeatures
+            val seedResA = manager.requestSeedCapabilities("https://sim-a.agni.lindenlab.com:12043/cap/seed-a")
+            assertEquals(4, seedResA.capabilities.size)
+            assertEquals(
+                "https://sim-a.agni.lindenlab.com:12043/cap/exclusive-a",
+                manager.getCapabilityUrl("RegionAExclusiveCap")
+            )
+
+            val featuresEvtDeferred = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                withTimeout(2000L) {
+                    manager.capsEvents.first { it is CapsEvent.SimulatorFeaturesReceived } as CapsEvent.SimulatorFeaturesReceived
+                }
+            }
+            val featuresA = manager.fetchSimulatorFeatures()
+            assertNotNull(featuresA)
+            assertEquals(featuresA, featuresEvtDeferred.await().features)
+            assertTrue(featuresA!!.meshRezEnabled)
+            assertTrue(featuresA.meshUploadEnabled)
+            assertEquals(setOf("convex", "prim", "none"), featuresA.physicsShapeTypes)
+            assertTrue(featuresA.pbrMaterialEnabled)
+            assertTrue(featuresA.renderMaterialsEnabled)
+            assertEquals("webrtc", featuresA.voiceServerType)
+            assertTrue(featuresA.isWebRtcVoice)
+            assertEquals(50, featuresA.maxMaterialsPerTransaction)
+            assertTrue(featuresA.bakesOnMeshEnabled)
+            assertTrue(featuresA.animatedObjectsAllowed)
+            assertEquals(256, featuresA.regionSizeX)
+
+            // 2. Clear region capabilities before teleport re-seed and verify zero stale URLs survive
+            manager.clearRegionCapabilities()
+            assertNull(manager.getCapabilityUrl("RegionAExclusiveCap"))
+            assertNull(manager.getCapabilityUrl("RenderMaterials"))
+            assertNull(manager.simulatorFeatures)
+            assertTrue(manager.snapshotCapabilities().isEmpty())
+
+            // 3. Re-seed on Region B and verify Region A caps never leak and Region B features replace Region A
+            val seedResB = manager.requestSeedCapabilities("https://sim-b.grid.example.org:9000/cap/seed-b")
+            assertEquals(2, seedResB.capabilities.size)
+            assertNull("Departing region capability must not persist after re-seed", manager.getCapabilityUrl("RegionAExclusiveCap"))
+            assertNull("Departing RenderMaterials cap must not persist after re-seed", manager.getCapabilityUrl("RenderMaterials"))
+            assertEquals("https://sim-b.grid.example.org:9000/cap/get-tex-b", manager.getCapabilityUrl("GetTexture"))
+
+            val featuresB = manager.fetchSimulatorFeatures()
+            assertNotNull(featuresB)
+            assertTrue(featuresB!!.meshRezEnabled)
+            assertFalse(featuresB.meshUploadEnabled)
+            assertEquals(setOf("prim", "convex"), featuresB.physicsShapeTypes)
+            assertFalse(featuresB.pbrMaterialEnabled)
+            assertFalse(featuresB.renderMaterialsEnabled)
+            assertEquals("vivox", featuresB.voiceServerType)
+            assertFalse(featuresB.isWebRtcVoice)
+            assertEquals(16, featuresB.maxMaterialsPerTransaction)
+            assertEquals(512, featuresB.regionSizeX)
+            assertEquals(512, featuresB.regionSizeY)
+        } finally {
+            manager.shutdown()
+        }
+    }
+
+    @Test
+    fun `decodes unencoded EnableSimulator and DisableSimulator packets into neighbor SimEvents`() = runBlocking {
+        assertEquals(0xFFFF0097.toInt(), LludpPackets.MSG_ENABLE_SIMULATOR)
+        assertEquals(0xFFFF0098.toInt(), LludpPackets.MSG_DISABLE_SIMULATOR)
+        assertTrue(LludpPackets.isUnencodedMessage(LludpPackets.MSG_ENABLE_SIMULATOR))
+        assertTrue(LludpPackets.isUnencodedMessage(LludpPackets.MSG_DISABLE_SIMULATOR))
+
+        val neighborHandle = LludpPackets.toRegionHandle(1001, 1000)
+        val enablePayload = LludpPackets.buildEnableSimulator(
+            regionHandle = neighborHandle,
+            simIp = "10.0.0.42",
+            simPort = 13012
+        )
+        assertEquals(14, enablePayload.size)
+
+        // Frame with useZeroCoding = true to prove unencoded rule prevents zero-coding on 0x00 octets
+        val enableFramed = LludpPackets.framePacket(
+            sequenceNumber = 19,
+            reliable = true,
+            messageId = LludpPackets.MSG_ENABLE_SIMULATOR,
+            body = enablePayload,
+            useZeroCoding = true
+        )
+        assertEquals(0, enableFramed[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+
+        val decodedEnable = LludpPackets.decodePacket(enableFramed, enableFramed.size)
+        assertNotNull(decodedEnable)
+        assertEquals(LludpPackets.MSG_ENABLE_SIMULATOR, decodedEnable!!.messageId)
+
+        val parsedEnable = LludpPackets.parseEnableSimulator(enablePayload)
+        assertNotNull(parsedEnable)
+        assertEquals(neighborHandle, parsedEnable!!.regionHandle)
+        assertEquals(1001, parsedEnable.gridX)
+        assertEquals(1000, parsedEnable.gridY)
+        assertEquals("10.0.0.42", parsedEnable.simIp)
+        assertEquals(13012, parsedEnable.simPort)
+
+        val engine = LludpCircuitEngine()
+        val enableEvtDeferred = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            withTimeout(2000L) {
+                engine.events.first { it is SimEvent.EnableSimulatorReceived } as SimEvent.EnableSimulatorReceived
+            }
+        }
+        engine.decodeAndDispatchForTesting(decodedEnable, sourceIp = "10.0.0.1", sourcePort = 13000)
+        val enableEvt = enableEvtDeferred.await()
+        assertEquals(neighborHandle, enableEvt.regionHandle)
+        assertEquals("10.0.0.42", enableEvt.simIp)
+        assertEquals(13012, enableEvt.simPort)
+        assertEquals(
+            LludpPackets.NeighborSimulatorEndpoint(neighborHandle, "10.0.0.42", 13012),
+            engine.getNeighborSimulators()[neighborHandle]
+        )
+
+        // Frame and dispatch DisableSimulator (Low 152 / 0xFFFF0098, unencoded, empty body) from the neighbor endpoint
+        val disableFramed = LludpPackets.framePacket(
+            sequenceNumber = 20,
+            reliable = true,
+            messageId = LludpPackets.MSG_DISABLE_SIMULATOR,
+            body = LludpPackets.buildDisableSimulator(),
+            useZeroCoding = true
+        )
+        assertEquals(10, disableFramed.size)
+        assertEquals(0, disableFramed[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        val decodedDisable = LludpPackets.decodePacket(disableFramed, disableFramed.size)
+        assertNotNull(decodedDisable)
+        assertEquals(LludpPackets.MSG_DISABLE_SIMULATOR, decodedDisable!!.messageId)
+
+        val disableEvtDeferred = async(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+            withTimeout(2000L) {
+                engine.events.first { it is SimEvent.DisableSimulatorReceived } as SimEvent.DisableSimulatorReceived
+            }
+        }
+        engine.decodeAndDispatchForTesting(decodedDisable, sourceIp = "10.0.0.42", sourcePort = 13012)
+        val disableEvt = disableEvtDeferred.await()
+        assertEquals("10.0.0.42", disableEvt.simIp)
+        assertEquals(13012, disableEvt.simPort)
+        assertEquals(neighborHandle, disableEvt.regionHandle)
+        assertTrue(engine.getNeighborSimulators().isEmpty())
     }
 }

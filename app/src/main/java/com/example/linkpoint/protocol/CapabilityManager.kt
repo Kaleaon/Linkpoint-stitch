@@ -34,7 +34,29 @@ data class CapsAttachmentTransform(
     val meshAssetId: UUID? = null
 )
 
+/**
+ * Per-region capability flags advertised by a Second Life or OpenSimulator region's
+ * `SimulatorFeatures` HTTP capability. Must be cleared and re-fetched on every region change.
+ */
+data class SimulatorFeatures(
+    val meshRezEnabled: Boolean = false,
+    val meshUploadEnabled: Boolean = false,
+    val physicsShapeTypes: Set<String> = emptySet(),
+    val pbrMaterialEnabled: Boolean = false,
+    val renderMaterialsEnabled: Boolean = false,
+    val voiceServerType: String = "",
+    val maxMaterialsPerTransaction: Int = 0,
+    val bakesOnMeshEnabled: Boolean = false,
+    val animatedObjectsAllowed: Boolean = false,
+    val regionSizeX: Int = 256,
+    val regionSizeY: Int = 256
+) {
+    val isWebRtcVoice: Boolean
+        get() = voiceServerType.equals("webrtc", ignoreCase = true)
+}
+
 sealed class CapsEvent {
+    data class SimulatorFeaturesReceived(val features: SimulatorFeatures) : CapsEvent()
     data class TeleportFinish(
         val simIp: String,
         val simPort: Int,
@@ -114,11 +136,17 @@ class CapabilityManager(
     private val capabilities = ConcurrentHashMap<String, String>()
     private var eventQueueJob: Job? = null
     @Volatile private var lastSeedUrl: String = ""
+    @Volatile private var _simulatorFeatures: SimulatorFeatures? = null
+
+    val simulatorFeatures: SimulatorFeatures?
+        get() = _simulatorFeatures
 
     companion object {
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
-        private val REQUESTED_CAPS = listOf(
+        val REQUESTED_CAPS = listOf(
             "EventQueueGet",
+            "SimulatorFeatures",
+            "RenderMaterials",
             "FetchInventoryDescendents2",
             "FetchInventory2",
             "ViewerAsset",
@@ -135,6 +163,99 @@ class CapabilityManager(
             "MapLayer",
             "EnvironmentSettings"
         )
+
+        /**
+         * Parses a Second Life / OpenSimulator `SimulatorFeatures` LLSD map into typed
+         * per-region capability flags (`MeshRezEnabled`, `PhysicsShapeTypes`,
+         * `PBRMaterialEnabled` / `RenderMaterials`, `VoiceServerType`, `MaxMaterialsPerTransaction`).
+         */
+        fun parseSimulatorFeatures(
+            body: LlsdValue,
+            negotiatedCapabilities: Map<String, String> = emptyMap()
+        ): SimulatorFeatures? {
+            if (body !is LlsdValue.MapVal) return null
+
+            val meshRez = firstDefined(body, "MeshRezEnabled", "mesh_rez_enabled")?.asBool(false) ?: false
+            val meshUpload = firstDefined(body, "MeshUploadEnabled", "mesh_upload_enabled")?.asBool(false) ?: false
+
+            val physNode = firstDefined(body, "PhysicsShapeTypes", "physics_shape_types") ?: LlsdValue.Undef
+            val physicsShapes: Set<String> = when (physNode) {
+                is LlsdValue.MapVal -> physNode.entries
+                    .filter { (_, v) -> v.asBool(false) }
+                    .keys
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+                is LlsdValue.ArrayVal -> physNode.items
+                    .map { it.asString().trim() }
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+                is LlsdValue.Bool -> if (physNode.value) setOf("prim", "convex", "none") else emptySet()
+                is LlsdValue.Str -> physNode.value
+                    .split(',')
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .toSet()
+                else -> emptySet()
+            }
+
+            val pbrEnabled = firstDefined(
+                body,
+                "PBRMaterialEnabled",
+                "PBRMaterialsEnabled",
+                "pbr_materials",
+                "ModifyMaterialEnabled"
+            )?.asBool(false) ?: false
+
+            val renderMatNode = firstDefined(body, "RenderMaterials", "RenderMaterialsCapability") ?: LlsdValue.Undef
+            val renderMatFlag = when (renderMatNode) {
+                is LlsdValue.Bool -> renderMatNode.value
+                is LlsdValue.IntVal -> renderMatNode.value > 0
+                is LlsdValue.LongVal -> renderMatNode.value > 0L
+                is LlsdValue.Real -> renderMatNode.value > 0.0
+                is LlsdValue.MapVal -> renderMatNode.entries.isNotEmpty()
+                is LlsdValue.Str -> renderMatNode.asBool(false) || (renderMatNode.value.trim().toDoubleOrNull() ?: 0.0) > 0.0
+                else -> false
+            }
+            val renderMaterialsEnabled = renderMatFlag || pbrEnabled || negotiatedCapabilities.containsKey("RenderMaterials")
+
+            val voiceType = firstString(body, "VoiceServerType", "voice_server_type", "voice-server-type").orEmpty()
+
+            val maxMatDirect = firstDefined(body, "MaxMaterialsPerTransaction", "max_materials_per_transaction")
+                ?: (body["RenderMaterials"] as? LlsdValue.MapVal)?.get("MaxMaterialsPerTransaction")?.takeIf { it !is LlsdValue.Undef }
+            val maxMaterialsPerTx = (maxMatDirect?.asInt(0) ?: 0).coerceAtLeast(0)
+
+            val bomEnabled = firstDefined(body, "BakesOnMeshEnabled", "bakes_on_mesh_enabled")?.asBool(false) ?: false
+            val animNode = body["AnimatedObjects"]
+            val animAllowed = when (animNode) {
+                is LlsdValue.MapVal -> animNode["AllowedAnimatedObjects"].asBool(false)
+                else -> animNode.asBool(false)
+            }
+            val sizeX = (firstDefined(body, "RegionSizeX")?.asInt(256) ?: 256).coerceIn(256, 4096)
+            val sizeY = (firstDefined(body, "RegionSizeY")?.asInt(256) ?: 256).coerceIn(256, 4096)
+
+            return SimulatorFeatures(
+                meshRezEnabled = meshRez,
+                meshUploadEnabled = meshUpload,
+                physicsShapeTypes = physicsShapes,
+                pbrMaterialEnabled = pbrEnabled,
+                renderMaterialsEnabled = renderMaterialsEnabled,
+                voiceServerType = voiceType,
+                maxMaterialsPerTransaction = maxMaterialsPerTx,
+                bakesOnMeshEnabled = bomEnabled,
+                animatedObjectsAllowed = animAllowed,
+                regionSizeX = sizeX,
+                regionSizeY = sizeY
+            )
+        }
+
+        private fun firstDefined(node: LlsdValue, vararg keys: String): LlsdValue? {
+            for (k in keys) {
+                val v = node[k]
+                if (v !is LlsdValue.Undef) return v
+            }
+            return null
+        }
 
         /**
          * Parses Second Life / OpenSimulator CAPS LLSD attachment payloads (EventQueueGet or HTTP CAPS)
@@ -262,13 +383,24 @@ class CapabilityManager(
         }
     }
 
+    /**
+     * Clears all cached region capability URLs, resets cached `SimulatorFeatures`,
+     * and cancels any active `EventQueueGet` poll before region re-seeding
+     * (`TeleportFinish` / `CrossedRegion`) or session shutdown.
+     */
+    fun clearRegionCapabilities() {
+        eventQueueJob?.cancel()
+        eventQueueJob = null
+        capabilities.clear()
+        _simulatorFeatures = null
+    }
+
     suspend fun requestSeedCapabilities(
         seedUrl: String,
         retryPolicy: RetryPolicy = RetryPolicy(maxAttempts = 2, initialDelayMs = 800L, maxDelayMs = 2500L),
         onAttemptStatus: suspend (attempt: Int, maxAttempts: Int, detail: String) -> Unit = { _, _, _ -> }
     ): CapsNegotiationResult = withContext(Dispatchers.IO) {
-        eventQueueJob?.cancel()
-        capabilities.clear()
+        clearRegionCapabilities()
         lastSeedUrl = seedUrl.trim()
         val diagnostics = mutableListOf<String>()
 
@@ -792,11 +924,59 @@ class CapabilityManager(
             emptyList()
         }
 
+    /**
+     * Queries the current region's negotiated `SimulatorFeatures` HTTP capability via GET,
+     * parses key region capability flags (`MeshRezEnabled`, `PhysicsShapeTypes`,
+     * `PBRMaterialEnabled` / `RenderMaterials`, `VoiceServerType`, `MaxMaterialsPerTransaction`),
+     * caches the per-region snapshot, and emits [CapsEvent.SimulatorFeaturesReceived].
+     */
+    suspend fun fetchSimulatorFeatures(): SimulatorFeatures? = withContext(Dispatchers.IO) {
+        val url = capabilities["SimulatorFeatures"] ?: return@withContext null
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, application/llsd+binary, text/xml")
+            .get()
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext null
+                val contentType = resp.header("Content-Type").orEmpty().lowercase()
+                val rawBytes = resp.body?.bytes() ?: return@withContext null
+                if (rawBytes.isEmpty()) return@withContext null
+
+                val parsed = if (contentType.contains("llsd+binary") ||
+                    (rawBytes.size >= 18 && String(rawBytes, 0, 18, Charsets.US_ASCII).startsWith("<? llsd/binary ?>"))
+                ) {
+                    LlsdCodec.parseBinary(rawBytes)
+                } else {
+                    LlsdCodec.parseXml(String(rawBytes, Charsets.UTF_8))
+                }
+
+                val features = parseSimulatorFeatures(parsed, capabilities.toMap()) ?: return@withContext null
+                _simulatorFeatures = features
+                ProtocolAuditLogger.logInfo(
+                    "[CAPS IN] SimulatorFeatures -> meshRez=${features.meshRezEnabled}, " +
+                        "physics=${features.physicsShapeTypes}, pbr=${features.pbrMaterialEnabled}, " +
+                        "renderMat=${features.renderMaterialsEnabled}, voice=${features.voiceServerType.ifBlank { "default" }}, " +
+                        "maxMatTx=${features.maxMaterialsPerTransaction}"
+                )
+                _capsEvents.tryEmit(CapsEvent.SimulatorFeaturesReceived(features))
+                features
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     fun getCapabilityUrl(name: String): String? = capabilities[name]
 
+    fun snapshotCapabilities(): Map<String, String> = capabilities.toMap()
+
     fun shutdown() {
-        eventQueueJob?.cancel()
-        capabilities.clear()
+        clearRegionCapabilities()
         lastSeedUrl = ""
     }
 }

@@ -48,6 +48,8 @@ object LludpPackets {
     const val MSG_CHAT_FROM_SIMULATOR: Int = 0xFFFF008B.toInt()
     const val MSG_REGION_HANDSHAKE: Int = 0xFFFF0094.toInt()
     const val MSG_REGION_HANDSHAKE_REPLY: Int = 0xFFFF0095.toInt()
+    const val MSG_ENABLE_SIMULATOR: Int = 0xFFFF0097.toInt()          // Low 151 (Unencoded)
+    const val MSG_DISABLE_SIMULATOR: Int = 0xFFFF0098.toInt()         // Low 152 (Unencoded)
     const val MSG_AVATAR_APPEARANCE: Int = 0xFFFF009E.toInt()       // Low 158
     const val MSG_AVATAR_PROPERTIES_REQUEST: Int = 0xFFFF00A9.toInt() // Low 169
     const val MSG_AVATAR_PROPERTIES_REPLY: Int = 0xFFFF00AB.toInt()   // Low 171
@@ -66,7 +68,9 @@ object LludpPackets {
     const val MSG_MAP_BLOCK_REQUEST: Int = 0xFFFF0197.toInt()
     const val MSG_MAP_NAME_REQUEST: Int = 0xFFFF0198.toInt()          // Low 408
     const val MSG_MAP_BLOCK_REPLY: Int = 0xFFFF0199.toInt()
+    // Fixed frequency message IDs (0xFFFFFF + 1 byte, Unencoded — never zerocoded)
     const val MSG_PACKET_ACK: Int = 0xFFFFFFFB.toInt()
+    const val MSG_CLOSE_CIRCUIT: Int = 0xFFFFFFFD.toInt()
 
     // RegionHandshakeReply flags (tells SL Server-Side Appearance to bake & stream self appearance)
     const val REGION_HANDSHAKE_SUPPORTS_SELF_APPEARANCE: Int = 0x00000004
@@ -233,6 +237,23 @@ object LludpPackets {
         return out.toByteArray()
     }
 
+    /**
+     * Returns true for Second Life messages marked `Unencoded` in `message_template.msg`
+     * (including all Fixed `0xFFFFFFxx` packets such as `PacketAck` and `CloseCircuit`),
+     * ensuring `FLAG_ZEROCODED` is never applied to them.
+     */
+    fun isUnencodedMessage(messageId: Int): Boolean {
+        if ((messageId and 0xFFFFFF00.toInt()) == 0xFFFFFF00.toInt()) return true
+        return when (messageId) {
+            MSG_START_PING_CHECK,
+            MSG_COMPLETE_PING_CHECK,
+            MSG_ENABLE_SIMULATOR,
+            MSG_DISABLE_SIMULATOR,
+            MSG_LOGOUT_REQUEST -> true
+            else -> false
+        }
+    }
+
     fun framePacket(
         sequenceNumber: Int,
         reliable: Boolean,
@@ -259,8 +280,9 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        val allowZeroCoding = useZeroCoding && !isUnencodedMessage(messageId)
+        val encoded = if (allowZeroCoding) zeroEncode(msgBytes) else msgBytes
+        val actuallyZeroCoded = allowZeroCoding && encoded.size < msgBytes.size
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0
@@ -547,6 +569,58 @@ object LludpPackets {
         val teleportFlags: Int
     )
 
+    data class ParsedEnableSimulator(
+        val regionHandle: Long,
+        val simIp: String,
+        val simPort: Int
+    ) {
+        val gridX: Int
+            get() = regionHandleToGridX(regionHandle)
+        val gridY: Int
+            get() = regionHandleToGridY(regionHandle)
+    }
+
+    data class NeighborSimulatorEndpoint(
+        val regionHandle: Long,
+        val simIp: String,
+        val simPort: Int
+    )
+
+    /**
+     * Decodes `EnableSimulator` (Low 151 / 0xFFFF0097, Unencoded):
+     * SimulatorInfo block: Handle (U64 LE, 8B) + IP (IPADDR network order, 4B) + Port (IPPORT/U16 LE, 2B).
+     */
+    fun parseEnableSimulator(bytes: ByteArray): ParsedEnableSimulator? =
+        parseEnableSimulator(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseEnableSimulator(buf: ByteBuffer): ParsedEnableSimulator? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 14) return null
+        val handle = buf.long
+        val b0 = buf.get().toInt() and 0xFF
+        val b1 = buf.get().toInt() and 0xFF
+        val b2 = buf.get().toInt() and 0xFF
+        val b3 = buf.get().toInt() and 0xFF
+        val simIp = "$b0.$b1.$b2.$b3"
+        val simPort = buf.short.toInt() and 0xFFFF
+        if (simPort !in 1..65535) return null
+        return ParsedEnableSimulator(regionHandle = handle, simIp = simIp, simPort = simPort)
+    }
+
+    fun buildEnableSimulator(regionHandle: Long, simIp: String, simPort: Int): ByteArray {
+        val octets = simIp.trim().split('.')
+        val ipBytes = ByteArray(4) { idx ->
+            (octets.getOrNull(idx)?.toIntOrNull()?.coerceIn(0, 255) ?: 0).toByte()
+        }
+        val buf = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putLong(regionHandle)
+        buf.put(ipBytes)
+        buf.putShort((simPort and 0xFFFF).toShort())
+        return buf.array()
+    }
+
+    fun buildDisableSimulator(): ByteArray = ByteArray(0)
+
     fun parseTeleportProgress(bytes: ByteArray): ParsedTeleportProgress? =
         parseTeleportProgress(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
 
@@ -741,6 +815,11 @@ object LludpPackets {
         putUuid(buf, sessionId)
         return buf.array()
     }
+
+    /**
+     * Builds `CloseCircuit` (Fixed `0xFFFFFFFD`, `Unencoded` — empty body, never zerocoded).
+     */
+    fun buildCloseCircuit(): ByteArray = ByteArray(0)
 
     fun buildAgentWearablesRequest(agentId: UUID, sessionId: UUID): ByteArray {
         val buf = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)

@@ -33,6 +33,7 @@ import com.example.linkpoint.protocol.LoginRequestParams
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
+import com.example.linkpoint.protocol.SimulatorFeatures
 import com.example.linkpoint.protocol.SlBinaryParsers
 import com.example.linkpoint.protocol.SlurlParser
 import com.example.linkpoint.protocol.XmlRpcLoginClient
@@ -106,6 +107,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private val capsAttachmentOverridesByLocalId = ConcurrentHashMap<Int, CapsAttachmentTransform>()
     private val avatars = LinkedHashMap<UUID, AvatarEntity>()
     private val knownNames = LinkedHashMap<UUID, String>()
+    private val neighborSimulators = ConcurrentHashMap<Long, LludpPackets.NeighborSimulatorEndpoint>()
 
     private var selfAgentId: UUID = UUID.fromString("11111111-1111-4111-8111-111111111111")
     private var selfAvatarName: String = "Resident"
@@ -628,6 +630,30 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         pushSceneSnapshot()
                         showToast("Teleported to <${evt.position.x.toInt()}, ${evt.position.y.toInt()}, ${evt.position.z.toInt()}>")
                     }
+                    is SimEvent.EnableSimulatorReceived -> {
+                        val gx = LludpPackets.regionHandleToGridX(evt.regionHandle)
+                        val gy = LludpPackets.regionHandleToGridY(evt.regionHandle)
+                        val endpoint = LludpPackets.NeighborSimulatorEndpoint(
+                            regionHandle = evt.regionHandle,
+                            simIp = evt.simIp,
+                            simPort = evt.simPort
+                        )
+                        neighborSimulators[evt.regionHandle] = endpoint
+                        _state.update { it.copy(neighborSimulators = neighborSimulators.toMap()) }
+                        appendDiagnostic("[LLUDP] EnableSimulator neighbor ($gx, $gy) @ ${evt.simIp}:${evt.simPort}")
+                    }
+                    is SimEvent.DisableSimulatorReceived -> {
+                        if (evt.regionHandle != 0L) {
+                            neighborSimulators.remove(evt.regionHandle)
+                        } else {
+                            val matchingKey = neighborSimulators.entries.firstOrNull { (_, ep) ->
+                                ep.simIp == evt.simIp && ep.simPort == evt.simPort
+                            }?.key
+                            if (matchingKey != null) neighborSimulators.remove(matchingKey)
+                        }
+                        _state.update { it.copy(neighborSimulators = neighborSimulators.toMap()) }
+                        appendDiagnostic("[LLUDP] DisableSimulator neighbor @ ${evt.simIp}:${evt.simPort}")
+                    }
                     is SimEvent.PingUpdated -> {
                         _state.update { s ->
                             val conn = s.connection
@@ -661,6 +687,16 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             capabilityManager.capsEvents.collect { evt ->
                 when (evt) {
+                    is CapsEvent.SimulatorFeaturesReceived -> {
+                        _state.update { it.copy(simulatorFeatures = evt.features) }
+                        appendDiagnostic(
+                            "[CAPS] SimulatorFeatures: meshRez=${evt.features.meshRezEnabled}, " +
+                                "physics=${evt.features.physicsShapeTypes.joinToString("/")}, " +
+                                "pbr=${evt.features.pbrMaterialEnabled}, " +
+                                "voice=${evt.features.voiceServerType.ifBlank { "default" }}, " +
+                                "maxMaterials=${evt.features.maxMaterialsPerTransaction}"
+                        )
+                    }
                     is CapsEvent.ParcelProperties -> _state.update { it.copy(parcelName = evt.parcelName) }
                     is CapsEvent.ScriptDialog -> _state.update {
                         it.copy(scriptDialog = ScriptDialogPrompt(evt.objectName, evt.message, evt.buttons, evt.channel))
@@ -933,10 +969,25 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             capsRes.diagnostics.forEach { appendDiagnostic(it) }
             if (capsRes.capabilities.isNotEmpty()) {
                 assetManager.configureCapabilities(capsRes.capabilities)
+                if (capsRes.capabilities.containsKey("SimulatorFeatures")) {
+                    launch { capabilityManager.fetchSimulatorFeatures() }
+                }
                 showToast("Transport recovered (${capsRes.capabilities.size} CAPS active)")
             }
         }
     }
+
+    override fun refreshSimulatorFeatures() {
+        if (_state.value.connection !is ConnectionState.Connected) return
+        viewModelScope.launch {
+            capabilityManager.fetchSimulatorFeatures()
+        }
+    }
+
+    override fun getSimulatorFeatures(): SimulatorFeatures? = _state.value.simulatorFeatures
+
+    override fun getNeighborSimulators(): Map<Long, LludpPackets.NeighborSimulatorEndpoint> =
+        neighborSimulators.toMap()
 
     override fun runNetworkDiagnostics() {
         val grid = _state.value.grids.firstOrNull { it.gridId == _state.value.selectedGridId }
@@ -1179,6 +1230,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             capsAttachmentOverridesByLocalId.clear()
             avatars.clear()
             knownNames.clear()
+            neighborSimulators.clear()
             requestedProfiles.clear()
             pressedMoveKeys.clear()
             verticalVelocityZ = 0f
@@ -1206,6 +1258,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             lastRegionGridX = (response.regionX / 256).coerceAtLeast(0)
             lastRegionGridY = (response.regionY / 256).coerceAtLeast(0)
             lludpEngine.connect(response)
+            if (capsResult.capabilities.containsKey("SimulatorFeatures")) {
+                viewModelScope.launch { capabilityManager.fetchSimulatorFeatures() }
+            }
             if (capsResult.capabilities.containsKey("AttachmentResources")) {
                 viewModelScope.launch { capabilityManager.fetchAttachmentResources() }
             }
@@ -1221,6 +1276,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         simPort = response.simPort
                     ),
                     avatarPosition = Vec3(128f, 128f, 23f),
+                    simulatorFeatures = capabilityManager.simulatorFeatures,
+                    neighborSimulators = emptyMap(),
                     inventoryEntries = invEntries,
                     localChat = listOf(
                         ChatMessage(speaker = grid.name, text = response.message, isSystem = true),
@@ -1280,6 +1337,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         capsAttachmentOverridesByUuid.clear()
         capsAttachmentOverridesByLocalId.clear()
         knownNames.clear()
+        neighborSimulators.clear()
         requestedProfiles.clear()
         pressedMoveKeys.clear()
         verticalVelocityZ = 0f
@@ -1324,6 +1382,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 isSitting = false,
                 isTeleporting = false,
                 teleportStatusMessage = null,
+                simulatorFeatures = null,
+                neighborSimulators = emptyMap(),
                 inventoryEntries = sandboxInventory,
                 expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
                 mapRegions = sandboxMapRegions,
@@ -1357,6 +1417,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         manualHudAttachments.clear()
         capsAttachmentOverridesByUuid.clear()
         capsAttachmentOverridesByLocalId.clear()
+        neighborSimulators.clear()
         pressedMoveKeys.clear()
         requestedProfiles.clear()
         verticalVelocityZ = 0f
@@ -1373,7 +1434,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 scriptDialog = null,
                 hudEditMode = false,
                 isTeleporting = false,
-                teleportStatusMessage = null
+                teleportStatusMessage = null,
+                simulatorFeatures = null,
+                neighborSimulators = emptyMap()
             )
         }
     }
@@ -2102,6 +2165,14 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         pendingTeleportTimeoutJob?.cancel()
         handoffJob?.cancel()
 
+        val promotedNeighbor = if (regionHandle != 0L) neighborSimulators.remove(regionHandle) else null
+        val effectiveSimIp = simIp.ifBlank { promotedNeighbor?.simIp.orEmpty() }
+        val effectiveSimPort = if (simPort in 1..65535) simPort else (promotedNeighbor?.simPort ?: simPort)
+
+        // Immediately clear stale departing-region capability URLs and SimulatorFeatures before re-seeding
+        capabilityManager.clearRegionCapabilities()
+        assetManager.configureCapabilities(emptyMap())
+
         if (regionHandle != 0L) {
             lastRegionGridX = LludpPackets.regionHandleToGridX(regionHandle)
             lastRegionGridY = LludpPackets.regionHandleToGridY(regionHandle)
@@ -2145,8 +2216,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         }
 
         lludpEngine.switchSimulator(
-            newSimIp = simIp,
-            newSimPort = simPort,
+            newSimIp = effectiveSimIp,
+            newSimPort = effectiveSimPort,
             newSeedCapability = seedCap,
             newRegionHandle = regionHandle
         )
@@ -2155,24 +2226,26 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             val conn = s.connection
             val updatedConn = if (conn is ConnectionState.Connected) {
                 conn.copy(
-                    simIp = simIp,
-                    simPort = simPort,
+                    simIp = effectiveSimIp,
+                    simPort = effectiveSimPort,
                     regionName = cachedTile?.name ?: conn.regionName
                 )
             } else conn
             s.copy(
                 connection = updatedConn,
                 avatarPosition = resolvedPos,
+                simulatorFeatures = null,
+                neighborSimulators = neighborSimulators.toMap(),
                 isSitting = if (isTeleport) false else s.isSitting,
                 selectedObject = null,
                 selectedAvatarId = null,
                 nearbyAvatars = emptyList(),
                 projectedNametags = emptyList(),
                 isTeleporting = isTeleport,
-                teleportStatusMessage = if (isTeleport) "Connecting to ${cachedTile?.name ?: "$simIp:$simPort"}..." else null,
+                teleportStatusMessage = if (isTeleport) "Connecting to ${cachedTile?.name ?: "$effectiveSimIp:$effectiveSimPort"}..." else null,
                 connectionHealth = s.connectionHealth.copy(
                     lludpStatus = LayerHealthStatus.CONNECTING,
-                    lludpDetail = "Handshaking $simIp:$simPort...",
+                    lludpDetail = "Handshaking $effectiveSimIp:$effectiveSimPort...",
                     capsStatus = if (seedCap.isNotBlank()) LayerHealthStatus.CONNECTING else LayerHealthStatus.DEGRADED,
                     capsDetail = if (seedCap.isNotBlank()) "Negotiating destination CAPS..." else "No destination Seed CAPS"
                 )
@@ -2185,6 +2258,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 val capsRes = capabilityManager.requestSeedCapabilities(seedCap)
                 assetManager.configureCapabilities(capsRes.capabilities)
                 capsRes.diagnostics.forEach { appendDiagnostic(it) }
+                if (capsRes.capabilities.containsKey("SimulatorFeatures")) {
+                    launch { capabilityManager.fetchSimulatorFeatures() }
+                }
                 if (capsRes.capabilities.containsKey("AttachmentResources")) {
                     launch { capabilityManager.fetchAttachmentResources() }
                 }
@@ -2193,7 +2269,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 assetManager.configureCapabilities(emptyMap())
             }
 
-            val destName = (_state.value.connection as? ConnectionState.Connected)?.regionName ?: "$simIp:$simPort"
+            val destName = (_state.value.connection as? ConnectionState.Connected)?.regionName ?: "$effectiveSimIp:$effectiveSimPort"
             _state.update { s ->
                 s.copy(
                     isTeleporting = false,
@@ -2204,7 +2280,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             appendLocalChat(
                 ChatMessage(
                     speaker = "Region Handoff",
-                    text = "$actionVerb $destName ($simIp:$simPort)",
+                    text = "$actionVerb $destName ($effectiveSimIp:$effectiveSimPort)",
                     isSystem = true
                 )
             )

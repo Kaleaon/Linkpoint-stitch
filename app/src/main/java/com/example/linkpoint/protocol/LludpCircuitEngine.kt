@@ -117,6 +117,16 @@ sealed class SimEvent {
         val lookAt: Vec3,
         val flags: Int
     ) : SimEvent()
+    data class EnableSimulatorReceived(
+        val regionHandle: Long,
+        val simIp: String,
+        val simPort: Int
+    ) : SimEvent()
+    data class DisableSimulatorReceived(
+        val simIp: String,
+        val simPort: Int,
+        val regionHandle: Long = 0L
+    ) : SimEvent()
     data class PingUpdated(val pingMs: Int) : SimEvent()
     data class CircuitHealthChanged(
         val status: LayerHealthStatus,
@@ -166,9 +176,12 @@ class LludpCircuitEngine {
 
     private val pendingAcks = ConcurrentLinkedQueue<Int>()
     private val unackedReliable = ConcurrentHashMap<Int, Pair<Long, ByteArray>>()
+    private val neighborSimulators = ConcurrentHashMap<Long, LludpPackets.NeighborSimulatorEndpoint>()
     private var circuitJob: Job? = null
     private var heartbeatJob: Job? = null
     private var lastPingSentMs: Long = 0L
+
+    fun getNeighborSimulators(): Map<Long, LludpPackets.NeighborSimulatorEndpoint> = neighborSimulators.toMap()
 
     @Volatile var avatarPos = Vec3(128f, 128f, 25f)
     @Volatile var avatarYaw = 0f
@@ -264,6 +277,9 @@ class LludpCircuitEngine {
         socket = null
         unackedReliable.clear()
         pendingAcks.clear()
+        if (newRegionHandle != 0L) {
+            neighborSimulators.remove(newRegionHandle)
+        }
 
         agentId = newAgentId
         sessionId = newSessionId
@@ -512,7 +528,9 @@ class LludpCircuitEngine {
                     for (ack in decoded.acks) {
                         unackedReliable.remove(ack)
                     }
-                    handleDecodedPacket(decoded)
+                    val sourceIp = datagram.address?.hostAddress.orEmpty()
+                    val sourcePort = datagram.port
+                    handleDecodedPacket(decoded, sourceIp, sourcePort)
                 } catch (_: Exception) {
                     // Safely ignore single malformed packet without dropping simulator circuit
                 }
@@ -527,7 +545,11 @@ class LludpCircuitEngine {
         }
     }
 
-    private fun handleDecodedPacket(pkt: LludpPackets.DecodedPacket) {
+    private fun handleDecodedPacket(
+        pkt: LludpPackets.DecodedPacket,
+        sourceIp: String = simIpString,
+        sourcePort: Int = simPort
+    ) {
         val buf = pkt.payload
         when (pkt.messageId) {
             LludpPackets.MSG_START_PING_CHECK -> {
@@ -778,6 +800,44 @@ class LludpCircuitEngine {
                         }
                     }
                 }
+            }
+            LludpPackets.MSG_ENABLE_SIMULATOR -> {
+                val parsed = LludpPackets.parseEnableSimulator(buf)
+                if (parsed != null) {
+                    neighborSimulators[parsed.regionHandle] = LludpPackets.NeighborSimulatorEndpoint(
+                        regionHandle = parsed.regionHandle,
+                        simIp = parsed.simIp,
+                        simPort = parsed.simPort
+                    )
+                    _events.tryEmit(
+                        SimEvent.EnableSimulatorReceived(
+                            regionHandle = parsed.regionHandle,
+                            simIp = parsed.simIp,
+                            simPort = parsed.simPort
+                        )
+                    )
+                }
+            }
+            LludpPackets.MSG_DISABLE_SIMULATOR -> {
+                val matched = neighborSimulators.entries.firstOrNull { (_, ep) ->
+                    ep.simIp == sourceIp && ep.simPort == sourcePort
+                } ?: if (sourceIp.isBlank() && neighborSimulators.size == 1) {
+                    neighborSimulators.entries.firstOrNull()
+                } else null
+
+                val removedHandle = matched?.key ?: 0L
+                val effectiveIp = matched?.value?.simIp ?: sourceIp.ifBlank { simIpString }
+                val effectivePort = matched?.value?.simPort ?: if (sourcePort > 0) sourcePort else simPort
+                if (removedHandle != 0L) {
+                    neighborSimulators.remove(removedHandle)
+                }
+                _events.tryEmit(
+                    SimEvent.DisableSimulatorReceived(
+                        simIp = effectiveIp,
+                        simPort = effectivePort,
+                        regionHandle = removedHandle
+                    )
+                )
             }
             LludpPackets.MSG_LOGOUT_REPLY -> {
                 _events.tryEmit(SimEvent.LoggedOut)
@@ -1313,8 +1373,12 @@ class LludpCircuitEngine {
     /**
      * Exposes binary packet decoding for deterministic JVM unit testing without a live UDP socket.
      */
-    internal fun decodeAndDispatchForTesting(pkt: LludpPackets.DecodedPacket) {
-        handleDecodedPacket(pkt)
+    internal fun decodeAndDispatchForTesting(
+        pkt: LludpPackets.DecodedPacket,
+        sourceIp: String = simIpString,
+        sourcePort: Int = simPort
+    ) {
+        handleDecodedPacket(pkt, sourceIp, sourcePort)
     }
 
     private fun readNullTerminatedUtf8(buf: ByteBuffer, limitEnd: Int): String {
@@ -1550,20 +1614,72 @@ class LludpCircuitEngine {
     }
 
     fun disconnect(sendLogout: Boolean = true) {
-        if (sendLogout && running.get()) {
-            val body = LludpPackets.buildLogoutRequest(agentId, sessionId)
-            val framed = LludpPackets.framePacket(seqCounter.getAndIncrement(), true, LludpPackets.MSG_LOGOUT_REQUEST, body)
-            scope.launch { transmitRaw(framed) }
-        }
-        running.set(false)
+        val wasRunning = running.getAndSet(false)
         circuitGeneration.incrementAndGet()
         handshakeCompleted.set(false)
         heartbeatJob?.cancel()
         circuitJob?.cancel()
-        runCatching { socket?.close() }
+
+        val departingSocket = socket
+        val departingAddr = simAddress
+        val departingPort = simPort
         socket = null
+
         unackedReliable.clear()
         pendingAcks.clear()
+        neighborSimulators.clear()
+
+        if (sendLogout && wasRunning && departingSocket != null && departingAddr != null) {
+            val logoutBody = LludpPackets.buildLogoutRequest(agentId, sessionId)
+            val logoutFramed = LludpPackets.framePacket(
+                sequenceNumber = seqCounter.getAndIncrement(),
+                reliable = true,
+                messageId = LludpPackets.MSG_LOGOUT_REQUEST,
+                body = logoutBody,
+                useZeroCoding = false
+            )
+            val closeFramed = LludpPackets.framePacket(
+                sequenceNumber = seqCounter.getAndIncrement(),
+                reliable = false,
+                messageId = LludpPackets.MSG_CLOSE_CIRCUIT,
+                body = LludpPackets.buildCloseCircuit(),
+                useZeroCoding = false
+            )
+            val packetsToSend = listOf(logoutFramed, closeFramed)
+            var sentCount = 0
+            var needsAsyncFallback = false
+            try {
+                for (pktBytes in packetsToSend) {
+                    departingSocket.send(DatagramPacket(pktBytes, pktBytes.size, departingAddr, departingPort))
+                    packetsTx.incrementAndGet()
+                    sentCount++
+                }
+            } catch (t: Throwable) {
+                if (t.javaClass.simpleName == "NetworkOnMainThreadException") {
+                    needsAsyncFallback = true
+                }
+            }
+            if (needsAsyncFallback) {
+                val remaining = packetsToSend.drop(sentCount)
+                scope.launch {
+                    try {
+                        for (pktBytes in remaining) {
+                            runCatching {
+                                departingSocket.send(DatagramPacket(pktBytes, pktBytes.size, departingAddr, departingPort))
+                                packetsTx.incrementAndGet()
+                            }
+                        }
+                    } finally {
+                        runCatching { departingSocket.close() }
+                    }
+                }
+            } else {
+                runCatching { departingSocket.close() }
+            }
+        } else {
+            runCatching { departingSocket?.close() }
+        }
+
         emitHealth(LayerHealthStatus.IDLE, "Circuit closed")
     }
 }

@@ -9,8 +9,10 @@ import com.example.linkpoint.designsystem.PersonalDesignState
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.protocol.AssetStreamStats
 import com.example.linkpoint.protocol.ConnectionHealthSnapshot
+import com.example.linkpoint.protocol.LludpPackets.NeighborSimulatorEndpoint
 import com.example.linkpoint.protocol.NetworkDiagnosticReport
 import com.example.linkpoint.protocol.NetworkErrorCategory
+import com.example.linkpoint.protocol.SimulatorFeatures
 import com.example.linkpoint.render.RenderSceneSnapshot
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
@@ -170,6 +172,8 @@ data class ViewerState(
     val inventoryEntries: List<InventoryEntry> = emptyList(),
     val expandedFolderIds: Set<UUID> = emptySet(),
     val mapRegions: List<MapRegionTile> = emptyList(),
+    val simulatorFeatures: SimulatorFeatures? = null,
+    val neighborSimulators: Map<Long, NeighborSimulatorEndpoint> = emptyMap(),
     val isTeleporting: Boolean = false,
     val teleportStatusMessage: String? = null,
     val mapTargetRegion: String = "",
