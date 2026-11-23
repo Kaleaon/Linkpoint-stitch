@@ -36,6 +36,8 @@ object LludpPackets {
     const val MSG_OBJECT_PROPERTIES: Int = 0xFFFF0009.toInt()
     const val MSG_TELEPORT_LOCATION_REQUEST: Int = 0xFFFF003F.toInt()
     const val MSG_TELEPORT_LANDMARK_REQUEST: Int = 0xFFFF0041.toInt()
+    const val MSG_START_LURE: Int = SocialProtocolPackets.MSG_START_LURE
+    const val MSG_TELEPORT_LURE_REQUEST: Int = SocialProtocolPackets.MSG_TELEPORT_LURE_REQUEST
     const val MSG_CHAT_FROM_VIEWER: Int = 0xFFFF0050.toInt()
     const val MSG_AGENT_THROTTLE: Int = 0xFFFF0051.toInt()
     const val MSG_OBJECT_GRAB: Int = 0xFFFF0075.toInt()
@@ -54,6 +56,11 @@ object LludpPackets {
     const val MSG_LOGOUT_REQUEST: Int = 0xFFFF00FC.toInt()
     const val MSG_LOGOUT_REPLY: Int = 0xFFFF00FD.toInt()
     const val MSG_IMPROVED_INSTANT_MESSAGE: Int = 0xFFFF00FE.toInt()
+    const val MSG_ACCEPT_FRIENDSHIP: Int = SocialProtocolPackets.MSG_ACCEPT_FRIENDSHIP
+    const val MSG_DECLINE_FRIENDSHIP: Int = SocialProtocolPackets.MSG_DECLINE_FRIENDSHIP
+    const val MSG_TERMINATE_FRIENDSHIP: Int = SocialProtocolPackets.MSG_TERMINATE_FRIENDSHIP
+    const val MSG_ONLINE_NOTIFICATION: Int = SocialProtocolPackets.MSG_ONLINE_NOTIFICATION
+    const val MSG_OFFLINE_NOTIFICATION: Int = SocialProtocolPackets.MSG_OFFLINE_NOTIFICATION
     const val MSG_AGENT_WEARABLES_REQUEST: Int = 0xFFFF017D.toInt() // Low 381
     const val MSG_AGENT_WEARABLES_UPDATE: Int = 0xFFFF017E.toInt()  // Low 382
     const val MSG_REZ_SINGLE_ATTACHMENT: Int = 0xFFFF018B.toInt()
@@ -61,6 +68,43 @@ object LludpPackets {
     const val MSG_MAP_BLOCK_REQUEST: Int = 0xFFFF0197.toInt()
     const val MSG_MAP_BLOCK_REPLY: Int = 0xFFFF0199.toInt()
     const val MSG_PACKET_ACK: Int = 0xFFFFFFFB.toInt()
+
+    /**
+     * Messages explicitly declared `Unencoded` in `indra/llmessage/message_template.msg`.
+     * Zero-coding (`FLAG_ZEROCODED = 0x80`) MUST NEVER be applied to these messages.
+     */
+    val UNENCODED_MESSAGE_IDS: Set<Int> = setOf(
+        MSG_PACKET_ACK,
+        MSG_START_PING_CHECK,
+        MSG_COMPLETE_PING_CHECK,
+        MSG_LAYER_DATA,
+        MSG_OBJECT_UPDATE_COMPRESSED,
+        MSG_IMPROVED_TERSE_OBJECT_UPDATE,
+        MSG_KILL_OBJECT,
+        MSG_COARSE_LOCATION_UPDATE,
+        MSG_USE_CIRCUIT_CODE,
+        MSG_TELEPORT_LOCATION_REQUEST,
+        MSG_START_LURE,
+        MSG_TELEPORT_LURE_REQUEST,
+        MSG_OBJECT_DEGRAB,
+        MSG_CHAT_FROM_SIMULATOR,
+        MSG_AVATAR_PROPERTIES_REQUEST,
+        MSG_UUID_NAME_REQUEST,
+        MSG_UUID_NAME_REPLY,
+        MSG_COMPLETE_AGENT_MOVEMENT,
+        MSG_LOGOUT_REQUEST,
+        MSG_ACCEPT_FRIENDSHIP,
+        MSG_DECLINE_FRIENDSHIP,
+        MSG_TERMINATE_FRIENDSHIP,
+        MSG_ONLINE_NOTIFICATION,
+        MSG_OFFLINE_NOTIFICATION,
+        MSG_AGENT_WEARABLES_REQUEST,
+        MSG_DETACH_ATTACHMENT,
+        MSG_MAP_BLOCK_REQUEST,
+        MSG_MAP_BLOCK_REPLY
+    )
+
+    fun isZeroCodedMessage(messageId: Int): Boolean = messageId !in UNENCODED_MESSAGE_IDS
 
     // RegionHandshakeReply flags (tells SL Server-Side Appearance to bake & stream self appearance)
     const val REGION_HANDSHAKE_SUPPORTS_SELF_APPEARANCE: Int = 0x00000004
@@ -253,8 +297,9 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        val canZeroCode = useZeroCoding && isZeroCodedMessage(messageId)
+        val encoded = if (canZeroCode) zeroEncode(msgBytes) else msgBytes
+        val actuallyZeroCoded = canZeroCode && encoded.size < msgBytes.size
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0
@@ -434,31 +479,36 @@ object LludpPackets {
         imSessionId: UUID,
         fromName: String,
         message: String,
-        dialog: Byte = 0
-    ): ByteArray {
-        val nameBytes = (fromName + "\u0000").toByteArray(Charsets.UTF_8)
-        val msgBytes = (message + "\u0000").toByteArray(Charsets.UTF_8)
-        val buf = ByteBuffer.allocate(
-            16 + 16 + 1 + 16 + 4 + 16 + 1 + 12 + 1 + 16 + 4 + 1 + nameBytes.size + 2 + msgBytes.size + 2
-        ).order(ByteOrder.LITTLE_ENDIAN)
-        putUuid(buf, agentId)
-        putUuid(buf, sessionId)
-        buf.put(0.toByte()) // FromGroup
-        putUuid(buf, toAgentId)
-        buf.putInt(0) // ParentEstateID
-        putUuid(buf, UUID(0L, 0L)) // RegionID
-        putVec3(buf, Vec3(128f, 128f, 25f))
-        buf.put(0.toByte()) // Offline
-        buf.put(dialog)
-        putUuid(buf, imSessionId)
-        buf.putInt((System.currentTimeMillis() / 1000L).toInt())
-        buf.put(nameBytes.size.toByte())
-        buf.put(nameBytes)
-        buf.putShort(msgBytes.size.toShort())
-        buf.put(msgBytes)
-        buf.putShort(0) // BinaryBucket empty
-        return buf.array()
-    }
+        dialog: Byte = 0,
+        binaryBucket: ByteArray = ByteArray(0)
+    ): ByteArray = SocialProtocolPackets.buildImprovedInstantMessage(
+        agentId = agentId,
+        sessionId = sessionId,
+        toAgentId = toAgentId,
+        imSessionId = imSessionId,
+        fromName = fromName,
+        message = message,
+        dialog = dialog.toInt() and 0xFF,
+        binaryBucket = binaryBucket
+    )
+
+    fun buildStartLure(
+        agentId: UUID,
+        sessionId: UUID,
+        targetAgentId: UUID,
+        message: String,
+        lureType: Int = 0
+    ): ByteArray = SocialProtocolPackets.buildStartLure(agentId, sessionId, targetAgentId, message, lureType)
+
+    fun buildTeleportLureRequest(
+        agentId: UUID,
+        sessionId: UUID,
+        lureId: UUID,
+        teleportFlags: Int = SocialProtocolPackets.TELEPORT_FLAGS_VIA_LURE
+    ): ByteArray = SocialProtocolPackets.buildTeleportLureRequest(agentId, sessionId, lureId, teleportFlags)
+
+    fun parsePresenceNotification(buf: ByteBuffer): List<UUID> =
+        SocialProtocolPackets.parsePresenceNotification(buf)
 
     /**
      * ObjectGrab / ObjectDeGrab — used for clicking in-world scripted objects AND

@@ -39,6 +39,21 @@ sealed class CapsEvent {
     data class ParcelProperties(val parcelName: String, val parcelDesc: String) : CapsEvent()
     data class ScriptDialog(val objectName: String, val message: String, val buttons: List<String>, val channel: Int) : CapsEvent()
     data class AttachmentsUpdated(val updates: List<CapsAttachmentTransform>) : CapsEvent()
+    data class ChatterBoxInvitationReceived(
+        val sessionId: UUID,
+        val sessionName: String,
+        val fromAgentId: UUID?,
+        val fromName: String,
+        val message: String
+    ) : CapsEvent()
+    data class ChatterBoxSessionEventReceived(
+        val sessionId: UUID,
+        val sessionName: String,
+        val success: Boolean,
+        val fromAgentId: UUID? = null,
+        val fromName: String? = null,
+        val chatMessage: String? = null
+    ) : CapsEvent()
     data class GenericNotice(val title: String, val message: String) : CapsEvent()
     data class HealthChanged(
         val status: LayerHealthStatus,
@@ -100,7 +115,7 @@ class CapabilityManager(
 
     companion object {
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
-        private val REQUESTED_CAPS = listOf(
+        internal val REQUESTED_CAPS = listOf(
             "EventQueueGet",
             "FetchInventoryDescendents2",
             "FetchInventory2",
@@ -115,6 +130,10 @@ class CapabilityManager(
             "AttachmentResources",
             "UpdateAgentInformation",
             "ChatSessionRequest",
+            "GroupAPIv1",
+            "GroupMemberData",
+            "AcceptFriendship",
+            "DeclineFriendship",
             "MapLayer",
             "EnvironmentSettings"
         )
@@ -587,9 +606,39 @@ class CapabilityManager(
                     )
                 )
             }
-            "ChatterBoxInvitation" -> {
-                val sessionName = body["session_name"].asString("Group Chat")
-                _capsEvents.tryEmit(CapsEvent.GenericNotice("Chat Invitation", sessionName))
+            "ChatterBoxInvitation",
+            "ChatterBoxSessionEventReply",
+            "ChatterBoxSessionStartReply",
+            "ChatterBoxSessionEvent" -> {
+                when (val parsed = SocialProtocolPackets.parseChatterBoxEvent(message, body)) {
+                    is SocialProtocolPackets.ParsedChatterBoxEvent.Invitation -> {
+                        _capsEvents.tryEmit(
+                            CapsEvent.ChatterBoxInvitationReceived(
+                                sessionId = parsed.sessionId,
+                                sessionName = parsed.sessionName,
+                                fromAgentId = parsed.fromAgentId,
+                                fromName = parsed.fromName,
+                                message = parsed.message
+                            )
+                        )
+                    }
+                    is SocialProtocolPackets.ParsedChatterBoxEvent.SessionEventReply -> {
+                        _capsEvents.tryEmit(
+                            CapsEvent.ChatterBoxSessionEventReceived(
+                                sessionId = parsed.sessionId,
+                                sessionName = parsed.sessionName,
+                                success = parsed.success,
+                                fromAgentId = parsed.fromAgentId,
+                                fromName = parsed.fromName,
+                                chatMessage = parsed.chatMessage
+                            )
+                        )
+                    }
+                    null -> {
+                        val sessionName = body["session_name"].asString("Group Chat")
+                        _capsEvents.tryEmit(CapsEvent.GenericNotice("Chat Invitation", sessionName))
+                    }
+                }
             }
             "AgentAttachments",
             "AvatarAttachments",
@@ -705,7 +754,152 @@ class CapabilityManager(
             emptyList()
         }
 
+    internal fun dispatchCapsEventForTest(message: String, body: LlsdValue) {
+        dispatchCapsEvent(message, body)
+    }
+
+    /**
+     * Invokes the Second Life `ChatSessionRequest` HTTP capability (`StartSession` or `AcceptInvitation`).
+     */
+    suspend fun requestChatSession(
+        method: SocialProtocolPackets.ChatSessionRequestMethod,
+        sessionId: UUID
+    ): Boolean = withContext(Dispatchers.IO) {
+        val url = capabilities["ChatSessionRequest"] ?: return@withContext false
+        val payload = SocialProtocolPackets.buildChatSessionRequestLlsd(method, sessionId)
+        val xmlPayload = LlsdCodec.toXml(payload)
+        val req = Request.Builder()
+            .url(url)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext false
+                val respText = resp.body?.string().orEmpty()
+                if (respText.isNotBlank()) {
+                    val parsed = LlsdCodec.parseXml(respText)
+                    val sessionEvent = SocialProtocolPackets.parseChatterBoxEvent("ChatterBoxSessionEventReply", parsed)
+                    if (sessionEvent is SocialProtocolPackets.ParsedChatterBoxEvent.SessionEventReply) {
+                        _capsEvents.tryEmit(
+                            CapsEvent.ChatterBoxSessionEventReceived(
+                                sessionId = sessionEvent.sessionId,
+                                sessionName = sessionEvent.sessionName,
+                                success = sessionEvent.success,
+                                fromAgentId = sessionEvent.fromAgentId,
+                                fromName = sessionEvent.fromName,
+                                chatMessage = sessionEvent.chatMessage
+                            )
+                        )
+                    }
+                }
+                true
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    suspend fun startGroupChatSession(sessionId: UUID): Boolean =
+        requestChatSession(SocialProtocolPackets.ChatSessionRequestMethod.StartSession, sessionId)
+
+    suspend fun acceptGroupChatInvitation(sessionId: UUID): Boolean =
+        requestChatSession(SocialProtocolPackets.ChatSessionRequestMethod.AcceptInvitation, sessionId)
+
+    /**
+     * Invokes the Second Life `AcceptFriendship` HTTP capability (`?transaction=<imSessionId>`
+     * with LLSD XML `POST`) when granted by the region. Returns `false` when the capability is
+     * absent (e.g. OpenSimulator) or fails so callers automatically fall back to UDP `0xFFFF0129`.
+     */
+    suspend fun acceptFriendship(
+        transactionId: UUID,
+        fromAgentId: UUID? = null,
+        callingCardFolderId: UUID = UUID(0L, 0L),
+        agentName: String = ""
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = capabilities["AcceptFriendship"]?.takeIf { it.isNotBlank() } ?: return@withContext false
+        val targetUrl = SocialProtocolPackets.buildFriendshipCapabilityUrl(
+            baseUrl = baseUrl,
+            transactionId = transactionId,
+            fromAgentId = fromAgentId,
+            agentName = agentName
+        )
+        val xmlPayload = LlsdCodec.toXml(
+            SocialProtocolPackets.buildAcceptFriendshipLlsd(
+                transactionId = transactionId,
+                fromAgentId = fromAgentId,
+                callingCardFolderId = callingCardFolderId
+            )
+        )
+        val req = Request.Builder()
+            .url(targetUrl)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext false
+                SocialProtocolPackets.parseFriendshipCapabilityResponse(resp.body?.string().orEmpty())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Invokes the Second Life `DeclineFriendship` HTTP capability (`?transaction=<imSessionId>`
+     * with LLSD XML `POST`) when granted by the region. Returns `false` when the capability is
+     * absent (e.g. OpenSimulator) or fails so callers automatically fall back to UDP `0xFFFF012A`.
+     */
+    suspend fun declineFriendship(
+        transactionId: UUID,
+        fromAgentId: UUID? = null
+    ): Boolean = withContext(Dispatchers.IO) {
+        val baseUrl = capabilities["DeclineFriendship"]?.takeIf { it.isNotBlank() } ?: return@withContext false
+        val targetUrl = SocialProtocolPackets.buildFriendshipCapabilityUrl(
+            baseUrl = baseUrl,
+            transactionId = transactionId,
+            fromAgentId = fromAgentId
+        )
+        val xmlPayload = LlsdCodec.toXml(
+            SocialProtocolPackets.buildDeclineFriendshipLlsd(
+                transactionId = transactionId,
+                fromAgentId = fromAgentId
+            )
+        )
+        val req = Request.Builder()
+            .url(targetUrl)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .post(xmlPayload.toRequestBody(LLSD_XML_MEDIA))
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext false
+                SocialProtocolPackets.parseFriendshipCapabilityResponse(resp.body?.string().orEmpty())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false
+        }
+    }
+
     fun getCapabilityUrl(name: String): String? = capabilities[name]
+
+    internal fun setCapabilityUrlForTesting(name: String, url: String) {
+        capabilities[name] = url
+    }
+
+    internal fun dispatchCapsEventForTesting(message: String, body: LlsdValue) {
+        dispatchCapsEvent(message, body)
+    }
 
     fun shutdown() {
         eventQueueJob?.cancel()

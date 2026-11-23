@@ -54,7 +54,50 @@ sealed class SimEvent {
         val fromName: String,
         val imSessionId: UUID,
         val message: String,
-        val dialog: Int
+        val dialog: Int,
+        val isAutoResponse: Boolean = false
+    ) : SimEvent()
+
+    data class FriendOnlineStatusChanged(
+        val agentIds: List<UUID>,
+        val isOnline: Boolean
+    ) : SimEvent()
+
+    data class PeerTypingStateChanged(
+        val fromAgentId: UUID,
+        val fromName: String,
+        val imSessionId: UUID,
+        val isTyping: Boolean
+    ) : SimEvent()
+
+    data class TeleportLureReceived(
+        val fromAgentId: UUID,
+        val fromName: String,
+        val lureId: UUID,
+        val message: String,
+        val isTeleportRequest: Boolean = false
+    ) : SimEvent()
+
+    data class FriendshipOfferReceived(
+        val fromAgentId: UUID,
+        val fromName: String,
+        val transactionId: UUID,
+        val message: String
+    ) : SimEvent()
+
+    data class FriendshipResponseReceived(
+        val fromAgentId: UUID,
+        val fromName: String,
+        val accepted: Boolean
+    ) : SimEvent()
+
+    data class GroupChatReceived(
+        val sessionId: UUID,
+        val groupName: String,
+        val fromAgentId: UUID,
+        val fromName: String,
+        val message: String,
+        val isNotice: Boolean = false
     ) : SimEvent()
 
     data class ObjectUpdated(val sceneObject: SceneObject) : SimEvent()
@@ -530,26 +573,22 @@ class LludpCircuitEngine {
                     }
                 }
             }
+            LludpPackets.MSG_ONLINE_NOTIFICATION -> {
+                val onlineIds = SocialProtocolPackets.parsePresenceNotification(buf)
+                if (onlineIds.isNotEmpty()) {
+                    _events.tryEmit(SimEvent.FriendOnlineStatusChanged(onlineIds, isOnline = true))
+                }
+            }
+            LludpPackets.MSG_OFFLINE_NOTIFICATION -> {
+                val offlineIds = SocialProtocolPackets.parsePresenceNotification(buf)
+                if (offlineIds.isNotEmpty()) {
+                    _events.tryEmit(SimEvent.FriendOnlineStatusChanged(offlineIds, isOnline = false))
+                }
+            }
             LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE -> {
-                if (buf.remaining() >= 80) {
-                    val fromAgentId = LludpPackets.readUuid(buf)
-                    LludpPackets.readUuid(buf) // SessionID
-                    buf.get() // FromGroup
-                    LludpPackets.readUuid(buf) // ToAgentID
-                    buf.int // ParentEstateID
-                    LludpPackets.readUuid(buf) // RegionID
-                    if (buf.remaining() >= 12) { buf.float; buf.float; buf.float }
-                    buf.get() // Offline
-                    val dialog = buf.get().toInt() and 0xFF
-                    val imSessionId = LludpPackets.readUuid(buf)
-                    if (buf.remaining() >= 4) buf.int // Timestamp
-                    val nameLen = if (buf.remaining() >= 1) buf.get().toInt() and 0xFF else 0
-                    val fromName = LludpPackets.readCString(buf, nameLen)
-                    val msgLen = if (buf.remaining() >= 2) buf.short.toInt() and 0xFFFF else 0
-                    val msg = LludpPackets.readCString(buf, msgLen)
-                    if (msg.isNotBlank()) {
-                        _events.tryEmit(SimEvent.InstantMessageReceived(fromAgentId, fromName, imSessionId, msg, dialog))
-                    }
+                val decoded = SocialProtocolPackets.decodeImprovedInstantMessage(buf)
+                if (decoded != null) {
+                    dispatchRoutedInstantMessage(SocialProtocolPackets.routeInstantMessage(decoded))
                 }
             }
             LludpPackets.MSG_OBJECT_UPDATE -> parseObjectUpdate(buf)
@@ -1257,13 +1296,217 @@ class LludpCircuitEngine {
     fun sendChat(message: String, chatType: Byte = 1, channel: Int = 0) {
         if (!running.get()) return
         val body = LludpPackets.buildChatFromViewer(agentId, sessionId, message, chatType, channel)
-        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true)
+        // ChatFromViewer (Low 80) is Zerocoded in message_template.msg
+        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true, zeroCode = true)
     }
 
-    fun sendInstantMessage(toAgentId: UUID, imSessionId: UUID, fromName: String, message: String) {
+    fun sendInstantMessage(
+        toAgentId: UUID,
+        imSessionId: UUID,
+        fromName: String,
+        message: String,
+        dialog: Int = SocialProtocolPackets.IM_MESSAGE_FROM_AGENT
+    ) {
         if (!running.get()) return
-        val body = LludpPackets.buildImprovedInstantMessage(agentId, sessionId, toAgentId, imSessionId, fromName, message)
-        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true)
+        val body = SocialProtocolPackets.buildImprovedInstantMessage(
+            agentId = agentId,
+            sessionId = sessionId,
+            toAgentId = toAgentId,
+            imSessionId = imSessionId,
+            fromName = fromName,
+            message = message,
+            dialog = dialog
+        )
+        // ImprovedInstantMessage (Low 254) is Zerocoded in message_template.msg
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendTypingIndicator(toAgentId: UUID, imSessionId: UUID, fromName: String, isTyping: Boolean) {
+        if (!running.get()) return
+        val dialog = if (isTyping) {
+            SocialProtocolPackets.IM_TYPING_START
+        } else {
+            SocialProtocolPackets.IM_TYPING_STOP
+        }
+        val body = SocialProtocolPackets.buildImprovedInstantMessage(
+            agentId = agentId,
+            sessionId = sessionId,
+            toAgentId = toAgentId,
+            imSessionId = imSessionId,
+            fromName = fromName,
+            message = "",
+            dialog = dialog
+        )
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendStartLure(targetAgentId: UUID, message: String) {
+        if (!running.get()) return
+        val body = SocialProtocolPackets.buildStartLure(agentId, sessionId, targetAgentId, message)
+        // StartLure (Low 70 / 0xFFFF0046) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_START_LURE, body, reliable = true, zeroCode = false)
+    }
+
+    fun sendTeleportLureRequest(
+        lureId: UUID,
+        teleportFlags: Int = SocialProtocolPackets.TELEPORT_FLAGS_VIA_LURE
+    ) {
+        if (!running.get()) return
+        val body = SocialProtocolPackets.buildTeleportLureRequest(agentId, sessionId, lureId, teleportFlags)
+        // TeleportLureRequest (Low 71 / 0xFFFF0047) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_TELEPORT_LURE_REQUEST, body, reliable = true, zeroCode = false)
+    }
+
+    fun sendFriendshipOffer(targetAgentId: UUID, fromName: String, message: String) {
+        if (!running.get()) return
+        val txId = SocialProtocolPackets.computeDirectImSessionId(agentId, targetAgentId)
+        val body = SocialProtocolPackets.buildImprovedInstantMessage(
+            agentId = agentId,
+            sessionId = sessionId,
+            toAgentId = targetAgentId,
+            imSessionId = txId,
+            fromName = fromName,
+            message = message,
+            dialog = SocialProtocolPackets.IM_FRIENDSHIP_OFFERED
+        )
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendAcceptFriendship(transactionId: UUID, callingCardFolderId: UUID = UUID(0L, 0L)) {
+        if (!running.get()) return
+        val body = SocialProtocolPackets.buildAcceptFriendship(agentId, sessionId, transactionId, callingCardFolderId)
+        // AcceptFriendship (Low 297 / 0xFFFF0129) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_ACCEPT_FRIENDSHIP, body, reliable = true, zeroCode = false)
+    }
+
+    fun sendDeclineFriendship(transactionId: UUID) {
+        if (!running.get()) return
+        val body = SocialProtocolPackets.buildDeclineFriendship(agentId, sessionId, transactionId)
+        // DeclineFriendship (Low 298 / 0xFFFF012A) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_DECLINE_FRIENDSHIP, body, reliable = true, zeroCode = false)
+    }
+
+    fun sendTerminateFriendship(otherAgentId: UUID) {
+        if (!running.get()) return
+        val body = SocialProtocolPackets.buildTerminateFriendship(agentId, sessionId, otherAgentId)
+        // TerminateFriendship (Low 300 / 0xFFFF012C) is Unencoded in message_template.msg
+        send(LludpPackets.MSG_TERMINATE_FRIENDSHIP, body, reliable = true, zeroCode = false)
+    }
+
+    fun sendGroupSessionStart(groupId: UUID, fromName: String) {
+        if (!running.get()) return
+        val body = SocialProtocolPackets.buildImprovedInstantMessage(
+            agentId = agentId,
+            sessionId = sessionId,
+            toAgentId = groupId,
+            imSessionId = groupId,
+            fromName = fromName,
+            message = "",
+            dialog = SocialProtocolPackets.IM_SESSION_GROUP_START,
+            binaryBucket = byteArrayOf(0)
+        )
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendGroupChat(groupId: UUID, fromName: String, message: String) {
+        if (!running.get()) return
+        val body = SocialProtocolPackets.buildImprovedInstantMessage(
+            agentId = agentId,
+            sessionId = sessionId,
+            toAgentId = groupId,
+            imSessionId = groupId,
+            fromName = fromName,
+            message = message,
+            dialog = SocialProtocolPackets.IM_SESSION_SEND,
+            binaryBucket = byteArrayOf(0)
+        )
+        send(LludpPackets.MSG_IMPROVED_INSTANT_MESSAGE, body, reliable = true, zeroCode = true)
+    }
+
+    internal fun dispatchRoutedInstantMessage(routed: SocialProtocolPackets.RoutedInstantMessage) {
+        when (routed) {
+            is SocialProtocolPackets.RoutedInstantMessage.DirectMessage -> {
+                _events.tryEmit(
+                    SimEvent.InstantMessageReceived(
+                        fromAgentId = routed.fromAgentId,
+                        fromName = routed.fromName,
+                        imSessionId = routed.imSessionId,
+                        message = routed.message,
+                        dialog = routed.dialog,
+                        isAutoResponse = routed.isAutoResponse
+                    )
+                )
+            }
+            is SocialProtocolPackets.RoutedInstantMessage.TypingIndicator -> {
+                _events.tryEmit(
+                    SimEvent.PeerTypingStateChanged(
+                        fromAgentId = routed.fromAgentId,
+                        fromName = routed.fromName,
+                        imSessionId = routed.imSessionId,
+                        isTyping = routed.isTyping
+                    )
+                )
+            }
+            is SocialProtocolPackets.RoutedInstantMessage.TeleportLureOffer -> {
+                _events.tryEmit(
+                    SimEvent.TeleportLureReceived(
+                        fromAgentId = routed.fromAgentId,
+                        fromName = routed.fromName,
+                        lureId = routed.lureId,
+                        message = routed.message,
+                        isTeleportRequest = routed.isTeleportRequest
+                    )
+                )
+            }
+            is SocialProtocolPackets.RoutedInstantMessage.FriendshipOffered -> {
+                _events.tryEmit(
+                    SimEvent.FriendshipOfferReceived(
+                        fromAgentId = routed.fromAgentId,
+                        fromName = routed.fromName,
+                        transactionId = routed.transactionId,
+                        message = routed.message
+                    )
+                )
+            }
+            is SocialProtocolPackets.RoutedInstantMessage.FriendshipResponse -> {
+                _events.tryEmit(
+                    SimEvent.FriendshipResponseReceived(
+                        fromAgentId = routed.fromAgentId,
+                        fromName = routed.fromName,
+                        accepted = routed.accepted
+                    )
+                )
+            }
+            is SocialProtocolPackets.RoutedInstantMessage.GroupChatMessage -> {
+                _events.tryEmit(
+                    SimEvent.GroupChatReceived(
+                        sessionId = routed.sessionId,
+                        groupName = routed.groupName,
+                        fromAgentId = routed.fromAgentId,
+                        fromName = routed.fromName,
+                        message = routed.message,
+                        isNotice = false
+                    )
+                )
+            }
+            is SocialProtocolPackets.RoutedInstantMessage.GroupNotice -> {
+                val attachmentSuffix = if (routed.attachedItemName.isNotBlank()) {
+                    " [Attached: ${routed.attachedItemName}]"
+                } else ""
+                val formatted = "[Notice: ${routed.subject}] ${routed.body}$attachmentSuffix".trim()
+                _events.tryEmit(
+                    SimEvent.GroupChatReceived(
+                        sessionId = routed.groupId,
+                        groupName = "Group Notice",
+                        fromAgentId = routed.fromAgentId,
+                        fromName = routed.fromName,
+                        message = formatted,
+                        isNotice = true
+                    )
+                )
+            }
+            is SocialProtocolPackets.RoutedInstantMessage.Unhandled -> Unit
+        }
     }
 
     fun sendObjectTouch(localId: Int, faceIndex: Int = 0, uvS: Float = 0.5f, uvT: Float = 0.5f) {

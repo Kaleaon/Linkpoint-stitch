@@ -353,7 +353,7 @@ fun InWorldCockpitScreen(
                             .padding(horizontal = 8.dp, vertical = 5.dp)
                     ) {
                         Text(
-                            text = "${latestChat.speaker}: ${latestChat.text}",
+                            text = latestChat.formattedLine(),
                             style = MaterialTheme.typography.labelSmall.copy(
                                 color = tokens.textPrimary,
                                 fontSize = 10.sp
@@ -484,6 +484,50 @@ fun InWorldCockpitScreen(
                     }
                 }
 
+                // Non-intrusive Social Offer Prompts (Teleport Lures & Friendship Offers)
+                val hasSocialPrompt = state.incomingTeleportOffer != null || state.incomingFriendshipOffer != null
+                AnimatedVisibility(
+                    visible = hasSocialPrompt,
+                    enter = fadeIn() + slideInVertically { -it / 3 },
+                    exit = fadeOut() + slideOutVertically { -it / 3 },
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .padding(top = if (state.toastMessage != null) 76.dp else 44.dp)
+                ) {
+                    Column(
+                        modifier = Modifier.widthIn(max = 360.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        state.incomingTeleportOffer?.let { lure ->
+                            SocialOfferBannerCard(
+                                badge = if (lure.isTeleportRequest) "TELEPORT REQUEST" else "TELEPORT OFFER",
+                                senderName = lure.fromName,
+                                message = lure.message,
+                                accentColor = tokens.accentPrimary,
+                                onAccept = client::acceptTeleportOffer,
+                                onDecline = client::declineTeleportOffer,
+                                bannerTestTag = "teleport_offer_banner",
+                                acceptTestTag = "teleport_offer_accept_button",
+                                declineTestTag = "teleport_offer_decline_button"
+                            )
+                        }
+                        state.incomingFriendshipOffer?.let { offer ->
+                            SocialOfferBannerCard(
+                                badge = "FRIENDSHIP OFFER",
+                                senderName = offer.fromName,
+                                message = offer.message,
+                                accentColor = tokens.accentSecondary,
+                                onAccept = client::acceptFriendshipOffer,
+                                onDecline = client::declineFriendshipOffer,
+                                bannerTestTag = "friendship_offer_banner",
+                                acceptTestTag = "friendship_offer_accept_button",
+                                declineTestTag = "friendship_offer_decline_button"
+                            )
+                        }
+                    }
+                }
+
                 // Transient System Feedback Toast Pill (tucked cleanly under top bar)
                 AnimatedVisibility(
                     visible = state.toastMessage != null,
@@ -543,6 +587,75 @@ fun InWorldCockpitScreen(
                 }
             }
         )
+    }
+}
+
+@Composable
+private fun SocialOfferBannerCard(
+    badge: String,
+    senderName: String,
+    message: String,
+    accentColor: Color,
+    onAccept: () -> Unit,
+    onDecline: () -> Unit,
+    bannerTestTag: String,
+    acceptTestTag: String,
+    declineTestTag: String
+) {
+    val tokens = LocalLinkpointDesign.current
+    val shape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(14.dp))
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 10.dp)
+            .clip(shape)
+            .background(tokens.surfaceFloater.copy(alpha = 0.94f))
+            .border(1.dp, accentColor.copy(alpha = 0.85f), shape)
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+            .testTag(bannerTestTag),
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            LinkpointStatusChip(label = badge, color = accentColor)
+            Text(
+                text = senderName,
+                style = MaterialTheme.typography.labelMedium.copy(
+                    color = tokens.textPrimary,
+                    fontWeight = FontWeight.Bold
+                ),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+        Text(
+            text = message,
+            style = MaterialTheme.typography.bodySmall.copy(color = tokens.textSecondary),
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.End,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            LinkpointStatusChip(
+                label = "Decline",
+                color = tokens.textMuted,
+                onClick = onDecline,
+                modifier = Modifier.testTag(declineTestTag)
+            )
+            Spacer(Modifier.width(8.dp))
+            LinkpointStatusChip(
+                label = "Accept",
+                color = tokens.statusOnline,
+                onClick = onAccept,
+                modifier = Modifier.testTag(acceptTestTag)
+            )
+        }
     }
 }
 

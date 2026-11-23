@@ -779,21 +779,7 @@ class XmlRpcLoginClient(
             }
         }
 
-        val buddies = mutableListOf<BuddyEntry>()
-        val rawBuddies = raw["buddy-list"] as? List<*>
-        rawBuddies?.forEach { entry ->
-            val map = entry as? Map<*, *> ?: return@forEach
-            val id = parseUuid(map["buddy_id"]?.toString())
-            if (id != ZERO_UUID) {
-                buddies.add(
-                    BuddyEntry(
-                        buddyId = id,
-                        rightsGiven = map["buddy_rights_given"]?.toString()?.toIntOrNull() ?: 0,
-                        rightsHas = map["buddy_rights_has"]?.toString()?.toIntOrNull() ?: 0
-                    )
-                )
-            }
-        }
+        val buddies = parseBuddyList(raw["buddy-list"])
 
         val rootList = raw["inventory-root"] as? List<*>
         val invRootMap = rootList?.firstOrNull() as? Map<*, *>
@@ -867,6 +853,49 @@ class XmlRpcLoginClient(
         else -> {
             val s = value?.toString()?.trim().orEmpty()
             s.toLongOrNull()?.toInt() ?: s.toDoubleOrNull()?.toLong()?.toInt() ?: default
+        }
+    }
+
+    internal fun parseBuddyList(rawBuddies: Any?): List<BuddyEntry> {
+        val entries = when (rawBuddies) {
+            is List<*> -> rawBuddies
+            is Map<*, *> -> rawBuddies.values.toList()
+            else -> return emptyList()
+        }
+        val byId = LinkedHashMap<UUID, BuddyEntry>()
+        for (entry in entries) {
+            val map = entry as? Map<*, *> ?: continue
+            val rawId = (map["buddy_id"] ?: map["buddy-id"] ?: map["id"])?.toString()
+            val id = parseUuid(rawId)
+            if (id == ZERO_UUID) continue
+            val given = parseBuddyRights(map["buddy_rights_given"] ?: map["buddy-rights-given"])
+            val has = parseBuddyRights(map["buddy_rights_has"] ?: map["buddy-rights-has"])
+            val prev = byId[id]
+            byId[id] = if (prev != null) {
+                BuddyEntry(
+                    buddyId = id,
+                    rightsGiven = prev.rightsGiven or given,
+                    rightsHas = prev.rightsHas or has
+                )
+            } else {
+                BuddyEntry(buddyId = id, rightsGiven = given, rightsHas = has)
+            }
+        }
+        return byId.values.toList()
+    }
+
+    private fun parseBuddyRights(value: Any?): Int = when (value) {
+        is Int -> value
+        is Long -> value.toInt()
+        is Number -> value.toInt()
+        is Boolean -> if (value) 1 else 0
+        else -> {
+            val s = value?.toString()?.trim().orEmpty()
+            when {
+                s.equals("true", ignoreCase = true) -> 1
+                s.equals("false", ignoreCase = true) -> 0
+                else -> s.toIntOrNull() ?: 0
+            }
         }
     }
 
