@@ -25,6 +25,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.Checkroom
+import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
@@ -33,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -63,6 +65,7 @@ fun AvatarProfileSheetContent(
 ) {
     val tokens = LocalLinkpointDesign.current
     var activeTab by remember(avatar.agentId) { mutableIntStateOf(0) } // 0 = Profile, 1 = Appearance & Meshes
+    var showPayDialog by remember(avatar.agentId) { mutableStateOf(false) }
 
     val portraitBitmap = remember(avatar.profileImageId, state.textureRevision) {
         client.getCachedTextureBitmap(avatar.profileImageId)
@@ -357,11 +360,11 @@ fun AvatarProfileSheetContent(
         Spacer(Modifier.height(8.dp))
 
         // Action Buttons Row
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            if (!avatar.isSelf) {
+        if (!avatar.isSelf) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
                 LinkpointActionButton(
                     text = "IM",
                     icon = Icons.Default.ChatBubbleOutline,
@@ -373,7 +376,22 @@ fun AvatarProfileSheetContent(
                     testTag = "avatar_profile_im_button",
                     modifier = Modifier.weight(1f)
                 )
+                LinkpointActionButton(
+                    text = "Pay L$",
+                    icon = Icons.Default.Payments,
+                    onClick = { showPayDialog = true },
+                    primary = false,
+                    testTag = "avatar_profile_pay_button",
+                    modifier = Modifier.weight(1f)
+                )
             }
+            Spacer(Modifier.height(6.dp))
+        }
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
             LinkpointActionButton(
                 text = "Focus",
                 icon = Icons.Default.CenterFocusStrong,
@@ -389,6 +407,19 @@ fun AvatarProfileSheetContent(
                 primary = false,
                 testTag = "avatar_profile_refresh_button",
                 modifier = Modifier.weight(1f)
+            )
+        }
+
+        if (showPayDialog && !avatar.isSelf) {
+            QuickPayModal(
+                recipientName = avatar.displayName,
+                isObjectPayment = false,
+                currentBalance = state.lindenBalance,
+                client = client,
+                onConfirmPayment = { amount, note ->
+                    client.payAvatar(avatar.agentId, avatar.displayName, amount, note)
+                },
+                onDismiss = { showPayDialog = false }
             )
         }
     }

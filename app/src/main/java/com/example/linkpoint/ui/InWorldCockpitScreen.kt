@@ -210,6 +210,7 @@ fun InWorldCockpitScreen(
                         if (state.connection is ConnectionState.Connected) showConnectionDialog = true
                         else client.toggleFloater(DockToolId.STUDIO)
                     },
+                    onRefreshBalance = client::requestBalanceRefresh,
                     modifier = Modifier
                         .align(telemetryAlign)
                         .padding(
@@ -520,28 +521,19 @@ fun InWorldCockpitScreen(
         }
     }
 
-    // LSL ScriptDialog Prompt Modal (from EventQueueGet CAPS)
+    // LSL ScriptDialog & llTextBox Prompt Modal (from EventQueueGet CAPS or LLUDP MSG_SCRIPT_DIALOG)
     state.scriptDialog?.let { dlg ->
-        val dlgTokens = LocalLinkpointDesign.current
-        AlertDialog(
-            onDismissRequest = client::dismissScriptDialog,
-            containerColor = dlgTokens.surfaceFloater,
-            title = { Text(dlg.objectName, color = dlgTokens.textPrimary) },
-            text = { Text(dlg.message, color = dlgTokens.textSecondary) },
-            confirmButton = {
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    dlg.buttons.take(3).forEach { label ->
-                        TextButton(onClick = { client.respondScriptDialog(label, dlg.channel) }) {
-                            Text(label, color = dlgTokens.accentPrimary)
-                        }
-                    }
-                }
-            },
-            dismissButton = {
-                TextButton(onClick = client::dismissScriptDialog) {
-                    Text("Ignore", color = dlgTokens.textMuted)
-                }
-            }
+        ScriptDialogModal(
+            prompt = dlg,
+            client = client
+        )
+    }
+
+    // LSL ScriptQuestion Permission Prompt Modal (with PERMISSION_DEBIT warning highlight)
+    state.scriptQuestion?.let { permPrompt ->
+        ScriptPermissionModal(
+            prompt = permPrompt,
+            client = client
         )
     }
 }
@@ -888,6 +880,7 @@ private fun CompactTelemetryPill(
     state: ViewerState,
     isWideScreen: Boolean,
     onTapTelemetry: () -> Unit,
+    onRefreshBalance: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val tokens = LocalLinkpointDesign.current
@@ -909,6 +902,8 @@ private fun CompactTelemetryPill(
 
     val pos = state.avatarPosition
     val stats = state.assetStats
+    val showBalanceBadge = state.connection is ConnectionState.Connected ||
+        state.connection is ConnectionState.LocalSandbox
     val pillShape = RoundedCornerShape(
         when (tokens.language) {
             DesignLanguage.LCARS -> 99.dp
@@ -920,7 +915,7 @@ private fun CompactTelemetryPill(
 
     Row(
         modifier = modifier
-            .widthIn(max = if (isWideScreen) 420.dp else 255.dp)
+            .widthIn(max = if (isWideScreen) 470.dp else 284.dp)
             .clip(pillShape)
             .background(tokens.surfaceChrome.copy(alpha = 0.72f))
             .border(1.dp, tokens.borderHairline.copy(alpha = 0.75f), pillShape)
@@ -975,6 +970,12 @@ private fun CompactTelemetryPill(
                 ),
                 maxLines = 1,
                 overflow = TextOverflow.Ellipsis
+            )
+        }
+        if (showBalanceBadge) {
+            LindenBalanceBadge(
+                balance = state.lindenBalance,
+                onRefreshBalance = onRefreshBalance
             )
         }
     }
