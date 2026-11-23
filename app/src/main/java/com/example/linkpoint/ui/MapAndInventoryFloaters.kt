@@ -35,17 +35,21 @@ import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -55,6 +59,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.example.linkpoint.client.ViewerClient
@@ -63,6 +68,7 @@ import com.example.linkpoint.designsystem.LinkpointFloaterHeader
 import com.example.linkpoint.designsystem.LinkpointStatusChip
 import com.example.linkpoint.designsystem.LocalLinkpointDesign
 import com.example.linkpoint.scene.HudAttachmentPoint
+import com.example.linkpoint.store.ConnectionState
 import com.example.linkpoint.store.InventoryEntry
 import com.example.linkpoint.store.ViewerState
 import java.util.UUID
@@ -74,12 +80,26 @@ fun MapFloaterContent(
     onClose: () -> Unit
 ) {
     val tokens = LocalLinkpointDesign.current
+    val defaultRegionName = when (val conn = state.connection) {
+        is ConnectionState.Connected -> conn.regionName
+        is ConnectionState.LocalSandbox -> conn.regionName
+        else -> state.parcelName
+    }
     var activeTab by remember { mutableIntStateOf(0) } // 0 = World Map, 1 = Landmarks
     var searchQuery by remember { mutableStateOf("") }
     var targetX by remember { mutableStateOf(state.avatarPosition.x.toInt().toString()) }
     var targetY by remember { mutableStateOf(state.avatarPosition.y.toInt().toString()) }
     var targetZ by remember { mutableStateOf(state.avatarPosition.z.toInt().toString()) }
-    var selectedRegionName by remember { mutableStateOf(state.parcelName) }
+    var selectedRegionName by remember { mutableStateOf(defaultRegionName) }
+
+    LaunchedEffect(state.mapTargetRevision) {
+        if (state.mapTargetRevision > 0 && state.mapTargetRegion.isNotBlank()) {
+            selectedRegionName = state.mapTargetRegion
+            targetX = state.mapTargetX.toString()
+            targetY = state.mapTargetY.toString()
+            targetZ = state.mapTargetZ.toString()
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose { client.setTextInputFocused(false) }
@@ -92,6 +112,38 @@ fun MapFloaterContent(
             lcarsCode = "03-NAV",
             onClose = onClose
         )
+
+        if (state.isTeleporting || !state.teleportStatusMessage.isNullOrBlank()) {
+            val bannerShape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(10.dp))
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(bannerShape)
+                    .background(tokens.accentPrimary.copy(alpha = 0.14f))
+                    .border(1.dp, tokens.accentPrimary.copy(alpha = 0.6f), bannerShape)
+                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                    .testTag("teleport_progress_banner")
+            ) {
+                Text(
+                    text = state.teleportStatusMessage ?: "Teleporting...",
+                    style = MaterialTheme.typography.labelMedium.copy(
+                        color = tokens.accentPrimary,
+                        fontWeight = FontWeight.SemiBold
+                    ),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Spacer(Modifier.height(4.dp))
+                LinearProgressIndicator(
+                    color = tokens.accentPrimary,
+                    trackColor = tokens.borderHairline,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(3.dp)
+                )
+            }
+            Spacer(Modifier.height(8.dp))
+        }
 
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             LinkpointStatusChip(
@@ -158,11 +210,13 @@ fun MapFloaterContent(
                     drawCircle(tokens.accentTertiary, radius = 7.dp.toPx(), center = Offset(tx, ty))
                 }
                 Text(
-                    text = "TARGET <$targetX, $targetY, $targetZ>",
+                    text = "${selectedRegionName.ifBlank { "Region" }} <$targetX, $targetY, $targetZ>",
                     style = MaterialTheme.typography.labelSmall.copy(
                         fontFamily = tokens.monoFont,
                         color = tokens.accentTertiary
                     ),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
                     modifier = Modifier
                         .align(Alignment.BottomStart)
                         .background(Color.Black.copy(alpha = 0.65f))
@@ -178,6 +232,8 @@ fun MapFloaterContent(
                     onValueChange = { searchQuery = it },
                     placeholder = { Text("Search region or SLURL...") },
                     singleLine = true,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                    keyboardActions = KeyboardActions(onSearch = { client.searchMapRegions(searchQuery) }),
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedBorderColor = tokens.accentPrimary,
                         unfocusedBorderColor = tokens.borderHairline,
@@ -187,21 +243,92 @@ fun MapFloaterContent(
                     modifier = Modifier
                         .weight(1f)
                         .onFocusChanged { client.setTextInputFocused(it.isFocused) }
+                        .testTag("map_search_input")
                 )
-                IconButton(onClick = { client.searchMapRegions(searchQuery) }) {
+                IconButton(
+                    onClick = { client.searchMapRegions(searchQuery) },
+                    modifier = Modifier.testTag("map_search_button")
+                ) {
                     Icon(Icons.Default.Search, contentDescription = "Search regions", tint = tokens.accentPrimary)
                 }
             }
 
             if (state.mapRegions.isNotEmpty()) {
                 Spacer(Modifier.height(6.dp))
-                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                    state.mapRegions.take(3).forEach { tile ->
-                        LinkpointStatusChip(
-                            label = "${tile.name} (${tile.agentCount})",
-                            color = if (selectedRegionName == tile.name) tokens.accentPrimary else tokens.textSecondary,
-                            onClick = { selectedRegionName = tile.name }
-                        )
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 128.dp)
+                        .testTag("map_region_results"),
+                    verticalArrangement = Arrangement.spacedBy(5.dp)
+                ) {
+                    items(
+                        items = state.mapRegions,
+                        key = { "${it.gridX}_${it.gridY}_${it.name}" }
+                    ) { tile ->
+                        val isSelected = selectedRegionName.equals(tile.name, ignoreCase = true)
+                        val rowShape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(10.dp))
+                        val maturityColor = when (tile.accessLabel) {
+                            "Adult" -> tokens.statusError
+                            "Mature" -> tokens.accentTertiary
+                            else -> tokens.statusOnline
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(rowShape)
+                                .background(
+                                    if (isSelected) tokens.accentPrimary.copy(alpha = 0.16f)
+                                    else tokens.surfaceElevated.copy(alpha = 0.72f)
+                                )
+                                .border(
+                                    width = 1.dp,
+                                    color = if (isSelected) tokens.accentPrimary else tokens.borderHairline,
+                                    shape = rowShape
+                                )
+                                .clickable {
+                                    if (!selectedRegionName.equals(tile.name, ignoreCase = true)) {
+                                        selectedRegionName = tile.name
+                                        targetX = "128"
+                                        targetY = "128"
+                                        targetZ = "25"
+                                    } else {
+                                        selectedRegionName = tile.name
+                                    }
+                                }
+                                .padding(horizontal = 10.dp, vertical = 6.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = tile.name,
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Medium,
+                                        color = tokens.textPrimary
+                                    ),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = "Grid (${tile.gridX}, ${tile.gridY}) • ${tile.agentCount} resident(s)",
+                                    style = MaterialTheme.typography.labelSmall.copy(
+                                        fontFamily = tokens.monoFont,
+                                        color = tokens.textSecondary
+                                    ),
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                            Spacer(Modifier.width(8.dp))
+                            LinkpointStatusChip(
+                                label = tile.accessLabel,
+                                color = maturityColor,
+                                onClick = {
+                                    selectedRegionName = tile.name
+                                }
+                            )
+                        }
                     }
                 }
             }
@@ -390,7 +517,7 @@ fun InventoryFloaterContent(
                         .border(1.dp, if (entry.isWorn) tokens.accentPrimary else tokens.borderHairline, shape)
                         .clickable {
                             if (entry.isFolder) client.toggleInventoryFolder(entry.id)
-                            else if (entry.assetType == 3) client.teleportToRegion(entry.name, 128, 128, 26)
+                            else if (entry.assetType == 3) client.teleportToLandmark(entry.assetId ?: entry.id, entry.name)
                             else client.toggleWearInventoryItem(entry.id)
                         }
                         .padding(horizontal = 10.dp, vertical = 8.dp),
@@ -423,7 +550,13 @@ fun InventoryFloaterContent(
                             }
                         }
                     }
-                    if (!entry.isFolder && entry.assetType != 3) {
+                    if (!entry.isFolder && entry.assetType == 3) {
+                        LinkpointStatusChip(
+                            label = "Teleport",
+                            color = tokens.accentTertiary,
+                            onClick = { client.teleportToLandmark(entry.assetId ?: entry.id, entry.name) }
+                        )
+                    } else if (!entry.isFolder) {
                         LinkpointStatusChip(
                             label = if (entry.isWorn) "Detach" else "Wear / HUD",
                             color = if (entry.isWorn) tokens.statusOnline else tokens.textSecondary,

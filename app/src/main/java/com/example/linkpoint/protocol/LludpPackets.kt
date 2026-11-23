@@ -34,8 +34,13 @@ object LludpPackets {
     // Low frequency message IDs (0xFFFF + 2 bytes)
     const val MSG_USE_CIRCUIT_CODE: Int = 0xFFFF0003.toInt()
     const val MSG_OBJECT_PROPERTIES: Int = 0xFFFF0009.toInt()
-    const val MSG_TELEPORT_LOCATION_REQUEST: Int = 0xFFFF003F.toInt()
-    const val MSG_TELEPORT_LANDMARK_REQUEST: Int = 0xFFFF0041.toInt()
+    const val MSG_TELEPORT_LOCATION_REQUEST: Int = 0xFFFF003F.toInt() // Low 63
+    const val MSG_TELEPORT_LOCAL: Int = 0xFFFF0040.toInt()            // Low 64
+    const val MSG_TELEPORT_LANDMARK_REQUEST: Int = 0xFFFF0041.toInt() // Low 65
+    const val MSG_TELEPORT_HOME_REQUEST: Int = MSG_TELEPORT_LANDMARK_REQUEST // Low 65 with null LandmarkID
+    const val MSG_TELEPORT_PROGRESS: Int = 0xFFFF0042.toInt()         // Low 66
+    const val MSG_TELEPORT_START: Int = 0xFFFF0049.toInt()            // Low 73
+    const val MSG_TELEPORT_FAILED: Int = 0xFFFF004A.toInt()           // Low 74
     const val MSG_CHAT_FROM_VIEWER: Int = 0xFFFF0050.toInt()
     const val MSG_AGENT_THROTTLE: Int = 0xFFFF0051.toInt()
     const val MSG_OBJECT_GRAB: Int = 0xFFFF0075.toInt()
@@ -43,6 +48,8 @@ object LludpPackets {
     const val MSG_CHAT_FROM_SIMULATOR: Int = 0xFFFF008B.toInt()
     const val MSG_REGION_HANDSHAKE: Int = 0xFFFF0094.toInt()
     const val MSG_REGION_HANDSHAKE_REPLY: Int = 0xFFFF0095.toInt()
+    const val MSG_ENABLE_SIMULATOR: Int = 0xFFFF0097.toInt()          // Low 151 (Unencoded)
+    const val MSG_DISABLE_SIMULATOR: Int = 0xFFFF0098.toInt()         // Low 152 (Unencoded)
     const val MSG_AVATAR_APPEARANCE: Int = 0xFFFF009E.toInt()       // Low 158
     const val MSG_AVATAR_PROPERTIES_REQUEST: Int = 0xFFFF00A9.toInt() // Low 169
     const val MSG_AVATAR_PROPERTIES_REPLY: Int = 0xFFFF00AB.toInt()   // Low 171
@@ -59,8 +66,11 @@ object LludpPackets {
     const val MSG_REZ_SINGLE_ATTACHMENT: Int = 0xFFFF018B.toInt()
     const val MSG_DETACH_ATTACHMENT: Int = 0xFFFF018D.toInt()
     const val MSG_MAP_BLOCK_REQUEST: Int = 0xFFFF0197.toInt()
+    const val MSG_MAP_NAME_REQUEST: Int = 0xFFFF0198.toInt()          // Low 408
     const val MSG_MAP_BLOCK_REPLY: Int = 0xFFFF0199.toInt()
+    // Fixed frequency message IDs (0xFFFFFF + 1 byte, Unencoded — never zerocoded)
     const val MSG_PACKET_ACK: Int = 0xFFFFFFFB.toInt()
+    const val MSG_CLOSE_CIRCUIT: Int = 0xFFFFFFFD.toInt()
 
     // RegionHandshakeReply flags (tells SL Server-Side Appearance to bake & stream self appearance)
     const val REGION_HANDSHAKE_SUPPORTS_SELF_APPEARANCE: Int = 0x00000004
@@ -227,6 +237,23 @@ object LludpPackets {
         return out.toByteArray()
     }
 
+    /**
+     * Returns true for Second Life messages marked `Unencoded` in `message_template.msg`
+     * (including all Fixed `0xFFFFFFxx` packets such as `PacketAck` and `CloseCircuit`),
+     * ensuring `FLAG_ZEROCODED` is never applied to them.
+     */
+    fun isUnencodedMessage(messageId: Int): Boolean {
+        if ((messageId and 0xFFFFFF00.toInt()) == 0xFFFFFF00.toInt()) return true
+        return when (messageId) {
+            MSG_START_PING_CHECK,
+            MSG_COMPLETE_PING_CHECK,
+            MSG_ENABLE_SIMULATOR,
+            MSG_DISABLE_SIMULATOR,
+            MSG_LOGOUT_REQUEST -> true
+            else -> false
+        }
+    }
+
     fun framePacket(
         sequenceNumber: Int,
         reliable: Boolean,
@@ -253,8 +280,9 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        val allowZeroCoding = useZeroCoding && !isUnencodedMessage(messageId)
+        val encoded = if (allowZeroCoding) zeroEncode(msgBytes) else msgBytes
+        val actuallyZeroCoded = allowZeroCoding && encoded.size < msgBytes.size
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0
@@ -507,6 +535,156 @@ object LludpPackets {
         return buf.array()
     }
 
+    /**
+     * Encodes grid tile coordinates (e.g. gridX=1000, gridY=1000) into a 64-bit Second Life
+     * RegionHandle: `((gridX * 256L) shl 32) or ((gridY * 256L) and 0xFFFFFFFFL)`.
+     */
+    fun toRegionHandle(gridX: Int, gridY: Int): Long {
+        val globalX = gridX.toLong() * 256L
+        val globalY = gridY.toLong() * 256L
+        return (globalX shl 32) or (globalY and 0xFFFFFFFFL)
+    }
+
+    fun regionHandleToGridX(regionHandle: Long): Int = ((regionHandle ushr 32) / 256L).toInt()
+
+    fun regionHandleToGridY(regionHandle: Long): Int = ((regionHandle and 0xFFFFFFFFL) / 256L).toInt()
+
+    data class ParsedTeleportProgress(
+        val agentId: UUID,
+        val teleportFlags: Int,
+        val message: String
+    )
+
+    data class ParsedTeleportFailed(
+        val agentId: UUID,
+        val reason: String,
+        val alertMessages: List<String> = emptyList()
+    )
+
+    data class ParsedTeleportLocal(
+        val agentId: UUID,
+        val locationId: Int,
+        val position: Vec3,
+        val lookAt: Vec3,
+        val teleportFlags: Int
+    )
+
+    data class ParsedEnableSimulator(
+        val regionHandle: Long,
+        val simIp: String,
+        val simPort: Int
+    ) {
+        val gridX: Int
+            get() = regionHandleToGridX(regionHandle)
+        val gridY: Int
+            get() = regionHandleToGridY(regionHandle)
+    }
+
+    data class NeighborSimulatorEndpoint(
+        val regionHandle: Long,
+        val simIp: String,
+        val simPort: Int
+    )
+
+    /**
+     * Decodes `EnableSimulator` (Low 151 / 0xFFFF0097, Unencoded):
+     * SimulatorInfo block: Handle (U64 LE, 8B) + IP (IPADDR network order, 4B) + Port (IPPORT/U16 LE, 2B).
+     */
+    fun parseEnableSimulator(bytes: ByteArray): ParsedEnableSimulator? =
+        parseEnableSimulator(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseEnableSimulator(buf: ByteBuffer): ParsedEnableSimulator? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 14) return null
+        val handle = buf.long
+        val b0 = buf.get().toInt() and 0xFF
+        val b1 = buf.get().toInt() and 0xFF
+        val b2 = buf.get().toInt() and 0xFF
+        val b3 = buf.get().toInt() and 0xFF
+        val simIp = "$b0.$b1.$b2.$b3"
+        val simPort = buf.short.toInt() and 0xFFFF
+        if (simPort !in 1..65535) return null
+        return ParsedEnableSimulator(regionHandle = handle, simIp = simIp, simPort = simPort)
+    }
+
+    fun buildEnableSimulator(regionHandle: Long, simIp: String, simPort: Int): ByteArray {
+        val octets = simIp.trim().split('.')
+        val ipBytes = ByteArray(4) { idx ->
+            (octets.getOrNull(idx)?.toIntOrNull()?.coerceIn(0, 255) ?: 0).toByte()
+        }
+        val buf = ByteBuffer.allocate(14).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putLong(regionHandle)
+        buf.put(ipBytes)
+        buf.putShort((simPort and 0xFFFF).toShort())
+        return buf.array()
+    }
+
+    fun buildDisableSimulator(): ByteArray = ByteArray(0)
+
+    fun parseTeleportProgress(bytes: ByteArray): ParsedTeleportProgress? =
+        parseTeleportProgress(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseTeleportProgress(buf: ByteBuffer): ParsedTeleportProgress? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 21) return null
+        val agentId = readUuid(buf)
+        val teleportFlags = buf.int
+        val msgLen = buf.get().toInt() and 0xFF
+        val message = readCString(buf, msgLen)
+        return ParsedTeleportProgress(agentId = agentId, teleportFlags = teleportFlags, message = message)
+    }
+
+    fun parseTeleportFailed(bytes: ByteArray): ParsedTeleportFailed? =
+        parseTeleportFailed(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseTeleportFailed(buf: ByteBuffer): ParsedTeleportFailed? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 17) return null
+        val agentId = readUuid(buf)
+        val reasonLen = buf.get().toInt() and 0xFF
+        val reason = readCString(buf, reasonLen)
+        val alerts = mutableListOf<String>()
+        if (buf.remaining() >= 1) {
+            val alertCount = buf.get().toInt() and 0xFF
+            repeat(alertCount) {
+                if (buf.remaining() >= 1) {
+                    val msgLen = buf.get().toInt() and 0xFF
+                    val alertMsg = readCString(buf, msgLen)
+                    if (alertMsg.isNotBlank()) alerts.add(alertMsg)
+                    if (buf.remaining() >= 1) {
+                        val extraLen = buf.get().toInt() and 0xFF
+                        readCString(buf, extraLen)
+                    }
+                }
+            }
+        }
+        return ParsedTeleportFailed(
+            agentId = agentId,
+            reason = reason.ifBlank { alerts.firstOrNull() ?: "Teleport failed" },
+            alertMessages = alerts
+        )
+    }
+
+    fun parseTeleportLocal(bytes: ByteArray): ParsedTeleportLocal? =
+        parseTeleportLocal(ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN))
+
+    fun parseTeleportLocal(buf: ByteBuffer): ParsedTeleportLocal? {
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        if (buf.remaining() < 48) return null
+        val agentId = readUuid(buf)
+        val locationId = buf.int
+        val position = Vec3(buf.float, buf.float, buf.float)
+        val lookAt = Vec3(buf.float, buf.float, buf.float)
+        val teleportFlags = buf.int
+        return ParsedTeleportLocal(
+            agentId = agentId,
+            locationId = locationId,
+            position = position,
+            lookAt = lookAt,
+            teleportFlags = teleportFlags
+        )
+    }
+
     fun buildTeleportLocationRequest(
         agentId: UUID,
         sessionId: UUID,
@@ -520,6 +698,60 @@ object LludpPackets {
         buf.putLong(regionHandle)
         putVec3(buf, position)
         putVec3(buf, lookAt)
+        return buf.array()
+    }
+
+    /**
+     * Builds `TeleportLandmarkRequest` (Low 65 / 0xFFFF0041):
+     * Info block: AgentID (16B UUID) + SessionID (16B UUID) + LandmarkID (16B UUID).
+     */
+    fun buildTeleportLandmarkRequest(
+        agentId: UUID,
+        sessionId: UUID,
+        landmarkId: UUID
+    ): ByteArray {
+        val buf = ByteBuffer.allocate(48).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, agentId)
+        putUuid(buf, sessionId)
+        putUuid(buf, landmarkId)
+        return buf.array()
+    }
+
+    /**
+     * Builds a Second Life / OpenSimulator Home Teleport request (`TeleportLandmarkRequest` with
+     * `UUID(0L, 0L)` as `LandmarkID`, per canonical `message_template.msg`).
+     */
+    fun buildTeleportHomeRequest(
+        agentId: UUID,
+        sessionId: UUID
+    ): ByteArray = buildTeleportLandmarkRequest(agentId, sessionId, UUID(0L, 0L))
+
+    /**
+     * Builds `MapNameRequest` (Low 408 / 0xFFFF0198):
+     * AgentData: AgentID (16B) + SessionID (16B) + Flags (U32 LE) + EstateID (U32 LE) + Godlike (BOOL 1B)
+     * NameData: Name (Variable 1 null-terminated UTF-8 string).
+     */
+    fun buildMapNameRequest(
+        agentId: UUID,
+        sessionId: UUID,
+        name: String,
+        flags: Int = 0,
+        estateId: Int = 0,
+        godlike: Boolean = false
+    ): ByteArray {
+        val trimmed = name.trim()
+        val rawUtf8 = trimmed.toByteArray(Charsets.UTF_8)
+        val cappedLen = rawUtf8.size.coerceAtMost(254)
+        val cStrLen = cappedLen + 1 // null terminator
+        val buf = ByteBuffer.allocate(16 + 16 + 4 + 4 + 1 + 1 + cStrLen).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, agentId)
+        putUuid(buf, sessionId)
+        buf.putInt(flags)
+        buf.putInt(estateId)
+        buf.put(if (godlike) 1.toByte() else 0.toByte())
+        buf.put(cStrLen.toByte())
+        buf.put(rawUtf8, 0, cappedLen)
+        buf.put(0.toByte())
         return buf.array()
     }
 
@@ -583,6 +815,11 @@ object LludpPackets {
         putUuid(buf, sessionId)
         return buf.array()
     }
+
+    /**
+     * Builds `CloseCircuit` (Fixed `0xFFFFFFFD`, `Unencoded` — empty body, never zerocoded).
+     */
+    fun buildCloseCircuit(): ByteArray = ByteArray(0)
 
     fun buildAgentWearablesRequest(agentId: UUID, sessionId: UUID): ByteArray {
         val buf = ByteBuffer.allocate(32).order(ByteOrder.LITTLE_ENDIAN)

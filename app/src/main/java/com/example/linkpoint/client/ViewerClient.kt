@@ -10,6 +10,8 @@ import com.example.linkpoint.designsystem.DockToolId
 import com.example.linkpoint.designsystem.JoystickSide
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.designsystem.UiDensity
+import com.example.linkpoint.protocol.LludpPackets.NeighborSimulatorEndpoint
+import com.example.linkpoint.protocol.SimulatorFeatures
 import com.example.linkpoint.scene.CameraMode
 import com.example.linkpoint.scene.EnvironmentPreset
 import com.example.linkpoint.scene.HudHitResult
@@ -85,6 +87,11 @@ interface ViewerClient {
     fun searchMapRegions(query: String)
     fun teleportToRegion(regionName: String, x: Int, y: Int, z: Int)
     fun teleportHome()
+    fun teleportToLandmark(itemOrAssetId: UUID, name: String = "Landmark")
+    fun openSlurl(slurl: String)
+    fun refreshSimulatorFeatures() {}
+    fun getSimulatorFeatures(): SimulatorFeatures? = null
+    fun getNeighborSimulators(): Map<Long, NeighborSimulatorEndpoint> = emptyMap()
     fun saveCurrentLandmark(name: String)
     fun deleteLandmark(landmarkId: String)
     fun toggleInventoryFolder(folderId: UUID)
