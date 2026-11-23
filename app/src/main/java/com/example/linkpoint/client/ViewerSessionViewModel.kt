@@ -20,7 +20,9 @@ import com.example.linkpoint.designsystem.JoystickSide
 import com.example.linkpoint.designsystem.PersonalDesignState
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.designsystem.UiDensity
+import com.example.linkpoint.protocol.AisLinkRequest
 import com.example.linkpoint.protocol.AssetStreamEvent
+import com.example.linkpoint.protocol.AvatarTextureIndex
 import com.example.linkpoint.protocol.CapabilityManager
 import com.example.linkpoint.protocol.CapsAttachmentTransform
 import com.example.linkpoint.protocol.CapsEvent
@@ -33,7 +35,11 @@ import com.example.linkpoint.protocol.LoginRequestParams
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
+import com.example.linkpoint.protocol.SlAssetType
 import com.example.linkpoint.protocol.SlBinaryParsers
+import com.example.linkpoint.protocol.SlFolderType
+import com.example.linkpoint.protocol.SlInventoryType
+import com.example.linkpoint.protocol.SlWearableType
 import com.example.linkpoint.protocol.XmlRpcLoginClient
 import com.example.linkpoint.render.LinkpointGlRenderer
 import com.example.linkpoint.render.RenderSceneSnapshot
@@ -59,7 +65,9 @@ import com.example.linkpoint.store.ImConversation
 import com.example.linkpoint.store.InventoryEntry
 import com.example.linkpoint.store.MapRegionTile
 import com.example.linkpoint.store.NearbyAvatarInfo
+import com.example.linkpoint.store.NotecardViewerState
 import com.example.linkpoint.store.ScriptDialogPrompt
+import com.example.linkpoint.store.TexturePreviewState
 import com.example.linkpoint.store.ViewerState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -72,6 +80,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
@@ -101,6 +110,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private var terrain = LocalSandboxBuilder.buildTerrain()
     private val allSceneObjects = LinkedHashMap<Int, SceneObject>()
     private val manualHudAttachments = LinkedHashMap<Int, SceneObject>()
+    private val nextManualAttachmentLocalId = AtomicInteger(9200)
+    private val wornWearablesByType = ConcurrentHashMap<Int, UUID>()
+    private val cofLinksByTargetItemId = ConcurrentHashMap<UUID, UUID>()
+    @Volatile private var currentCofFolderId: UUID? = null
     private val capsAttachmentOverridesByUuid = ConcurrentHashMap<UUID, CapsAttachmentTransform>()
     private val capsAttachmentOverridesByLocalId = ConcurrentHashMap<Int, CapsAttachmentTransform>()
     private val avatars = LinkedHashMap<UUID, AvatarEntity>()
@@ -242,13 +255,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         val yawRad = 2f * atan2(evt.rotation.z, evt.rotation.w)
                         val heightM = evt.scale.z.takeIf { it in 1.1f..2.8f } ?: existing?.heightMeters ?: 1.82f
                         val baked = evt.textureEntry
-                        val headTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HEAD] ?: existing?.bakedHeadTextureId
-                        val upperTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_UPPER] ?: existing?.bakedUpperTextureId
-                        val lowerTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_LOWER] ?: existing?.bakedLowerTextureId
-                        val eyesTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_EYES] ?: existing?.bakedEyesTextureId
-                        val hairTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HAIR] ?: existing?.bakedHairTextureId
+                        val mergedBakes = AvatarTextureIndex.extractBakedTextures(
+                            baked,
+                            existing?.effectiveBakedTextures().orEmpty()
+                        )
+                        val headTex = mergedBakes[AvatarTextureIndex.HeadBaked] ?: existing?.bakedHeadTextureId
+                        val upperTex = mergedBakes[AvatarTextureIndex.UpperBaked] ?: existing?.bakedUpperTextureId
+                        val lowerTex = mergedBakes[AvatarTextureIndex.LowerBaked] ?: existing?.bakedLowerTextureId
+                        val eyesTex = mergedBakes[AvatarTextureIndex.EyesBaked] ?: existing?.bakedEyesTextureId
+                        val hairTex = mergedBakes[AvatarTextureIndex.HairBaked] ?: existing?.bakedHairTextureId
 
-                        listOfNotNull(headTex, upperTex, lowerTex, eyesTex, hairTex, baked.defaultTextureId)
+                        (mergedBakes.values + listOfNotNull(baked.defaultTextureId))
                             .forEach { assetManager.requestTexture(it, highPriority = true) }
 
                         val updatedAvatar = (existing ?: AvatarEntity(
@@ -270,7 +287,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             bakedUpperTextureId = upperTex,
                             bakedLowerTextureId = lowerTex,
                             bakedEyesTextureId = eyesTex,
-                            bakedHairTextureId = hairTex
+                            bakedHairTextureId = hairTex,
+                            bakedTextures = mergedBakes
                         )
                         avatars[evt.agentId] = updatedAvatar
 
@@ -303,14 +321,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         val matchingAvatar = avatars.values.firstOrNull { it.localId == evt.localId }
                         if (matchingAvatar != null) {
                             val te = evt.textureEntry
-                            val headTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_HEAD) ?: matchingAvatar.bakedHeadTextureId
-                            val upperTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_UPPER) ?: matchingAvatar.bakedUpperTextureId
-                            val lowerTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_LOWER) ?: matchingAvatar.bakedLowerTextureId
-                            val eyesTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_EYES) ?: matchingAvatar.bakedEyesTextureId
-                            val hairTex = te?.faceTextures?.get(SlBinaryParsers.BAKE_FACE_HAIR) ?: matchingAvatar.bakedHairTextureId
+                            val mergedBakes = AvatarTextureIndex.extractBakedTextures(
+                                te,
+                                matchingAvatar.effectiveBakedTextures()
+                            )
+                            val headTex = mergedBakes[AvatarTextureIndex.HeadBaked] ?: matchingAvatar.bakedHeadTextureId
+                            val upperTex = mergedBakes[AvatarTextureIndex.UpperBaked] ?: matchingAvatar.bakedUpperTextureId
+                            val lowerTex = mergedBakes[AvatarTextureIndex.LowerBaked] ?: matchingAvatar.bakedLowerTextureId
+                            val eyesTex = mergedBakes[AvatarTextureIndex.EyesBaked] ?: matchingAvatar.bakedEyesTextureId
+                            val hairTex = mergedBakes[AvatarTextureIndex.HairBaked] ?: matchingAvatar.bakedHairTextureId
                             if (te != null) {
-                                listOfNotNull(headTex, upperTex, lowerTex, eyesTex, hairTex)
-                                    .forEach { assetManager.requestTexture(it, highPriority = true) }
+                                mergedBakes.values.forEach { assetManager.requestTexture(it, highPriority = true) }
                             }
 
                             val isActivelySteeringSelf = matchingAvatar.isSelf && isSelfActivelySteering()
@@ -326,7 +347,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                     bakedUpperTextureId = upperTex,
                                     bakedLowerTextureId = lowerTex,
                                     bakedEyesTextureId = eyesTex,
-                                    bakedHairTextureId = hairTex
+                                    bakedHairTextureId = hairTex,
+                                    bakedTextures = mergedBakes
                                 )
                                 if (matchingAvatar.isSelf) {
                                     lludpEngine.avatarPos = evt.position
@@ -345,7 +367,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                     bakedUpperTextureId = upperTex,
                                     bakedLowerTextureId = lowerTex,
                                     bakedEyesTextureId = eyesTex,
-                                    bakedHairTextureId = hairTex
+                                    bakedHairTextureId = hairTex,
+                                    bakedTextures = mergedBakes
                                 )
                             }
                             refreshNearbyRadar()
@@ -375,13 +398,18 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     }
                     is SimEvent.AvatarAppearanceReceived -> {
                         val baked = evt.bakedTextures
-                        val headTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HEAD]
-                        val upperTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_UPPER]
-                        val lowerTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_LOWER]
-                        val eyesTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_EYES]
-                        val hairTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HAIR]
+                        val existing = avatars[evt.agentId]
+                        val mergedBakes = AvatarTextureIndex.extractBakedTextures(
+                            baked,
+                            existing?.effectiveBakedTextures().orEmpty()
+                        )
+                        val headTex = mergedBakes[AvatarTextureIndex.HeadBaked]
+                        val upperTex = mergedBakes[AvatarTextureIndex.UpperBaked]
+                        val lowerTex = mergedBakes[AvatarTextureIndex.LowerBaked]
+                        val eyesTex = mergedBakes[AvatarTextureIndex.EyesBaked]
+                        val hairTex = mergedBakes[AvatarTextureIndex.HairBaked]
 
-                        listOfNotNull(headTex, upperTex, lowerTex, eyesTex, hairTex, baked.defaultTextureId)
+                        (mergedBakes.values + listOfNotNull(baked.defaultTextureId))
                             .forEach { assetManager.requestTexture(it, highPriority = true) }
                         baked.faceTextures.values.forEach { assetManager.requestTexture(it, highPriority = true) }
 
@@ -391,7 +419,6 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             return minS + norm * (maxS - minS)
                         }
 
-                        val existing = avatars[evt.agentId]
                         val isSelf = evt.agentId == selfAgentId
                         val base = existing ?: AvatarEntity(
                             agentId = evt.agentId,
@@ -412,6 +439,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             bakedLowerTextureId = lowerTex ?: base.bakedLowerTextureId,
                             bakedEyesTextureId = eyesTex ?: base.bakedEyesTextureId,
                             bakedHairTextureId = hairTex ?: base.bakedHairTextureId,
+                            bakedTextures = mergedBakes,
                             visualParamsCount = evt.visualParams.size
                         )
                         if (!isSelf && !knownNames.containsKey(evt.agentId)) {
@@ -442,6 +470,29 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         }
                     }
                     is SimEvent.AgentWearablesReceived -> {
+                        val zeroUuid = UUID(0L, 0L)
+                        evt.wearableItems.forEach { (wType, itemId, _) ->
+                            if (itemId != zeroUuid) {
+                                wornWearablesByType[wType] = itemId
+                            }
+                        }
+                        val wornItemIds = wornWearablesByType.values.toSet()
+                        if (wornItemIds.isNotEmpty()) {
+                            _state.update { s ->
+                                s.copy(
+                                    inventoryEntries = s.inventoryEntries.map { entry ->
+                                        val matchedType = evt.wearableItems.firstOrNull { it.second == entry.id }?.first
+                                        if (matchedType != null) {
+                                            entry.copy(isWorn = true, wearableType = matchedType)
+                                        } else if ((entry.assetType == SlWearableType.ASSET_TYPE_CLOTHING || entry.assetType == SlWearableType.ASSET_TYPE_BODYPART) && entry.isWorn && entry.id !in wornItemIds) {
+                                            entry.copy(isWorn = false)
+                                        } else {
+                                            entry
+                                        }
+                                    }
+                                )
+                            }
+                        }
                         avatars[selfAgentId]?.let { selfAv ->
                             avatars[selfAgentId] = selfAv.copy(wearableCount = evt.wearableCount)
                         }
@@ -603,7 +654,27 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     }
                     is AssetStreamEvent.TextureReady -> {
                         renderer.putStreamedTexture(evt.textureId, evt.bitmap)
-                        _state.update { it.copy(textureRevision = it.textureRevision + 1) }
+                        _state.update { s ->
+                            val nextPreview = if (s.activeTexturePreview?.textureId == evt.textureId) {
+                                s.activeTexturePreview.copy(isLoading = false, error = null)
+                            } else {
+                                s.activeTexturePreview
+                            }
+                            s.copy(
+                                textureRevision = s.textureRevision + 1,
+                                activeTexturePreview = nextPreview
+                            )
+                        }
+                    }
+                    is AssetStreamEvent.NotecardReady -> {
+                        _state.update { s ->
+                            val nextNotecard = if (s.activeNotecard?.assetId == evt.assetId) {
+                                s.activeNotecard.copy(body = evt.text, isLoading = false, error = null)
+                            } else {
+                                s.activeNotecard
+                            }
+                            s.copy(activeNotecard = nextNotecard)
+                        }
                     }
                     is AssetStreamEvent.DisplayNamesResolved -> {
                         evt.names.forEach { (id, name) ->
@@ -1056,6 +1127,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             terrain = TerrainGrid(gridSize = 65, waterHeight = 20.0f)
             allSceneObjects.clear()
             manualHudAttachments.clear()
+            wornWearablesByType.clear()
+            cofLinksByTargetItemId.clear()
+            currentCofFolderId = null
             capsAttachmentOverridesByUuid.clear()
             capsAttachmentOverridesByLocalId.clear()
             avatars.clear()
@@ -1074,13 +1148,20 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 isSelf = true
             )
 
+            val cofFolder = response.inventorySkeleton.firstOrNull { f ->
+                f.typeDefault == SlFolderType.CURRENT_OUTFIT.code ||
+                    f.name.equals("Current Outfit", ignoreCase = true)
+            }
+            currentCofFolderId = cofFolder?.folderId
+
             val invEntries = response.inventorySkeleton.map { f ->
                 InventoryEntry(
                     id = f.folderId,
                     parentId = f.parentId,
                     name = f.name,
                     isFolder = true,
-                    assetType = f.typeDefault
+                    assetType = f.typeDefault,
+                    folderType = f.typeDefault
                 )
             }
 
@@ -1089,6 +1170,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             lludpEngine.connect(response)
             if (capsResult.capabilities.containsKey("AttachmentResources")) {
                 viewModelScope.launch { capabilityManager.fetchAttachmentResources() }
+            }
+            if (capabilityManager.hasAis3Support()) {
+                syncCurrentOutfitFolder()
             }
 
             _state.update { s ->
@@ -1103,6 +1187,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     ),
                     avatarPosition = Vec3(128f, 128f, 23f),
                     inventoryEntries = invEntries,
+                    currentOutfitFolderId = currentCofFolderId,
+                    cofVersion = cofFolder?.version ?: 0,
+                    activeNotecard = null,
+                    activeTexturePreview = null,
                     localChat = listOf(
                         ChatMessage(speaker = grid.name, text = response.message, isSystem = true),
                         ChatMessage(
@@ -1158,6 +1246,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         LocalSandboxBuilder.buildWorldObjects(terrain).forEach { allSceneObjects[it.localId] = it }
 
         manualHudAttachments.clear()
+        wornWearablesByType.clear()
+        cofLinksByTargetItemId.clear()
+        currentCofFolderId = null
         capsAttachmentOverridesByUuid.clear()
         capsAttachmentOverridesByLocalId.clear()
         knownNames.clear()
@@ -1175,19 +1266,223 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         selfAvatarName = self.displayName
 
         val rootId = UUID.fromString("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-        val hudsFolder = UUID.fromString("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        val bodyPartsFolder = UUID.fromString("b1111111-1111-4111-8111-111111111111")
+        val clothingFolder = UUID.fromString("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+        val outerwearFolder = UUID.fromString("d1111111-1111-4111-8111-111111111111")
+        val everydayLayersFolder = UUID.fromString("d2222222-2222-4222-8222-222222222222")
+        val objectsFolder = UUID.fromString("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
+        val hudsSubfolder = UUID.fromString("b2222222-2222-4222-8222-222222222222")
+        val accessoriesSubfolder = UUID.fromString("b3333333-3333-4333-8333-333333333333")
+        val notecardsFolder = UUID.fromString("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
+        val texturesFolder = UUID.fromString("ffffffff-ffff-4fff-8fff-ffffffffffff")
         val landmarksFolder = UUID.fromString("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
-        val outfitsFolder = UUID.fromString("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
+
+        val shapeItemId = UUID.fromString("10000000-0000-4000-8000-000000000001")
+        val skinItemId = UUID.fromString("10000000-0000-4000-8000-000000000002")
+        val eyesItemId = UUID.fromString("10000000-0000-4000-8000-000000000003")
+        val hairItemId = UUID.fromString("10000000-0000-4000-8000-000000000004")
+        val jacketItemId = UUID.fromString("20000000-0000-4000-8000-000000000001")
+        val coatItemId = UUID.fromString("20000000-0000-4000-8000-000000000002")
+        val pantsItemId = UUID.fromString("20000000-0000-4000-8000-000000000003")
+        val bootsItemId = UUID.fromString("20000000-0000-4000-8000-000000000004")
+        val universalTattooItemId = UUID.fromString("20000000-0000-4000-8000-000000000005")
+
+        val welcomeNotecardAssetId = UUID.fromString("70000000-0000-4000-8000-000000000001")
+        val lslGuideNotecardAssetId = UUID.fromString("70000000-0000-4000-8000-000000000002")
+        val mosaicTextureAssetId = UUID.fromString("80000000-0000-4000-8000-000000000001")
+        val neonGridTextureAssetId = UUID.fromString("80000000-0000-4000-8000-000000000002")
+
+        seedSandboxPreviewAssets(
+            welcomeNotecardAssetId = welcomeNotecardAssetId,
+            lslGuideNotecardAssetId = lslGuideNotecardAssetId,
+            mosaicTextureAssetId = mosaicTextureAssetId,
+            neonGridTextureAssetId = neonGridTextureAssetId
+        )
+
+        wornWearablesByType[SlWearableType.SHAPE.code] = shapeItemId
+        wornWearablesByType[SlWearableType.SKIN.code] = skinItemId
+        wornWearablesByType[SlWearableType.EYES.code] = eyesItemId
+        wornWearablesByType[SlWearableType.JACKET.code] = jacketItemId
+        wornWearablesByType[SlWearableType.PANTS.code] = pantsItemId
 
         val sandboxInventory = listOf(
             InventoryEntry(rootId, UUID(0L, 0L), "My Inventory (Local Sandbox)", true, 8),
-            InventoryEntry(hudsFolder, rootId, "Avatar HUD Attachments", true, 6),
+            InventoryEntry(bodyPartsFolder, rootId, "Body Parts", true, 13),
+            InventoryEntry(clothingFolder, rootId, "Clothing", true, 5),
+            InventoryEntry(outerwearFolder, clothingFolder, "Outerwear", true, 5),
+            InventoryEntry(everydayLayersFolder, clothingFolder, "Everyday Layers", true, 5),
+            InventoryEntry(objectsFolder, rootId, "Objects & HUDs", true, 6),
+            InventoryEntry(hudsSubfolder, objectsFolder, "Avatar HUD Attachments", true, 6),
+            InventoryEntry(accessoriesSubfolder, objectsFolder, "3D Accessories", true, 6),
+            InventoryEntry(notecardsFolder, rootId, "Notecards", true, 7),
+            InventoryEntry(texturesFolder, rootId, "Textures", true, 0),
             InventoryEntry(landmarksFolder, rootId, "Landmarks", true, 3),
-            InventoryEntry(outfitsFolder, rootId, "Outfits & Accessories", true, 5),
-            InventoryEntry(manualHudAttachments[9032]!!.uuid, hudsFolder, "AO & Flight Booster HUD", false, 6, isWorn = true, attachmentPoint = 32),
-            InventoryEntry(manualHudAttachments[9034]!!.uuid, hudsFolder, "EEP Atmosphere HUD", false, 6, isWorn = true, attachmentPoint = 34),
-            InventoryEntry(manualHudAttachments[9036]!!.uuid, hudsFolder, "Avatar Outfit & Tint HUD", false, 6, isWorn = true, attachmentPoint = 36),
-            InventoryEntry(UUID.randomUUID(), outfitsFolder, "Obsidian Telemetry Jacket", false, 5, isWorn = true, attachmentPoint = 5),
+
+            // System Body Parts (assetType = 13)
+            InventoryEntry(
+                id = shapeItemId,
+                parentId = bodyPartsFolder,
+                name = "Cybernetic Explorer Shape",
+                isFolder = false,
+                assetType = 13,
+                isWorn = true,
+                description = "Balanced Bento proportion shape",
+                invType = 18,
+                flags = SlWearableType.SHAPE.code,
+                wearableType = SlWearableType.SHAPE.code
+            ),
+            InventoryEntry(
+                id = skinItemId,
+                parentId = bodyPartsFolder,
+                name = "Warm Alabaster Skin",
+                isFolder = false,
+                assetType = 13,
+                isWorn = true,
+                description = "Baked-on-Mesh system skin layer",
+                invType = 18,
+                flags = SlWearableType.SKIN.code,
+                wearableType = SlWearableType.SKIN.code
+            ),
+            InventoryEntry(
+                id = eyesItemId,
+                parentId = bodyPartsFolder,
+                name = "Luminous Horizon Eyes",
+                isFolder = false,
+                assetType = 13,
+                isWorn = true,
+                description = "Deep cyan iris system eyes",
+                invType = 18,
+                flags = SlWearableType.EYES.code,
+                wearableType = SlWearableType.EYES.code
+            ),
+            InventoryEntry(
+                id = hairItemId,
+                parentId = bodyPartsFolder,
+                name = "Cobalt Breeze System Hair",
+                isFolder = false,
+                assetType = 13,
+                isWorn = false,
+                description = "System hair & brow base",
+                invType = 18,
+                flags = SlWearableType.HAIR.code,
+                wearableType = SlWearableType.HAIR.code
+            ),
+
+            // System Clothing (assetType = 5) inside nested subfolders
+            InventoryEntry(
+                id = jacketItemId,
+                parentId = outerwearFolder,
+                name = "Obsidian Telemetry Jacket",
+                isFolder = false,
+                assetType = 5,
+                isWorn = true,
+                description = "High-collar system jacket layer",
+                invType = 18,
+                flags = SlWearableType.JACKET.code,
+                wearableType = SlWearableType.JACKET.code
+            ),
+            InventoryEntry(
+                id = coatItemId,
+                parentId = outerwearFolder,
+                name = "Stormshield Expedition Coat",
+                isFolder = false,
+                assetType = 5,
+                isWorn = false,
+                description = "Weatherproof overcoat (replaces Jacket slot)",
+                invType = 18,
+                flags = SlWearableType.JACKET.code,
+                wearableType = SlWearableType.JACKET.code
+            ),
+            InventoryEntry(
+                id = pantsItemId,
+                parentId = everydayLayersFolder,
+                name = "Carbon Weave Cargo Pants",
+                isFolder = false,
+                assetType = 5,
+                isWorn = true,
+                description = "Reinforced system pants layer",
+                invType = 18,
+                flags = SlWearableType.PANTS.code,
+                wearableType = SlWearableType.PANTS.code
+            ),
+            InventoryEntry(
+                id = bootsItemId,
+                parentId = everydayLayersFolder,
+                name = "Grid Strider Boots",
+                isFolder = false,
+                assetType = SlAssetType.CLOTHING.code,
+                isWorn = false,
+                description = "All-terrain system footwear",
+                invType = SlInventoryType.WEARABLE.code,
+                flags = SlWearableType.SHOES.code,
+                wearableType = SlWearableType.SHOES.code
+            ),
+            InventoryEntry(
+                id = universalTattooItemId,
+                parentId = everydayLayersFolder,
+                name = "Bakes-on-Mesh Aux Universal Tattoo",
+                isFolder = false,
+                assetType = SlAssetType.CLOTHING.code,
+                isWorn = false,
+                description = "BoM Universal wearable (type 17) targeting Aux1..Aux3 & LeftArm/LeftLeg bakes",
+                invType = SlInventoryType.WEARABLE.code,
+                flags = SlWearableType.UNIVERSAL.code,
+                wearableType = SlWearableType.UNIVERSAL.code
+            ),
+
+            // 3D Objects & HUDs (assetType = 6) inside nested subfolders
+            InventoryEntry(manualHudAttachments[9032]!!.uuid, hudsSubfolder, "AO & Flight Booster HUD", false, 6, isWorn = true, attachmentPoint = 32, invType = 17),
+            InventoryEntry(manualHudAttachments[9034]!!.uuid, hudsSubfolder, "EEP Atmosphere HUD", false, 6, isWorn = true, attachmentPoint = 34, invType = 17),
+            InventoryEntry(manualHudAttachments[9036]!!.uuid, hudsSubfolder, "Avatar Outfit & Tint HUD", false, 6, isWorn = true, attachmentPoint = 36, invType = 17),
+            InventoryEntry(UUID.fromString("60000000-0000-4000-8000-000000000001"), hudsSubfolder, "Tactical Radar Compass HUD", false, 6, isWorn = false, attachmentPoint = 35, description = "Compact mini-compass HUD for Top Center", invType = 17),
+            InventoryEntry(UUID.fromString("60000000-0000-4000-8000-000000000002"), accessoriesSubfolder, "Holo Wrist Communicator", false, 6, isWorn = false, attachmentPoint = 10, description = "3D forearm projector attachment", invType = 6),
+            InventoryEntry(UUID.fromString("60000000-0000-4000-8000-000000000003"), accessoriesSubfolder, "Surveyor Companion Drone", false, 6, isWorn = false, attachmentPoint = 5, description = "Hovering shoulder companion", invType = 6),
+
+            // Notecards (assetType = 7)
+            InventoryEntry(
+                id = UUID.fromString("71000000-0000-4000-8000-000000000001"),
+                parentId = notecardsFolder,
+                name = "Linkpoint Phase 2 Welcome Guide",
+                isFolder = false,
+                assetType = 7,
+                assetId = welcomeNotecardAssetId,
+                description = "Overview of nested folders, wearables, attachments & viewers",
+                invType = 7
+            ),
+            InventoryEntry(
+                id = UUID.fromString("71000000-0000-4000-8000-000000000002"),
+                parentId = notecardsFolder,
+                name = "LSL HUD & Attachment Slot Reference",
+                isFolder = false,
+                assetType = 7,
+                assetId = lslGuideNotecardAssetId,
+                description = "HUD slots 31–38 & RezSingleAttachment 0x80 Add flag guide",
+                invType = 7
+            ),
+
+            // Textures (assetType = 0)
+            InventoryEntry(
+                id = UUID.fromString("81000000-0000-4000-8000-000000000001"),
+                parentId = texturesFolder,
+                name = "Archipelago Plaza Mosaic",
+                isFolder = false,
+                assetType = 0,
+                assetId = mosaicTextureAssetId,
+                description = "Architectural stone & cyan inlay diffuse map",
+                invType = 0
+            ),
+            InventoryEntry(
+                id = UUID.fromString("81000000-0000-4000-8000-000000000002"),
+                parentId = texturesFolder,
+                name = "Neon Telemetry Calibration Grid",
+                isFolder = false,
+                assetType = 0,
+                assetId = neonGridTextureAssetId,
+                description = "High-contrast UV & alpha alignment grid",
+                invType = 0
+            ),
+
+            // Landmarks (assetType = 3)
             InventoryEntry(UUID.randomUUID(), landmarksFolder, "Linkpoint Welcome Deck", false, 3),
             InventoryEntry(UUID.randomUUID(), landmarksFolder, "Harbor Signal Spire", false, 3)
         )
@@ -1207,7 +1502,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 isFlying = false,
                 isSitting = false,
                 inventoryEntries = sandboxInventory,
-                expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
+                expandedFolderIds = setOf(rootId, clothingFolder, outerwearFolder, objectsFolder, hudsSubfolder, notecardsFolder, texturesFolder),
+                activeNotecard = null,
+                activeTexturePreview = null,
                 mapRegions = sandboxMap,
                 localChat = listOf(
                     ChatMessage(
@@ -1234,6 +1531,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         renderer.clearStreamedAssets()
         allSceneObjects.clear()
         manualHudAttachments.clear()
+        wornWearablesByType.clear()
         capsAttachmentOverridesByUuid.clear()
         capsAttachmentOverridesByLocalId.clear()
         pressedMoveKeys.clear()
@@ -1245,6 +1543,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             s.copy(
                 connection = ConnectionState.Disconnected,
                 activeFloater = null,
+                activeNotecard = null,
+                activeTexturePreview = null,
                 selectedObject = null,
                 selectedAvatarId = null,
                 projectedNametags = emptyList(),
@@ -2001,6 +2301,33 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch { cacheRepo.deleteLandmark(landmarkId) }
     }
 
+    override fun isAis3CofActive(): Boolean =
+        capabilityManager.hasAis3Support() && currentCofFolderId != null
+
+    override fun syncCurrentOutfitFolder() {
+        if (!capabilityManager.hasAis3Support()) return
+        viewModelScope.launch {
+            val fetched = capabilityManager.fetchCofLinks(currentCofFolderId)
+            if (fetched.isNotEmpty()) {
+                val resolvedCofFolder = fetched.folders.firstOrNull { it.isCurrentOutfitFolder }
+                    ?: fetched.folders.firstOrNull()
+                if (resolvedCofFolder != null && currentCofFolderId == null) {
+                    currentCofFolderId = resolvedCofFolder.folderId
+                }
+                fetched.links.forEach { link ->
+                    cofLinksByTargetItemId[link.linkedId] = link.linkItemId
+                }
+                val nextVer = currentCofFolderId?.let { fetched.categoryVersions[it] } ?: resolvedCofFolder?.version
+                _state.update { s ->
+                    s.copy(
+                        currentOutfitFolderId = currentCofFolderId ?: s.currentOutfitFolderId,
+                        cofVersion = nextVer ?: s.cofVersion
+                    )
+                }
+            }
+        }
+    }
+
     override fun toggleInventoryFolder(folderId: UUID) {
         val currentlyExpanded = folderId in _state.value.expandedFolderIds
         _state.update { s ->
@@ -2011,12 +2338,47 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             viewModelScope.launch {
                 val fetched = capabilityManager.fetchFolderContents(folderId, selfAgentId)
                 if (fetched.isNotEmpty()) {
+                    if (folderId == currentCofFolderId) {
+                        fetched.links.forEach { link ->
+                            cofLinksByTargetItemId[link.linkedId] = link.linkItemId
+                        }
+                    }
                     _state.update { s ->
                         val existingIds = s.inventoryEntries.map { it.id }.toSet()
-                        val newNodes = fetched.filterNot { it.itemId in existingIds }.map {
-                            InventoryEntry(it.itemId, it.parentId, it.name, false, it.assetType)
+                        val newFolders = fetched.folders.filterNot { it.folderId in existingIds }.map { folder ->
+                            if (folder.isCurrentOutfitFolder && currentCofFolderId == null) {
+                                currentCofFolderId = folder.folderId
+                            }
+                            InventoryEntry(
+                                id = folder.folderId,
+                                parentId = folder.parentId,
+                                name = folder.name,
+                                isFolder = true,
+                                assetType = folder.typeDefault,
+                                folderType = folder.typeDefault
+                            )
                         }
-                        s.copy(inventoryEntries = s.inventoryEntries + newNodes)
+                        val wornItemIds = wornWearablesByType.values.toSet() + cofLinksByTargetItemId.keys
+                        val newItems = fetched.items.filterNot { it.itemId in existingIds }.map { item ->
+                            val wType = item.wearableType
+                            InventoryEntry(
+                                id = item.itemId,
+                                parentId = item.parentId,
+                                name = item.name,
+                                isFolder = false,
+                                assetType = item.assetType,
+                                isWorn = item.itemId in wornItemIds,
+                                assetId = item.assetId,
+                                description = item.description,
+                                invType = item.invType,
+                                flags = item.flags,
+                                wearableType = wType
+                            )
+                        }
+                        s.copy(
+                            inventoryEntries = s.inventoryEntries + newFolders + newItems,
+                            currentOutfitFolderId = currentCofFolderId ?: s.currentOutfitFolderId
+                        )
                     }
                 }
             }
@@ -2025,44 +2387,518 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
     override fun toggleWearInventoryItem(itemId: UUID, targetHudSlot: Int?) {
         val entry = _state.value.inventoryEntries.firstOrNull { it.id == itemId } ?: return
-        val nextWorn = !entry.isWorn
-        val slot = targetHudSlot ?: if (entry.attachmentPoint > 0) entry.attachmentPoint else HudAttachmentPoint.TOP_CENTER.slotId
+        if (entry.isFolder) {
+            toggleInventoryFolder(itemId)
+            return
+        }
+        when (entry.assetType) {
+            SlWearableType.ASSET_TYPE_CLOTHING,
+            SlWearableType.ASSET_TYPE_BODYPART -> toggleSystemWearable(entry)
+            SlWearableType.ASSET_TYPE_NOTECARD -> openInventoryNotecard(itemId)
+            SlWearableType.ASSET_TYPE_TEXTURE -> openInventoryTexture(itemId)
+            SlWearableType.ASSET_TYPE_LANDMARK -> teleportToRegion(entry.name, 128, 128, 26)
+            else -> {
+                if (targetHudSlot != null) {
+                    attachObjectFromInventory(itemId, attachmentPoint = targetHudSlot, add = false)
+                } else if (entry.isWorn) {
+                    detachInventoryItem(itemId)
+                } else {
+                    attachObjectFromInventory(itemId, attachmentPoint = entry.attachmentPoint, add = false)
+                }
+            }
+        }
+    }
 
-        if (_state.value.connection is ConnectionState.Connected) {
-            if (nextWorn) lludpEngine.attachInventoryItem(itemId, slot, entry.name)
-            else lludpEngine.detachInventoryItem(itemId)
+    private fun toggleSystemWearable(entry: InventoryEntry) {
+        val wTypeCode = entry.wearableType
+            ?: SlWearableType.resolveWearableType(entry.assetType, entry.flags, entry.name)
+            ?: if (entry.assetType == SlWearableType.ASSET_TYPE_BODYPART) SlWearableType.SHAPE.code else SlWearableType.SHIRT.code
+        val wType = SlWearableType.fromCode(wTypeCode)
+        val isBodyPart = entry.assetType == SlWearableType.ASSET_TYPE_BODYPART || (wType?.isBodyPart == true)
+
+        if (entry.isWorn) {
+            if (isBodyPart) {
+                val slotName = wType?.label ?: "Body part"
+                showToast("$slotName is a required body part — wear another $slotName to replace it")
+                return
+            }
+            wornWearablesByType.remove(wTypeCode)
+            if (_state.value.connection is ConnectionState.Connected) {
+                val udpPayload = wornWearablesByType.entries.map { (wt, id) -> id to wt } + (UUID(0L, 0L) to wTypeCode)
+                val linkToRemove = cofLinksByTargetItemId.remove(entry.id)
+                val cofId = currentCofFolderId
+                if (capabilityManager.hasAis3Support() && cofId != null && linkToRemove != null) {
+                    viewModelScope.launch {
+                        val res = capabilityManager.syncWearableCofOrFallback(
+                            cofFolderId = cofId,
+                            linkToCreate = null,
+                            linkItemIdsToRemove = listOf(linkToRemove),
+                            onUdpFallback = { lludpEngine.sendAgentIsNowWearing(udpPayload) }
+                        )
+                        if (res.updatedCofVersion != null) {
+                            _state.update { it.copy(cofVersion = res.updatedCofVersion) }
+                        }
+                    }
+                } else {
+                    lludpEngine.sendAgentIsNowWearing(udpPayload)
+                }
+            }
+            _state.update { s ->
+                s.copy(
+                    inventoryEntries = s.inventoryEntries.map {
+                        if (it.id == entry.id) it.copy(isWorn = false) else it
+                    }
+                )
+            }
+            avatars[selfAgentId]?.let { selfAv ->
+                avatars[selfAgentId] = selfAv.copy(wearableCount = wornWearablesByType.size)
+            }
+            showToast("Took off ${entry.name}")
+            pushSceneSnapshot()
+        } else {
+            val previousItemId = wornWearablesByType.put(wTypeCode, entry.id)
+            if (_state.value.connection is ConnectionState.Connected) {
+                val udpPayload = wornWearablesByType.entries.map { (wt, id) -> id to wt }
+                val replacedLinkId = previousItemId?.let { cofLinksByTargetItemId.remove(it) }
+                val cofId = currentCofFolderId
+                if (capabilityManager.hasAis3Support() && cofId != null) {
+                    val linkReq = AisLinkRequest(
+                        linkedId = entry.id,
+                        assetType = SlAssetType.LINK,
+                        inventoryType = SlInventoryType.WEARABLE,
+                        name = entry.name,
+                        description = CapabilityManager.buildCofOrderDescription(wTypeCode, 0)
+                    )
+                    viewModelScope.launch {
+                        val res = capabilityManager.syncWearableCofOrFallback(
+                            cofFolderId = cofId,
+                            linkToCreate = linkReq,
+                            linkItemIdsToRemove = listOfNotNull(replacedLinkId),
+                            onUdpFallback = { lludpEngine.sendAgentIsNowWearing(udpPayload) }
+                        )
+                        if (res.createdLinkItemId != null) {
+                            cofLinksByTargetItemId[entry.id] = res.createdLinkItemId
+                        }
+                        if (res.updatedCofVersion != null) {
+                            _state.update { it.copy(cofVersion = res.updatedCofVersion) }
+                        }
+                    }
+                } else {
+                    lludpEngine.sendAgentIsNowWearing(udpPayload)
+                }
+            }
+            _state.update { s ->
+                s.copy(
+                    inventoryEntries = s.inventoryEntries.map {
+                        when {
+                            it.id == entry.id -> it.copy(isWorn = true, wearableType = wTypeCode, attachmentPoint = 0)
+                            previousItemId != null && it.id == previousItemId -> it.copy(isWorn = false)
+                            it.isWorn && (it.assetType == SlWearableType.ASSET_TYPE_CLOTHING || it.assetType == SlWearableType.ASSET_TYPE_BODYPART) &&
+                                (it.wearableType ?: SlWearableType.resolveWearableType(it.assetType, it.flags, it.name)) == wTypeCode ->
+                                it.copy(isWorn = false)
+                            else -> it
+                        }
+                    }
+                )
+            }
+            avatars[selfAgentId]?.let { selfAv ->
+                avatars[selfAgentId] = selfAv.copy(wearableCount = wornWearablesByType.size)
+            }
+            val layerLabel = wType?.label ?: if (isBodyPart) "Body Part" else "Clothing"
+            showToast("Wearing ${entry.name} ($layerLabel)")
+            pushSceneSnapshot()
+        }
+    }
+
+    override fun attachObjectFromInventory(itemId: UUID, attachmentPoint: Int, add: Boolean) {
+        val entry = _state.value.inventoryEntries.firstOrNull { it.id == itemId } ?: return
+        if (entry.isFolder) return
+        if (entry.assetType == SlWearableType.ASSET_TYPE_CLOTHING || entry.assetType == SlWearableType.ASSET_TYPE_BODYPART) {
+            toggleSystemWearable(entry)
+            return
         }
 
-        // Reflect HUD attachment immediately in the Pass-2 OpenGL HUD layer
-        if (slot in 31..38) {
-            val existingHud = manualHudAttachments.values.firstOrNull { it.uuid == itemId }
-            if (nextWorn && existingHud == null) {
-                val id = 9100 + slot
-                manualHudAttachments[id] = SceneObject(
-                    localId = id,
-                    uuid = itemId,
-                    name = entry.name,
-                    description = "Attached from Inventory to Slot $slot",
-                    attachmentPoint = slot,
-                    isFullbright = true,
-                    isScripted = true,
-                    color = ColorRgba(0.10f, 0.16f, 0.24f, 0.90f)
-                )
-            } else if (!nextWorn && existingHud != null) {
-                manualHudAttachments.remove(existingHud.localId)
+        val resolvedPoint = when {
+            attachmentPoint > 0 -> attachmentPoint
+            entry.attachmentPoint > 0 -> entry.attachmentPoint
+            entry.name.contains("HUD", ignoreCase = true) -> HudAttachmentPoint.TOP_CENTER.slotId
+            else -> 0
+        }
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.attachInventoryItem(itemId, resolvedPoint, entry.name, append = add)
+            val cofId = currentCofFolderId
+            if (capabilityManager.hasAis3Support() && cofId != null) {
+                val invType = if (entry.invType == SlInventoryType.ATTACHMENT.code) {
+                    SlInventoryType.ATTACHMENT
+                } else {
+                    SlInventoryType.OBJECT
+                }
+                viewModelScope.launch {
+                    val created = capabilityManager.createCofLink(
+                        cofFolderId = cofId,
+                        targetItemId = itemId,
+                        inventoryType = invType,
+                        name = entry.name,
+                        description = entry.description
+                    )
+                    created.createdLinks.firstOrNull()?.let { cofLinksByTargetItemId[itemId] = it.linkItemId }
+                    if (capabilityManager.hasCofVersionSupport()) {
+                        capabilityManager.incrementCofVersion()?.let { v ->
+                            _state.update { it.copy(cofVersion = v) }
+                        }
+                    }
+                }
             }
+        }
+
+        val replacedIds = mutableSetOf<UUID>()
+        if (!add && resolvedPoint > 0) {
+            _state.value.inventoryEntries.forEach { other ->
+                if (!other.isFolder && other.id != itemId && other.isWorn &&
+                    other.assetType == SlWearableType.ASSET_TYPE_OBJECT &&
+                    other.attachmentPoint == resolvedPoint
+                ) {
+                    replacedIds.add(other.id)
+                }
+            }
+        }
+
+        // Remove any prior HUD proxy for this item or any replaced items on the same slot
+        val toRemoveHudKeys = manualHudAttachments.entries
+            .filter { (_, obj) -> obj.uuid == itemId || obj.uuid in replacedIds }
+            .map { it.key }
+        toRemoveHudKeys.forEach { manualHudAttachments.remove(it) }
+
+        if (resolvedPoint in 31..38) {
+            val localId = nextManualAttachmentLocalId.getAndIncrement()
+            manualHudAttachments[localId] = SceneObject(
+                localId = localId,
+                uuid = itemId,
+                name = entry.name,
+                description = if (add) "Added to HUD Slot $resolvedPoint" else "Attached to HUD Slot $resolvedPoint",
+                attachmentPoint = resolvedPoint,
+                isFullbright = true,
+                isScripted = true,
+                color = ColorRgba(0.10f, 0.16f, 0.24f, 0.90f)
+            )
         }
 
         _state.update { s ->
             s.copy(
                 inventoryEntries = s.inventoryEntries.map {
-                    if (it.id == itemId) it.copy(isWorn = nextWorn, attachmentPoint = if (nextWorn) slot else it.attachmentPoint) else it
+                    when {
+                        it.id == itemId -> it.copy(isWorn = true, attachmentPoint = resolvedPoint)
+                        it.id in replacedIds -> it.copy(isWorn = false)
+                        else -> it
+                    }
                 }
             )
         }
-        showToast(if (nextWorn) "Attached ${entry.name} (Slot $slot)" else "Detached ${entry.name}")
+
+        val actionVerb = if (add) "Added" else "Attached"
+        val pointSuffix = when {
+            resolvedPoint in 31..38 -> " (HUD Slot $resolvedPoint)"
+            resolvedPoint > 0 -> " (Point $resolvedPoint)"
+            else -> ""
+        }
+        showToast("$actionVerb ${entry.name}$pointSuffix")
         pushSceneSnapshot()
     }
+
+    override fun detachInventoryItem(itemId: UUID) {
+        val entry = _state.value.inventoryEntries.firstOrNull { it.id == itemId } ?: return
+        if (!entry.isWorn) return
+        if (entry.assetType == SlWearableType.ASSET_TYPE_CLOTHING || entry.assetType == SlWearableType.ASSET_TYPE_BODYPART) {
+            toggleSystemWearable(entry)
+            return
+        }
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.detachInventoryItem(itemId)
+            val linkToRemove = cofLinksByTargetItemId.remove(itemId)
+            if (capabilityManager.hasAis3Support() && linkToRemove != null) {
+                viewModelScope.launch {
+                    capabilityManager.removeInventoryItem(linkToRemove)
+                    if (capabilityManager.hasCofVersionSupport()) {
+                        capabilityManager.incrementCofVersion()?.let { v ->
+                            _state.update { it.copy(cofVersion = v) }
+                        }
+                    }
+                }
+            }
+        }
+
+        val matchingHudKeys = manualHudAttachments.entries
+            .filter { (_, obj) -> obj.uuid == itemId }
+            .map { it.key }
+        matchingHudKeys.forEach { manualHudAttachments.remove(it) }
+
+        _state.update { s ->
+            s.copy(
+                inventoryEntries = s.inventoryEntries.map {
+                    if (it.id == itemId) it.copy(isWorn = false) else it
+                }
+            )
+        }
+        showToast("Detached ${entry.name}")
+        pushSceneSnapshot()
+    }
+
+    override fun openInventoryNotecard(itemId: UUID) {
+        val entry = _state.value.inventoryEntries.firstOrNull { it.id == itemId && !it.isFolder } ?: return
+        val assetId = entry.assetId
+        val cached = assetId?.let { assetManager.getCachedNotecard(it) }
+        if (cached != null) {
+            _state.update {
+                it.copy(
+                    activeTexturePreview = null,
+                    activeNotecard = NotecardViewerState(
+                        itemId = entry.id,
+                        assetId = assetId,
+                        title = entry.name,
+                        description = entry.description,
+                        body = cached,
+                        isLoading = false
+                    )
+                )
+            }
+            return
+        }
+
+        if (_state.value.connection is ConnectionState.LocalSandbox) {
+            val fallbackBody = buildString {
+                appendLine("=== ${entry.name} ===")
+                if (entry.description.isNotBlank()) appendLine(entry.description)
+                appendLine()
+                appendLine("Viewing local sandbox notecard preview in Linkpoint.")
+            }.trimEnd()
+            _state.update {
+                it.copy(
+                    activeTexturePreview = null,
+                    activeNotecard = NotecardViewerState(
+                        itemId = entry.id,
+                        assetId = assetId,
+                        title = entry.name,
+                        description = entry.description,
+                        body = fallbackBody,
+                        isLoading = false
+                    )
+                )
+            }
+            return
+        }
+
+        if (assetId == null) {
+            _state.update {
+                it.copy(
+                    activeTexturePreview = null,
+                    activeNotecard = NotecardViewerState(
+                        itemId = entry.id,
+                        assetId = null,
+                        title = entry.name,
+                        description = entry.description,
+                        isLoading = false,
+                        error = "Notecard asset UUID is unavailable (restricted permissions or unseeded item)."
+                    )
+                )
+            }
+            return
+        }
+
+        _state.update {
+            it.copy(
+                activeTexturePreview = null,
+                activeNotecard = NotecardViewerState(
+                    itemId = entry.id,
+                    assetId = assetId,
+                    title = entry.name,
+                    description = entry.description,
+                    isLoading = true
+                )
+            )
+        }
+
+        viewModelScope.launch {
+            val text = assetManager.fetchNotecard(assetId)
+            _state.update { s ->
+                val cur = s.activeNotecard
+                if (cur?.itemId != entry.id) return@update s
+                if (text != null) {
+                    s.copy(activeNotecard = cur.copy(body = text, isLoading = false, error = null))
+                } else {
+                    s.copy(
+                        activeNotecard = cur.copy(
+                            isLoading = false,
+                            error = "Unable to stream notecard via ViewerAsset capability."
+                        )
+                    )
+                }
+            }
+        }
+    }
+
+    override fun dismissNotecardViewer() {
+        _state.update { it.copy(activeNotecard = null) }
+    }
+
+    override fun openInventoryTexture(itemId: UUID) {
+        val entry = _state.value.inventoryEntries.firstOrNull { it.id == itemId && !it.isFolder } ?: return
+        val texId = entry.assetId
+        val cached = texId?.let { assetManager.getCachedTexture(it) }
+        if (cached != null) {
+            _state.update {
+                it.copy(
+                    activeNotecard = null,
+                    activeTexturePreview = TexturePreviewState(
+                        itemId = entry.id,
+                        textureId = texId,
+                        title = entry.name,
+                        description = entry.description,
+                        isLoading = false
+                    )
+                )
+            }
+            return
+        }
+
+        if (texId == null) {
+            _state.update {
+                it.copy(
+                    activeNotecard = null,
+                    activeTexturePreview = TexturePreviewState(
+                        itemId = entry.id,
+                        textureId = null,
+                        title = entry.name,
+                        description = entry.description,
+                        isLoading = false,
+                        error = "Texture asset UUID is unavailable (restricted permissions)."
+                    )
+                )
+            }
+            return
+        }
+
+        if (_state.value.connection is ConnectionState.LocalSandbox) {
+            buildProceduralPreviewBitmap(texId, neonVariant = entry.name.contains("Neon", ignoreCase = true))?.let { bmp ->
+                assetManager.putCachedTexture(texId, bmp)
+            }
+            _state.update {
+                it.copy(
+                    activeNotecard = null,
+                    activeTexturePreview = TexturePreviewState(
+                        itemId = entry.id,
+                        textureId = texId,
+                        title = entry.name,
+                        description = entry.description,
+                        isLoading = false
+                    )
+                )
+            }
+            return
+        }
+
+        _state.update {
+            it.copy(
+                activeNotecard = null,
+                activeTexturePreview = TexturePreviewState(
+                    itemId = entry.id,
+                    textureId = texId,
+                    title = entry.name,
+                    description = entry.description,
+                    isLoading = true
+                )
+            )
+        }
+        assetManager.retryFailedAsset(texId)
+        assetManager.requestTexture(texId, highPriority = true)
+    }
+
+    override fun dismissTexturePreview() {
+        _state.update { it.copy(activeTexturePreview = null) }
+    }
+
+    private fun seedSandboxPreviewAssets(
+        welcomeNotecardAssetId: UUID,
+        lslGuideNotecardAssetId: UUID,
+        mosaicTextureAssetId: UUID,
+        neonGridTextureAssetId: UUID
+    ) {
+        val welcomeBody = """
+            Welcome to Linkpoint — Phase 2 Second Life Viewer Parity!
+
+            • Nested Subfolders: Expand Clothing → Outerwear or Objects & HUDs → Avatar HUD Attachments to browse multi-level inventory trees.
+            • System Wearables (Clothing & Body Parts): Wearing or taking off system layers dispatches AgentIsNowWearing (0xFFFF017F) without rezzing 3D HUD prims.
+            • 3D Objects & HUDs: Choose Add (0x80 bitflag to stack multiple attachments), Wear (replace on point), HUD 31–38 slot picker, or Detach.
+            • Asset Viewers: Tap any Notecard or Texture to inspect streamed ViewerAsset content right inside the Inventory floater.
+        """.trimIndent()
+        val welcomeLinden = "Linden text version 2\n{\nLLEmbeddedItems version 1\n{\ncount 0\n}\nText length ${welcomeBody.toByteArray(Charsets.UTF_8).size}\n$welcomeBody\n}"
+        assetManager.putCachedNotecard(welcomeNotecardAssetId, welcomeLinden)
+
+        val lslBody = """
+            // Linkpoint HUD & Attachment Protocol Quick Reference
+            // HUD Attachment Points:
+            //   31 = Center 2     | 35 = Top Center
+            //   32 = Top Right    | 36 = Top Left
+            //   33 = Center       | 37 = Bottom Left
+            //   34 = Bottom       | 38 = Bottom Right
+
+            default
+            {
+                attach(key id)
+                {
+                    if (id != NULL_KEY) {
+                        llOwnerSay("Attached on slot " + (string)llGetAttached());
+                    }
+                }
+            }
+        """.trimIndent()
+        val lslLinden = "Linden text version 2\n{\nLLEmbeddedItems version 1\n{\ncount 0\n}\nBody length ${lslBody.toByteArray(Charsets.UTF_8).size}\n$lslBody\n}"
+        assetManager.putCachedNotecard(lslGuideNotecardAssetId, lslLinden)
+
+        buildProceduralPreviewBitmap(mosaicTextureAssetId, neonVariant = false)?.let {
+            assetManager.putCachedTexture(mosaicTextureAssetId, it)
+        }
+        buildProceduralPreviewBitmap(neonGridTextureAssetId, neonVariant = true)?.let {
+            assetManager.putCachedTexture(neonGridTextureAssetId, it)
+        }
+    }
+
+    private fun buildProceduralPreviewBitmap(seedId: UUID, neonVariant: Boolean): Bitmap? = runCatching {
+        val size = 128
+        val pixels = IntArray(size * size)
+        val seedTint = (seedId.leastSignificantBits.toInt() and 0x3F)
+        for (y in 0 until size) {
+            for (x in 0 until size) {
+                val color = if (neonVariant) {
+                    val onMajorGrid = (x % 32 == 0) || (y % 32 == 0)
+                    val onMinorGrid = (x % 8 == 0) || (y % 8 == 0)
+                    val dx = x - size / 2
+                    val dy = y - size / 2
+                    val ring = kotlin.math.abs(kotlin.math.sqrt((dx * dx + dy * dy).toDouble()).toInt() - 42) <= 2
+                    when {
+                        ring -> android.graphics.Color.argb(255, 255, 184, 77)
+                        onMajorGrid -> android.graphics.Color.argb(255, 36, 224, 255)
+                        onMinorGrid -> android.graphics.Color.argb(220, 22, 92, 128)
+                        else -> android.graphics.Color.argb(195, 10, 24, 38)
+                    }
+                } else {
+                    val tileX = x / 16
+                    val tileY = y / 16
+                    val grout = (x % 16 == 0) || (y % 16 == 0)
+                    val inlay = ((tileX + tileY) % 4 == 0) && (x % 16 in 4..11) && (y % 16 in 4..11)
+                    when {
+                        grout -> android.graphics.Color.argb(255, 24, 34, 46)
+                        inlay -> android.graphics.Color.argb(255, 42, 198, 226)
+                        (tileX + tileY) % 2 == 0 -> android.graphics.Color.argb(255, 74 + seedTint / 2, 90, 108)
+                        else -> android.graphics.Color.argb(255, 56, 70, 86 + seedTint / 2)
+                    }
+                }
+                pixels[y * size + x] = color
+            }
+        }
+        Bitmap.createBitmap(pixels, size, size, Bitmap.Config.ARGB_8888)
+    }.getOrNull()
 
     override fun respondScriptDialog(buttonLabel: String, channel: Int) {
         if (_state.value.connection is ConnectionState.Connected) {

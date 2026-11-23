@@ -56,8 +56,12 @@ object LludpPackets {
     const val MSG_IMPROVED_INSTANT_MESSAGE: Int = 0xFFFF00FE.toInt()
     const val MSG_AGENT_WEARABLES_REQUEST: Int = 0xFFFF017D.toInt() // Low 381
     const val MSG_AGENT_WEARABLES_UPDATE: Int = 0xFFFF017E.toInt()  // Low 382
+    const val MSG_AGENT_IS_NOW_WEARING: Int = 0xFFFF017F.toInt()    // Low 383
     const val MSG_REZ_SINGLE_ATTACHMENT: Int = 0xFFFF018B.toInt()
     const val MSG_DETACH_ATTACHMENT: Int = 0xFFFF018D.toInt()
+
+    // Attachment point bitflag instructing simulator to ADD (stack) rather than REPLACE
+    const val ATTACHMENT_ADD_FLAG: Int = 0x80
     const val MSG_MAP_BLOCK_REQUEST: Int = 0xFFFF0197.toInt()
     const val MSG_MAP_BLOCK_REPLY: Int = 0xFFFF0199.toInt()
     const val MSG_PACKET_ACK: Int = 0xFFFFFFFB.toInt()
@@ -544,23 +548,46 @@ object LludpPackets {
         return buf.array()
     }
 
+    fun buildAgentIsNowWearing(
+        agentId: UUID,
+        sessionId: UUID,
+        wearables: List<Pair<UUID, Int>>
+    ): ByteArray {
+        val capped = wearables.take(255)
+        val buf = ByteBuffer.allocate(16 + 16 + 1 + capped.size * 17).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, agentId)
+        putUuid(buf, sessionId)
+        buf.put(capped.size.toByte())
+        for ((itemId, wearableType) in capped) {
+            putUuid(buf, itemId)
+            buf.put((wearableType and 0xFF).toByte())
+        }
+        return buf.array()
+    }
+
     fun buildRezSingleAttachment(
         agentId: UUID,
         sessionId: UUID,
         itemId: UUID,
         ownerId: UUID,
         attachmentPoint: Int,
-        name: String
+        name: String,
+        append: Boolean = false
     ): ByteArray {
         val nameBytes = (name + "\u0000").toByteArray(Charsets.UTF_8)
         val descBytes = byteArrayOf(0)
+        val encodedPoint = if (append) {
+            (attachmentPoint and 0x7F) or ATTACHMENT_ADD_FLAG
+        } else {
+            attachmentPoint and 0xFF
+        }
         val buf = ByteBuffer.allocate(16 + 16 + 16 + 16 + 1 + 4 * 5 + 1 + nameBytes.size + 1 + descBytes.size)
             .order(ByteOrder.LITTLE_ENDIAN)
         putUuid(buf, agentId)
         putUuid(buf, sessionId)
         putUuid(buf, itemId)
         putUuid(buf, ownerId)
-        buf.put(attachmentPoint.toByte())
+        buf.put(encodedPoint.toByte())
         repeat(5) { buf.putInt(0) } // Permissions & flags
         buf.put(nameBytes.size.toByte())
         buf.put(nameBytes)

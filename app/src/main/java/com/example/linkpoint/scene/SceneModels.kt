@@ -275,6 +275,7 @@ data class AvatarEntity(
     val bakedLowerTextureId: UUID? = null,
     val bakedEyesTextureId: UUID? = null,
     val bakedHairTextureId: UUID? = null,
+    val bakedTextures: Map<com.example.linkpoint.protocol.AvatarTextureIndex, UUID> = emptyMap(),
     val wearableCount: Int = 0,
     val visualParamsCount: Int = 0,
     val attachments: List<SceneObject> = emptyList(),
@@ -287,7 +288,29 @@ data class AvatarEntity(
     val partnerId: UUID? = null,
     val isOnline: Boolean = true,
     val profileLoaded: Boolean = false
-)
+) {
+    /**
+     * Returns all active server-composited bake channels (`HeadBaked`..`Aux3Baked`),
+     * merging explicit [bakedTextures] with legacy single-channel fields.
+     */
+    fun effectiveBakedTextures(): Map<com.example.linkpoint.protocol.AvatarTextureIndex, UUID> {
+        val merged = LinkedHashMap<com.example.linkpoint.protocol.AvatarTextureIndex, UUID>()
+        bakedHeadTextureId?.let { merged[com.example.linkpoint.protocol.AvatarTextureIndex.HeadBaked] = it }
+        bakedUpperTextureId?.let { merged[com.example.linkpoint.protocol.AvatarTextureIndex.UpperBaked] = it }
+        bakedLowerTextureId?.let { merged[com.example.linkpoint.protocol.AvatarTextureIndex.LowerBaked] = it }
+        bakedEyesTextureId?.let { merged[com.example.linkpoint.protocol.AvatarTextureIndex.EyesBaked] = it }
+        bakedHairTextureId?.let { merged[com.example.linkpoint.protocol.AvatarTextureIndex.HairBaked] = it }
+        merged.putAll(bakedTextures)
+        return merged
+    }
+
+    /**
+     * Substitutes Bakes on Mesh `IMG_USE_BAKED_*` sentinel UUIDs on mesh body/head/aux attachments
+     * with this avatar's server-composited bake texture UUID (or `null` if not yet baked).
+     */
+    fun resolveAttachmentFaceTexture(rawTextureId: UUID?): UUID? =
+        com.example.linkpoint.protocol.AvatarTextureIndex.resolveBomTexture(rawTextureId, effectiveBakedTextures())
+}
 
 /**
  * 2D screen-space projected floating nametag anchored above a 3D avatar head.
