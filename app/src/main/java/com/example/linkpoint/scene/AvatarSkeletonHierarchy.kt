@@ -1,5 +1,7 @@
 package com.example.linkpoint.scene
 
+import com.example.linkpoint.render.BlendedJointPose
+
 /**
  * Anatomical scaling group used so avatar shape proportions (height, torso, shoulders, head, legs)
  * scale bone lengths coherently along the hierarchical skeleton tree.
@@ -295,7 +297,8 @@ object AvatarSkeletonHierarchy {
         torsoScale: Float = 1.0f,
         shoulderScale: Float = 1.0f,
         headScale: Float = 1.0f,
-        legScale: Float = 1.0f
+        legScale: Float = 1.0f,
+        jointPoses: Map<String, BlendedJointPose> = emptyMap()
     ): Transform3D {
         val chain = ArrayList<SkeletonBone>(8)
         var cur = bonesById[boneId] ?: bonesById["mPelvis"] ?: return Transform3D.IDENTITY
@@ -316,8 +319,23 @@ object AvatarSkeletonHierarchy {
 
         var accum = Transform3D.IDENTITY
         for (bone in chain) {
-            val scaledOffset = scaleOffsetForGroup(bone.localOffset, bone.scaleGroup, hScale, tS, sS, hdS, lS)
-            accum *= Transform3D(scaledOffset, bone.localRotation)
+            val baseScaledOffset = scaleOffsetForGroup(bone.localOffset, bone.scaleGroup, hScale, tS, sS, hdS, lS)
+            val pose = jointPoses[bone.boneId]
+            val finalOffset = if (pose?.positionOffset != null) {
+                if (bone.boneId == "mPelvis" || bone.boneId == "mRoot") {
+                    baseScaledOffset + pose.positionOffset
+                } else {
+                    pose.positionOffset
+                }
+            } else {
+                baseScaledOffset
+            }
+            val finalRot = if (pose != null) {
+                (bone.localRotation * pose.rotation).normalized()
+            } else {
+                bone.localRotation
+            }
+            accum *= Transform3D(finalOffset, finalRot)
         }
         return accum
     }
@@ -333,7 +351,8 @@ object AvatarSkeletonHierarchy {
         torsoScale: Float = 1.0f,
         shoulderScale: Float = 1.0f,
         headScale: Float = 1.0f,
-        legScale: Float = 1.0f
+        legScale: Float = 1.0f,
+        jointPoses: Map<String, BlendedJointPose> = emptyMap()
     ): Transform3D {
         val spec = getSpec(attachPoint)
         val boneTransform = resolveBoneTransformPelvis(
@@ -342,7 +361,8 @@ object AvatarSkeletonHierarchy {
             torsoScale = torsoScale,
             shoulderScale = shoulderScale,
             headScale = headScale,
-            legScale = legScale
+            legScale = legScale,
+            jointPoses = jointPoses
         )
         val hScale = (heightMeters.coerceIn(1.2f, 2.5f)) / 1.82f
         val bone = bonesById[spec.jointName]
@@ -365,7 +385,8 @@ object AvatarSkeletonHierarchy {
             torsoScale = avatar.torsoScale,
             shoulderScale = avatar.shoulderScale,
             headScale = avatar.headScale,
-            legScale = avatar.legScale
+            legScale = avatar.legScale,
+            jointPoses = avatar.jointPoses
         )
 
     /**

@@ -27,6 +27,8 @@ object LludpPackets {
     const val MSG_OBJECT_UPDATE_COMPRESSED: Int = 13
     const val MSG_IMPROVED_TERSE_OBJECT_UPDATE: Int = 15
     const val MSG_KILL_OBJECT: Int = 16
+    const val MSG_AVATAR_ANIMATION: Int = 20
+    const val MSG_OBJECT_ANIMATION: Int = 21
 
     // Medium frequency message IDs (0xFF + 1 byte)
     const val MSG_COARSE_LOCATION_UPDATE: Int = 0xFF06

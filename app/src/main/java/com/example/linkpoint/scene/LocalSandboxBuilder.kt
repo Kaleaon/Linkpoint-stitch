@@ -1,5 +1,11 @@
 package com.example.linkpoint.scene
 
+import com.example.linkpoint.render.FlexibleParams
+import com.example.linkpoint.render.LightParams
+import com.example.linkpoint.render.PartDataConfig
+import com.example.linkpoint.render.ParticleBlendFunc
+import com.example.linkpoint.render.ParticleFlags
+import com.example.linkpoint.render.ParticlePattern
 import java.util.UUID
 import kotlin.math.cos
 import kotlin.math.exp
@@ -53,18 +59,110 @@ object LocalSandboxBuilder {
                 isTouchable = true
             )
         )
-        // Floating Nexus Crystal & Orbital Rings
+        // Floating Nexus Crystal & Orbital Rings (with live beacon aura particle emitter)
         objs.add(
             SceneObject(
                 localId = nextId++,
                 name = "Aether Nexus Beacon",
-                description = "Scripted touch-interactive crystal beacon (Tap to cycle glow)",
+                description = "Scripted touch-interactive crystal beacon emitting additive glow particles (Tap to cycle glow)",
                 shape = PrimShape.SPHERE,
                 position = Vec3(128f, 134f, groundZ(128f, 134f, 4.2f)),
                 scale = Vec3(2.2f, 2.2f, 3.0f),
                 color = ColorRgba(0.22f, 0.78f, 0.98f, 0.88f),
                 isFullbright = true,
-                isScripted = true
+                isScripted = true,
+                lightParams = LightParams(
+                    color = ColorRgba(0.22f, 0.82f, 1.0f, 1f),
+                    intensity = 0.9f,
+                    radius = 12f,
+                    falloff = 0.75f
+                ),
+                partData = PartDataConfig(
+                    crc = 0x51A09,
+                    pattern = ParticlePattern.EXPLODE,
+                    burstRate = 0.14f,
+                    burstRadius = 1.25f,
+                    burstSpeedMin = 0.35f,
+                    burstSpeedMax = 0.95f,
+                    burstPartCount = 3,
+                    acceleration = Vec3(0f, 0f, 0.45f),
+                    dataFlags = ParticleFlags.INTERP_COLOR or
+                        ParticleFlags.INTERP_SCALE or
+                        ParticleFlags.EMISSIVE or
+                        ParticleFlags.DATA_GLOW or
+                        ParticleFlags.DATA_BLEND,
+                    partMaxAge = 2.8f,
+                    startColor = ColorRgba(0.35f, 0.92f, 1.0f, 0.88f),
+                    endColor = ColorRgba(0.96f, 0.62f, 0.12f, 0.0f),
+                    startScaleX = 0.28f,
+                    startScaleY = 0.28f,
+                    endScaleX = 0.06f,
+                    endScaleY = 0.06f,
+                    startGlow = 0.55f,
+                    endGlow = 0.05f,
+                    blendFuncSource = ParticleBlendFunc.SOURCE_ALPHA,
+                    blendFuncDest = ParticleBlendFunc.ONE
+                )
+            )
+        )
+        // Live Plaza Fountain Emitter (`llParticleSystem` ANGLE_CONE + BOUNCE + WIND)
+        objs.add(
+            SceneObject(
+                localId = nextId++,
+                name = "Plaza Aether Fountain",
+                description = "Live llParticleSystem fountain emitter demonstrating cone spray, gravity arc, and bounce",
+                shape = PrimShape.CYLINDER,
+                position = Vec3(128f, 129.2f, groundZ(128f, 129.2f, 0.40f)),
+                scale = Vec3(2.4f, 2.4f, 0.80f),
+                color = ColorRgba(0.18f, 0.34f, 0.48f, 1f),
+                isScripted = true,
+                partData = PartDataConfig(
+                    crc = 0xF007A1,
+                    pattern = ParticlePattern.ANGLE_CONE,
+                    innerAngle = 0.04f,
+                    outerAngle = 0.34f,
+                    burstRate = 0.08f,
+                    burstRadius = 0.18f,
+                    burstSpeedMin = 3.1f,
+                    burstSpeedMax = 4.4f,
+                    burstPartCount = 4,
+                    acceleration = Vec3(0f, 0f, -2.6f),
+                    dataFlags = ParticleFlags.INTERP_COLOR or
+                        ParticleFlags.INTERP_SCALE or
+                        ParticleFlags.BOUNCE or
+                        ParticleFlags.WIND or
+                        ParticleFlags.EMISSIVE or
+                        ParticleFlags.DATA_GLOW,
+                    partMaxAge = 2.5f,
+                    startColor = ColorRgba(0.42f, 0.90f, 1.0f, 0.92f),
+                    endColor = ColorRgba(0.16f, 0.54f, 0.96f, 0.0f),
+                    startScaleX = 0.22f,
+                    startScaleY = 0.22f,
+                    endScaleX = 0.09f,
+                    endScaleY = 0.09f,
+                    startGlow = 0.35f,
+                    endGlow = 0.0f
+                )
+            )
+        )
+        // Flexible Wind Pennant (`ExtraParams 0x10`)
+        objs.add(
+            SceneObject(
+                localId = nextId++,
+                name = "Archipelago Wind Pennant",
+                description = "Flexible prim (ExtraParams 0x10) demonstrating live wind sway & gravity sag",
+                shape = PrimShape.BOX,
+                position = Vec3(132.5f, 126.5f, groundZ(132.5f, 126.5f, 1.9f)),
+                scale = Vec3(0.16f, 0.95f, 3.8f),
+                color = ColorRgba(0.18f, 0.76f, 0.94f, 0.95f),
+                flexibleParams = FlexibleParams(
+                    softness = 2,
+                    numFlexiSections = 5,
+                    tension = 1.2f,
+                    airFriction = 2.0f,
+                    gravity = 0.35f,
+                    windSensitivity = 1.8f
+                )
             )
         )
         objs.add(

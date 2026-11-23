@@ -33,9 +33,12 @@ import com.example.linkpoint.protocol.LoginRequestParams
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
+import com.example.linkpoint.protocol.SignaledAnimation
 import com.example.linkpoint.protocol.SlBinaryParsers
 import com.example.linkpoint.protocol.XmlRpcLoginClient
+import com.example.linkpoint.render.LindenAnimBinaryDecoder
 import com.example.linkpoint.render.LinkpointGlRenderer
+import com.example.linkpoint.render.PlayingAvatarAnimation
 import com.example.linkpoint.render.RenderSceneSnapshot
 import com.example.linkpoint.scene.AvatarEntity
 import com.example.linkpoint.scene.AvatarHudSlotState
@@ -126,6 +129,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     @Volatile private var lastUiPosSyncMs = 0L
     private val pressedMoveKeys = ConcurrentHashMap.newKeySet<Int>()
     private val requestedProfiles = ConcurrentHashMap.newKeySet<UUID>()
+    private val sessionStartNs = System.nanoTime()
     private var simLoopJob: Job? = null
 
     private data class LoginAttemptSpec(
@@ -225,6 +229,16 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         obj.meshAssetId?.let { assetManager.requestMesh(it, highPriority = isAvatarPriority) }
                         obj.defaultTextureId?.let { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
                         obj.faceTextures.values.forEach { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
+                        obj.partData?.textureId?.let { assetManager.requestTexture(it, highPriority = false) }
+                        obj.sculptParams?.takeIf { it.isSculptedPrim }?.sculptTextureId?.let {
+                            assetManager.requestTexture(it, highPriority = isAvatarPriority)
+                        }
+                        listOfNotNull(
+                            obj.pbrChannelTransforms.baseColorTextureId,
+                            obj.pbrChannelTransforms.normalTextureId,
+                            obj.pbrChannelTransforms.metallicRoughnessTextureId,
+                            obj.pbrChannelTransforms.emissiveTextureId
+                        ).forEach { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
 
                         allSceneObjects[obj.localId] = obj
                         pushSceneSnapshot()
@@ -455,6 +469,18 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         )
                         pushSceneSnapshot()
                     }
+                    is SimEvent.AvatarAnimationReceived -> {
+                        evt.animations.forEach { assetManager.requestAnimation(it.animId) }
+                        val targetAv = avatars[evt.senderId]
+                            ?: avatars.values.firstOrNull { av -> allSceneObjects[av.localId]?.uuid == evt.senderId }
+                        if (targetAv != null) {
+                            val nowSec = sessionElapsedSec()
+                            val updatedPlaying = reconcileSignaledAnimations(targetAv.playingAnimations, evt.animations, nowSec)
+                            avatars[targetAv.agentId] = targetAv.copy(playingAnimations = updatedPlaying)
+                            recomputeAvatarAnimations(targetAv.agentId, nowSec)
+                            pushSceneSnapshot()
+                        }
+                    }
                     is SimEvent.UuidNamesResolved -> {
                         evt.names.forEach { (id, name) ->
                             knownNames[id] = name
@@ -604,6 +630,17 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     is AssetStreamEvent.TextureReady -> {
                         renderer.putStreamedTexture(evt.textureId, evt.bitmap)
                         _state.update { it.copy(textureRevision = it.textureRevision + 1) }
+                    }
+                    is AssetStreamEvent.AnimationReady -> {
+                        val nowSec = sessionElapsedSec()
+                        var changed = false
+                        for (agentId in avatars.keys.toList()) {
+                            val av = avatars[agentId] ?: continue
+                            if (av.playingAnimations.any { it.animId == evt.animId }) {
+                                if (recomputeAvatarAnimations(agentId, nowSec)) changed = true
+                            }
+                        }
+                        if (changed) pushSceneSnapshot()
                     }
                     is AssetStreamEvent.DisplayNamesResolved -> {
                         evt.names.forEach { (id, name) ->
@@ -1550,6 +1587,20 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         }
                         if (tick % 60 == 0) refreshNearbyRadar()
                     }
+
+                    if (tick % 2 == 0 && avatars.values.any { it.playingAnimations.isNotEmpty() }) {
+                        val nowSec = sessionElapsedSec()
+                        var animUpdated = false
+                        for (agentId in avatars.keys.toList()) {
+                            val av = avatars[agentId] ?: continue
+                            if (av.playingAnimations.isNotEmpty()) {
+                                if (recomputeAvatarAnimations(agentId, nowSec)) animUpdated = true
+                            }
+                        }
+                        if (animUpdated && !moved) {
+                            pushSceneSnapshot(syncUiState = false)
+                        }
+                    }
                 }
                 tick++
                 delay(16)
@@ -2161,6 +2212,67 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
     private fun isPlausibleJointLocalOffset(pos: Vec3): Boolean =
         kotlin.math.abs(pos.x) <= 16f && kotlin.math.abs(pos.y) <= 16f && kotlin.math.abs(pos.z) <= 16f
+
+    private fun sessionElapsedSec(): Float =
+        ((System.nanoTime() - sessionStartNs) / 1_000_000_000.0).toFloat()
+
+    private fun reconcileSignaledAnimations(
+        existing: List<PlayingAvatarAnimation>,
+        signaled: List<SignaledAnimation>,
+        nowSec: Float
+    ): List<PlayingAvatarAnimation> {
+        val next = ArrayList<PlayingAvatarAnimation>(signaled.size + existing.size)
+        val matchedExistingIndices = HashSet<Int>()
+        for (sig in signaled) {
+            val idx = existing.indexOfFirst {
+                it.animId == sig.animId && it.sequenceId == sig.sequenceId && it.stoppedAtSec == null
+            }.takeIf { it >= 0 } ?: existing.indexOfFirst {
+                it.animId == sig.animId && it.stoppedAtSec == null
+            }
+            if (idx >= 0) {
+                matchedExistingIndices.add(idx)
+                next.add(existing[idx].copy(sequenceId = sig.sequenceId, stoppedAtSec = null))
+            } else {
+                next.add(
+                    PlayingAvatarAnimation(
+                        animId = sig.animId,
+                        sequenceId = sig.sequenceId,
+                        startedAtSec = nowSec
+                    )
+                )
+            }
+        }
+        existing.forEachIndexed { idx, prev ->
+            if (!matchedExistingIndices.contains(idx)) {
+                if (prev.stoppedAtSec == null) {
+                    next.add(prev.copy(stoppedAtSec = nowSec))
+                } else if (nowSec - prev.stoppedAtSec < 3.0f) {
+                    next.add(prev)
+                }
+            }
+        }
+        return next
+    }
+
+    private fun recomputeAvatarAnimations(agentId: UUID, nowSec: Float): Boolean {
+        val av = avatars[agentId] ?: return false
+        if (av.playingAnimations.isEmpty()) {
+            if (av.jointPoses.isEmpty()) return false
+            avatars[agentId] = av.copy(jointPoses = emptyMap())
+            return true
+        }
+        val animAssets = assetManager.snapshotAnimations()
+        val pruned = av.playingAnimations.filter { playing ->
+            val stopped = playing.stoppedAtSec ?: return@filter true
+            val asset = animAssets[playing.animId]
+            val maxEaseOut = (asset?.easeOutTime ?: 0.5f).coerceAtLeast(0.05f) + 0.05f
+            nowSec - stopped <= maxEaseOut
+        }
+        val poses = LindenAnimBinaryDecoder.blendAnimations(pruned, animAssets, nowSec)
+        if (pruned == av.playingAnimations && poses == av.jointPoses) return false
+        avatars[agentId] = av.copy(playingAnimations = pruned, jointPoses = poses)
+        return true
+    }
 
     private fun mergeIncomingObjectWithCaps(incoming: SceneObject): SceneObject {
         val caps = capsAttachmentOverridesByUuid[incoming.uuid]

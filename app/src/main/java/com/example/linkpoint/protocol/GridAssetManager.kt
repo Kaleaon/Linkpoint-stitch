@@ -3,6 +3,8 @@ package com.example.linkpoint.protocol
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.LruCache
+import com.example.linkpoint.render.LindenAnimBinaryDecoder
+import com.example.linkpoint.render.LindenAnimData
 import com.gemalto.jp2.JP2Decoder
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -30,6 +32,7 @@ data class AssetStreamStats(
 sealed class AssetStreamEvent {
     data class MeshReady(val meshId: UUID, val asset: DecodedMeshAsset) : AssetStreamEvent()
     data class TextureReady(val textureId: UUID, val bitmap: Bitmap) : AssetStreamEvent()
+    data class AnimationReady(val animId: UUID, val animData: LindenAnimData) : AssetStreamEvent()
     data class DisplayNamesResolved(val names: Map<UUID, String>) : AssetStreamEvent()
     data class StatsUpdated(val stats: AssetStreamStats) : AssetStreamEvent()
 }
@@ -60,6 +63,7 @@ class GridAssetManager(
 
     // Memory-bounded LRU caches sized for dense Second Life / OpenSim regions
     private val meshCache = LruCache<UUID, DecodedMeshAsset>(240)
+    private val animCache = LruCache<UUID, LindenAnimData>(160)
     private val textureCache = object : LruCache<UUID, Bitmap>(32 * 1024) { // 32 MB KB budget
         override fun sizeOf(key: UUID, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
     }
@@ -70,6 +74,9 @@ class GridAssetManager(
     private val inFlightTextures = ConcurrentHashMap.newKeySet<UUID>()
     private val failedTextures = ConcurrentHashMap.newKeySet<UUID>()
     private val transientTextureFailures = ConcurrentHashMap<UUID, Int>()
+    private val inFlightAnims = ConcurrentHashMap.newKeySet<UUID>()
+    private val failedAnims = ConcurrentHashMap.newKeySet<UUID>()
+    private val pendingPreCapAnims = ConcurrentHashMap.newKeySet<UUID>()
     private val pendingPreCapMeshes = ConcurrentHashMap<UUID, Boolean>()
     private val pendingPreCapTextures = ConcurrentHashMap<UUID, Boolean>()
     private val pendingPreCapNames = ConcurrentHashMap.newKeySet<UUID>()
@@ -114,10 +121,21 @@ class GridAssetManager(
             pendingPreCapNames.clear()
             requestDisplayNames(queuedNames)
         }
+        if (viewerAssetCap != null && pendingPreCapAnims.isNotEmpty()) {
+            val queuedAnims = pendingPreCapAnims.toList()
+            pendingPreCapAnims.clear()
+            queuedAnims.forEach { requestAnimation(it) }
+        }
     }
 
     fun getCachedMesh(meshId: UUID): DecodedMeshAsset? = synchronized(meshCache) { meshCache.get(meshId) }
     fun getCachedTexture(textureId: UUID): Bitmap? = synchronized(textureCache) { textureCache.get(textureId) }
+    fun getCachedAnimation(animId: UUID): LindenAnimData? = synchronized(animCache) { animCache.get(animId) }
+    fun putCachedAnimation(animId: UUID, animData: LindenAnimData) {
+        synchronized(animCache) { animCache.put(animId, animData) }
+        _events.tryEmit(AssetStreamEvent.AnimationReady(animId, animData))
+    }
+    fun snapshotAnimations(): Map<UUID, LindenAnimData> = synchronized(animCache) { animCache.snapshot() }
     fun getResolvedName(agentId: UUID): String? = resolvedNames[agentId]
 
     fun snapshotMeshes(): Map<UUID, DecodedMeshAsset> = synchronized(meshCache) { meshCache.snapshot() }
@@ -240,6 +258,45 @@ class GridAssetManager(
         transientMeshFailures.remove(assetId)
         failedTextures.remove(assetId)
         transientTextureFailures.remove(assetId)
+        failedAnims.remove(assetId)
+    }
+
+    /**
+     * Streams a custom Second Life `.anim` asset from `ViewerAsset` (`?animatn_id=<uuid>`)
+     * and decodes its quantized joint keyframes via [LindenAnimBinaryDecoder].
+     */
+    fun requestAnimation(animId: UUID) {
+        if (animId == ZERO_UUID) return
+        if (getCachedAnimation(animId) != null || failedAnims.contains(animId)) return
+        val capBase = viewerAssetCap
+        if (capBase == null) {
+            pendingPreCapAnims.add(animId)
+            return
+        }
+        if (!inFlightAnims.add(animId)) return
+
+        val sep = if (capBase.contains("?")) "&" else "?"
+        val url = "$capBase${sep}animatn_id=$animId"
+        scope.launch {
+            try {
+                avatarMeshSemaphore.withPermit {
+                    val outcome = downloadBytesWithStatus(url)
+                    val parsed = outcome.bytes?.let { LindenAnimBinaryDecoder.decode(it) }
+                    if (parsed != null) {
+                        synchronized(animCache) { animCache.put(animId, parsed) }
+                        _events.tryEmit(AssetStreamEvent.AnimationReady(animId, parsed))
+                    } else if (outcome.permanentFailure) {
+                        failedAnims.add(animId)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Non-fatal
+            } finally {
+                inFlightAnims.remove(animId)
+            }
+        }
     }
 
     fun requestDisplayNames(agentIds: Collection<UUID>) {
@@ -404,14 +461,18 @@ class GridAssetManager(
         inFlightTextures.clear()
         failedTextures.clear()
         transientTextureFailures.clear()
+        inFlightAnims.clear()
+        failedAnims.clear()
         pendingPreCapMeshes.clear()
         pendingPreCapTextures.clear()
+        pendingPreCapAnims.clear()
         pendingPreCapNames.clear()
         requestedNames.clear()
         resolvedNames.clear()
         meshesLoadedCount.set(0)
         texturesLoadedCount.set(0)
         synchronized(meshCache) { meshCache.evictAll() }
+        synchronized(animCache) { animCache.evictAll() }
         synchronized(textureCache) { textureCache.evictAll() }
         emitStats(force = true)
     }

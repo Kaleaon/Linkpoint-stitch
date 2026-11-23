@@ -95,6 +95,11 @@ sealed class SimEvent {
         val wearableCount: Int,
         val wearableAssetIds: List<Pair<Int, UUID>>
     ) : SimEvent()
+    data class AvatarAnimationReceived(
+        val senderId: UUID,
+        val animations: List<SignaledAnimation>,
+        val objectSourceIds: List<UUID> = emptyList()
+    ) : SimEvent()
     data class UuidNamesResolved(val names: Map<UUID, String>) : SimEvent()
     data class ObjectKilled(val localId: Int) : SimEvent()
     data class ObjectPropertiesReceived(
@@ -555,6 +560,18 @@ class LludpCircuitEngine {
             LludpPackets.MSG_OBJECT_UPDATE -> parseObjectUpdate(buf)
             LludpPackets.MSG_OBJECT_UPDATE_COMPRESSED -> parseObjectUpdateCompressed(buf)
             LludpPackets.MSG_IMPROVED_TERSE_OBJECT_UPDATE -> parseImprovedTerseObjectUpdate(buf)
+            LludpPackets.MSG_AVATAR_ANIMATION,
+            LludpPackets.MSG_OBJECT_ANIMATION -> {
+                SceneObjectDecoder.decodeAvatarAnimationPacket(buf)?.let { decoded ->
+                    _events.tryEmit(
+                        SimEvent.AvatarAnimationReceived(
+                            senderId = decoded.senderId,
+                            animations = decoded.animations,
+                            objectSourceIds = decoded.objectSourceIds
+                        )
+                    )
+                }
+            }
             LludpPackets.MSG_AVATAR_APPEARANCE -> parseAvatarAppearance(buf)
             LludpPackets.MSG_AVATAR_PROPERTIES_REPLY -> parseAvatarPropertiesReply(buf)
             LludpPackets.MSG_AGENT_WEARABLES_UPDATE -> parseAgentWearablesUpdate(buf)
@@ -761,14 +778,16 @@ class LludpCircuitEngine {
             // PSBlock (1-byte length)
             val psLen = if (buf.remaining() >= 1) buf.get().toInt() and 0xFF else return
             if (buf.remaining() < psLen) return
-            buf.position(buf.position() + psLen)
+            val psBytes = ByteArray(psLen)
+            if (psLen > 0) buf.get(psBytes)
 
-            // ExtraParams (1-byte length) — contains Mesh Asset UUID (type 0x0060)
+            // ExtraParams (1-byte length) — contains Flexi (0x10), Light (0x20), Sculpt (0x30), Mesh (0x60)
             val extraLen = if (buf.remaining() >= 1) buf.get().toInt() and 0xFF else return
             if (buf.remaining() < extraLen) return
             val extraBytes = ByteArray(extraLen)
             buf.get(extraBytes)
-            val extraParams = SlBinaryParsers.parseExtraParams(extraBytes)
+            val decodedBlocks = SceneObjectDecoder.decodeUncompressedBlocks(psBytes, extraBytes)
+            val extraParams = decodedBlocks.extraParams
 
             // Trailing Sound (16B) + OwnerID (16B) + Gain (4B) + Flags (1B) + Radius (4B) + JointType (1B) + JointPivot (12B) + JointAxis (12B) = 66B
             var ownerId = UUID(0L, 0L)
@@ -822,7 +841,11 @@ class LludpCircuitEngine {
                             isScripted = (updateFlags and 0x00000004) != 0,
                             isPhysical = (updateFlags and 0x00000001) != 0,
                             isPhantom = (updateFlags and 0x00000020) != 0,
-                            attachmentPoint = attachmentPoint
+                            attachmentPoint = attachmentPoint,
+                            partData = decodedBlocks.partData,
+                            flexibleParams = extraParams.flexibleParams,
+                            lightParams = extraParams.lightParams,
+                            sculptParams = extraParams.sculptParams
                         )
                     )
                 )
@@ -883,33 +906,12 @@ class LludpCircuitEngine {
                 if ((compFlags and 0x200) != 0) {
                     readNullTerminatedUtf8(buf, blockEnd) // MediaURL
                 }
-                if ((compFlags and 0x08) != 0 && blockEnd - buf.position() >= 86) {
-                    buf.position(buf.position() + 86) // Particle system
-                }
-
-                // ExtraParams (always present in ObjectUpdateCompressed right after optional ParticleSystem)
-                var extraParams = ParsedExtraParams()
-                if (blockEnd - buf.position() >= 1) {
-                    val epStart = buf.position()
-                    val epCount = buf.get().toInt() and 0xFF
-                    var validEp = true
-                    repeat(epCount.coerceAtMost(16)) {
-                        if (blockEnd - buf.position() < 6) { validEp = false; return@repeat }
-                        buf.short // type
-                        val szBytes = buf.int
-                        if (szBytes < 0 || szBytes > blockEnd - buf.position()) { validEp = false; return@repeat }
-                        buf.position(buf.position() + szBytes)
-                    }
-                    if (validEp) {
-                        val epLen = buf.position() - epStart
-                        val epBytes = ByteArray(epLen)
-                        val savedPos = buf.position()
-                        buf.position(epStart)
-                        buf.get(epBytes)
-                        buf.position(savedPos)
-                        extraParams = SlBinaryParsers.parseExtraParams(epBytes)
-                    }
-                }
+                val decodedBlocks = SceneObjectDecoder.readCompressedParticleAndExtraParams(
+                    buf = buf,
+                    compFlags = compFlags,
+                    blockEnd = blockEnd
+                )
+                val extraParams = decodedBlocks.extraParams
 
                 if ((compFlags and 0x10) != 0 && blockEnd - buf.position() >= 25) {
                     buf.position(buf.position() + 25) // SoundUUID(16)+Gain(4)+Flags(1)+Radius(4)
@@ -989,7 +991,11 @@ class LludpCircuitEngine {
                                 isScripted = (updateFlags and 0x00000004) != 0,
                                 isPhysical = (updateFlags and 0x00000001) != 0,
                                 isPhantom = (updateFlags and 0x00000020) != 0,
-                                attachmentPoint = attachmentPoint
+                                attachmentPoint = attachmentPoint,
+                                partData = decodedBlocks.partData,
+                                flexibleParams = extraParams.flexibleParams,
+                                lightParams = extraParams.lightParams,
+                                sculptParams = extraParams.sculptParams
                             )
                         )
                     )

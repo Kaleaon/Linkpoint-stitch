@@ -8,6 +8,7 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.math.tan
 
 /**
  * Decoded single submesh (material face) from a Second Life / OpenSimulator binary `.llmesh` asset.
@@ -118,6 +119,9 @@ object LlMeshDecoder {
 
     fun decode(rawBytes: ByteArray): DecodedMeshAsset? {
         if (rawBytes.size < 16) return null
+        if (rawBytes.size >= 24 && String(rawBytes, 0, 22, Charsets.US_ASCII) == "Linden Binary Mesh 1.0") {
+            return decodeLindenBinaryMesh10(rawBytes)
+        }
         return try {
             val (header, headerEndOffset) = parseLlsdBinaryWithOffset(rawBytes) ?: return null
             val headerMap = header.asMap()
@@ -759,6 +763,192 @@ object LlMeshDecoder {
                 LlsdValue.MapVal(map)
             }
             else -> null
+        }
+    }
+
+    /**
+     * Canonical Second Life / Unified-LLSD projected screen pixel coverage formula:
+     * `px = (boundingRadius / distanceMeters) * (screenHeightPx / tan(fovRad * 0.5))`
+     */
+    fun calculateProjectedPixelCoverage(
+        boundingRadius: Float,
+        distanceMeters: Float,
+        fovRad: Float,
+        screenHeightPx: Float
+    ): Float {
+        if (distanceMeters <= 1e-4f || fovRad <= 1e-4f) return screenHeightPx
+        val halfTan = tan(fovRad * 0.5f).coerceAtLeast(1e-5f)
+        return (boundingRadius / distanceMeters) * (screenHeightPx / halfTan)
+    }
+
+    /**
+     * Selects the canonical Second Life LOD bucket (`high_lod`, `medium_lod`, `low_lod`, `lowest_lod`)
+     * from projected pixel coverage thresholds (`200`, `80`, `20`).
+     */
+    fun selectLodByPixelCoverage(projectedPixels: Float): String = when {
+        projectedPixels >= 200f -> "high_lod"
+        projectedPixels >= 80f -> "medium_lod"
+        projectedPixels >= 20f -> "low_lod"
+        else -> "lowest_lod"
+    }
+
+    /**
+     * Parses Second Life `Linden Binary Mesh 1.0` (`.llm`) system avatar / morph mesh assets,
+     * including optional trailing submesh material partitions.
+     */
+    private fun decodeLindenBinaryMesh10(bytes: ByteArray): DecodedMeshAsset? {
+        if (bytes.size < 24 + 39 + 2) return null
+        return try {
+            val bb = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+            bb.position(24)
+            val hasWeights = bb.get().toInt() != 0
+            val hasDetailTex = bb.get().toInt() != 0
+            val px = bb.float; val py = bb.float; val pz = bb.float
+            bb.float; bb.float; bb.float // rotationAngles
+            bb.get()                     // rotationOrder
+            bb.float; bb.float; bb.float // scale
+
+            val numVertices = bb.short.toInt() and 0xFFFF
+            if (numVertices <= 0 || numVertices > 200_000) return null
+
+            val positions = FloatArray(numVertices * 3)
+            var minZ = Float.POSITIVE_INFINITY
+            var maxZ = Float.NEGATIVE_INFINITY
+            for (i in 0 until numVertices) {
+                val vx = bb.float + px
+                val vy = bb.float + py
+                val vz = bb.float + pz
+                positions[i * 3] = vx
+                positions[i * 3 + 1] = vy
+                positions[i * 3 + 2] = vz
+                if (vz < minZ) minZ = vz
+                if (vz > maxZ) maxZ = vz
+            }
+            val normals = FloatArray(numVertices * 3)
+            for (i in 0 until numVertices) {
+                normals[i * 3] = bb.float
+                normals[i * 3 + 1] = bb.float
+                normals[i * 3 + 2] = bb.float
+            }
+            val binormBytes = if (bb.remaining() > 1000) numVertices * 12 else 20
+            if (bb.remaining() >= binormBytes + numVertices * 8 + 8) {
+                bb.position(bb.position() + binormBytes)
+            }
+            val uvs = FloatArray(numVertices * 2)
+            for (i in 0 until numVertices) {
+                uvs[i * 2] = bb.float
+                uvs[i * 2 + 1] = bb.float
+            }
+            if (hasDetailTex) {
+                repeat(numVertices * 2) { bb.float }
+            }
+            if (hasWeights) {
+                repeat(numVertices) { bb.float }
+            }
+
+            val numFaces = bb.short.toInt() and 0xFFFF
+            if (numFaces <= 0 || numFaces > 200_000) return null
+            val indices = ShortArray(numFaces * 3) { bb.short }
+
+            val jointNames = ArrayList<String>()
+            if (hasWeights && bb.remaining() >= 2) {
+                val numSkinJoints = bb.short.toInt() and 0xFFFF
+                if (numSkinJoints in 1..256 && bb.remaining() >= numSkinJoints * 64) {
+                    val nameBuf = ByteArray(64)
+                    repeat(numSkinJoints) {
+                        bb.get(nameBuf)
+                        val nul = nameBuf.indexOf(0)
+                        jointNames.add(String(nameBuf, 0, if (nul >= 0) nul else 64, Charsets.US_ASCII).trim())
+                    }
+                }
+            }
+
+            // Skip morph targets until "End Morphs" sentinel
+            val nameBuf = ByteArray(64)
+            while (bb.remaining() >= 64) {
+                bb.get(nameBuf)
+                val nul = nameBuf.indexOf(0)
+                val morphName = String(nameBuf, 0, if (nul >= 0) nul else 64, Charsets.US_ASCII)
+                if (morphName == "End Morphs") break
+                if (bb.remaining() < 4) break
+                val mv = bb.int
+                val skipBytes = mv.toLong() * 48L
+                if (mv <= 0 || bb.remaining() < skipBytes) break
+                bb.position(bb.position() + skipBytes.toInt())
+            }
+
+            fun interleaveSlice(vOff: Int, vCount: Int): FloatArray {
+                val arr = FloatArray(vCount * 8)
+                for (i in 0 until vCount) {
+                    val src = vOff + i
+                    val o = i * 8
+                    arr[o] = positions[src * 3]
+                    arr[o + 1] = positions[src * 3 + 1]
+                    arr[o + 2] = positions[src * 3 + 2]
+                    arr[o + 3] = normals[src * 3]
+                    arr[o + 4] = normals[src * 3 + 1]
+                    arr[o + 5] = normals[src * 3 + 2]
+                    arr[o + 6] = uvs[src * 2]
+                    arr[o + 7] = uvs[src * 2 + 1]
+                }
+                return arr
+            }
+
+            val submeshes = ArrayList<DecodedSubmesh>()
+            if (bb.remaining() >= 2) {
+                val mark = bb.position()
+                val numSubs = bb.short.toInt() and 0xFFFF
+                if (numSubs in 1..64 && bb.remaining() >= numSubs * 10) {
+                    var valid = true
+                    val tmp = ArrayList<DecodedSubmesh>(numSubs)
+                    repeat(numSubs) {
+                        val matIdx = bb.short.toInt() and 0xFFFF
+                        val idxOff = bb.short.toInt() and 0xFFFF
+                        val idxCnt = bb.short.toInt() and 0xFFFF
+                        val vOff = bb.short.toInt() and 0xFFFF
+                        val vCnt = bb.short.toInt() and 0xFFFF
+                        if (idxOff + idxCnt <= indices.size && vOff + vCnt <= numVertices) {
+                            val subIdx = ShortArray(idxCnt) { k -> (indices[idxOff + k] - vOff).toShort() }
+                            tmp.add(
+                                DecodedSubmesh(
+                                    faceIndex = matIdx,
+                                    interleavedVertices = interleaveSlice(vOff, vCnt),
+                                    vertexCount = vCnt,
+                                    indices = subIdx,
+                                    indexCount = idxCnt
+                                )
+                            )
+                        } else {
+                            valid = false
+                        }
+                    }
+                    if (valid) submeshes.addAll(tmp) else bb.position(mark)
+                }
+            }
+
+            if (submeshes.isEmpty()) {
+                submeshes.add(
+                    DecodedSubmesh(
+                        faceIndex = 0,
+                        interleavedVertices = interleaveSlice(0, numVertices),
+                        vertexCount = numVertices,
+                        indices = indices,
+                        indexCount = indices.size
+                    )
+                )
+            }
+
+            DecodedMeshAsset(
+                lodName = "high_lod",
+                submeshes = submeshes,
+                isRigged = hasWeights,
+                jointNames = jointNames,
+                totalTriangles = numFaces,
+                minZ = if (minZ.isFinite()) minZ else -0.5f,
+                maxZ = if (maxZ.isFinite()) maxZ else 0.5f
+            )
+        } catch (_: Exception) {
+            null
         }
     }
 }
