@@ -37,7 +37,20 @@ data class CapsAttachmentTransform(
 sealed class CapsEvent {
     data class TeleportFinish(val simIp: String, val simPort: Int, val seedCap: String, val regionHandle: Long) : CapsEvent()
     data class ParcelProperties(val parcelName: String, val parcelDesc: String) : CapsEvent()
-    data class ScriptDialog(val objectName: String, val message: String, val buttons: List<String>, val channel: Int) : CapsEvent()
+    data class ScriptDialog(
+        val objectName: String,
+        val message: String,
+        val buttons: List<String>,
+        val channel: Int,
+        val isTextBox: Boolean = false,
+        val objectId: UUID? = null,
+        val ownerName: String = ""
+    ) : CapsEvent()
+    data class MoneyBalanceUpdated(
+        val moneyBalance: Int,
+        val transactionSuccess: Boolean = true,
+        val description: String = ""
+    ) : CapsEvent()
     data class AttachmentsUpdated(val updates: List<CapsAttachmentTransform>) : CapsEvent()
     data class GenericNotice(val title: String, val message: String) : CapsEvent()
     data class HealthChanged(
@@ -553,7 +566,7 @@ class CapabilityManager(
         }
     }
 
-    private fun dispatchCapsEvent(message: String, body: LlsdValue) {
+    internal fun dispatchCapsEvent(message: String, body: LlsdValue) {
         when (message) {
             "TeleportFinish" -> {
                 val info = body["Info"].asList().firstOrNull() ?: return
@@ -576,16 +589,42 @@ class CapabilityManager(
                 }
             }
             "ScriptDialog" -> {
-                val data = body["Data"].asList().firstOrNull() ?: return
-                val buttons = body["Buttons"].asList().map { it["ButtonLabel"].asString() }.filter { it.isNotBlank() }
+                val data = body["Data"].asList().firstOrNull()
+                    ?: (body["Data"] as? LlsdValue.MapVal)
+                    ?: return
+                val rawLabels = body["Buttons"].asList().map { entry ->
+                    entry["ButtonLabel"].asString().ifBlank { entry.asString() }
+                }
+                val (buttons, isTextBox) = ScriptAndEconomyProtocol.extractScriptDialogButtons(rawLabels)
+                val firstName = data["FirstName"].asString()
+                val lastName = data["LastName"].asString()
+                val ownerName = "$firstName $lastName".trim()
                 _capsEvents.tryEmit(
                     CapsEvent.ScriptDialog(
-                        objectName = data["ObjectName"].asString("Scripted Object"),
+                        objectName = data["ObjectName"].asString("Scripted Object").ifBlank { "Scripted Object" },
                         message = data["Message"].asString(),
                         buttons = buttons,
-                        channel = data["ChatChannel"].asInt(0)
+                        channel = data["ChatChannel"].asInt(0),
+                        isTextBox = isTextBox,
+                        objectId = data["ObjectID"].asUuidOrNull(),
+                        ownerName = ownerName
                     )
                 )
+            }
+            "MoneyBalanceReply" -> {
+                val moneyData = body["MoneyData"].asList().firstOrNull()
+                    ?: (body["MoneyData"] as? LlsdValue.MapVal)
+                    ?: return
+                val balance = moneyData["MoneyBalance"].asInt(Int.MIN_VALUE)
+                if (balance != Int.MIN_VALUE) {
+                    _capsEvents.tryEmit(
+                        CapsEvent.MoneyBalanceUpdated(
+                            moneyBalance = balance,
+                            transactionSuccess = moneyData["TransactionSuccess"].asBool(true),
+                            description = moneyData["Description"].asString().trim()
+                        )
+                    )
+                }
             }
             "ChatterBoxInvitation" -> {
                 val sessionName = body["session_name"].asString("Group Chat")

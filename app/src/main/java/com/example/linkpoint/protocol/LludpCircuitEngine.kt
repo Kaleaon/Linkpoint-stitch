@@ -105,6 +105,34 @@ sealed class SimEvent {
         val description: String
     ) : SimEvent()
 
+    data class ScriptQuestionReceived(
+        val taskId: UUID,
+        val itemId: UUID,
+        val objectName: String,
+        val objectOwner: String,
+        val questions: Int,
+        val permissions: List<ScriptAndEconomyProtocol.LslPermissionInfo>,
+        val hasDebitPermission: Boolean
+    ) : SimEvent()
+
+    data class ScriptDialogReceived(
+        val objectId: UUID,
+        val objectName: String,
+        val ownerName: String,
+        val message: String,
+        val buttons: List<String>,
+        val channel: Int,
+        val isTextBox: Boolean
+    ) : SimEvent()
+
+    data class MoneyBalanceReceived(
+        val moneyBalance: Int,
+        val transactionSuccess: Boolean,
+        val description: String,
+        val amount: Int = 0,
+        val transactionType: Int = 0
+    ) : SimEvent()
+
     data class CoarseLocationsUpdated(val locations: List<Vec3>) : SimEvent()
     data class TerrainPatchReceived(val patchX: Int, val patchY: Int, val avgHeight: Float) : SimEvent()
     data class MapBlockReceived(val x: Int, val y: Int, val name: String, val access: Int, val agents: Int) : SimEvent()
@@ -491,6 +519,12 @@ class LludpCircuitEngine {
                         LludpPackets.buildAvatarPropertiesRequest(agentId, sessionId, agentId),
                         reliable = true
                     )
+                    send(
+                        LludpPackets.MSG_MONEY_BALANCE_REQUEST,
+                        LludpPackets.buildMoneyBalanceRequest(agentId, sessionId, UUID.randomUUID()),
+                        reliable = true,
+                        zeroCode = true
+                    )
                     handshakeCompleted.set(true)
                     emitHealth(
                         status = LayerHealthStatus.HEALTHY,
@@ -640,6 +674,66 @@ class LludpCircuitEngine {
                             _events.tryEmit(SimEvent.ObjectPropertiesReceived(objId, creatorId, ownerId, name, desc))
                         }
                     }
+                }
+            }
+            LludpPackets.MSG_SCRIPT_QUESTION -> {
+                val parsed = LludpPackets.parseScriptQuestion(buf)
+                if (parsed != null && parsed.questions != 0) {
+                    _events.tryEmit(
+                        SimEvent.ScriptQuestionReceived(
+                            taskId = parsed.taskId,
+                            itemId = parsed.itemId,
+                            objectName = parsed.objectName,
+                            objectOwner = parsed.objectOwner,
+                            questions = parsed.questions,
+                            permissions = parsed.permissions,
+                            hasDebitPermission = parsed.hasDebitPermission
+                        )
+                    )
+                }
+            }
+            LludpPackets.MSG_SCRIPT_DIALOG -> {
+                val parsed = LludpPackets.parseScriptDialog(buf)
+                if (parsed != null) {
+                    _events.tryEmit(
+                        SimEvent.ScriptDialogReceived(
+                            objectId = parsed.objectId,
+                            objectName = parsed.objectName,
+                            ownerName = parsed.ownerName,
+                            message = parsed.message,
+                            buttons = parsed.buttons,
+                            channel = parsed.chatChannel,
+                            isTextBox = parsed.isTextBox
+                        )
+                    )
+                }
+            }
+            LludpPackets.MSG_MONEY_BALANCE_REPLY -> {
+                val parsed = LludpPackets.parseMoneyBalanceReply(buf, hasRoutedTargetHeader = false)
+                if (parsed != null) {
+                    _events.tryEmit(
+                        SimEvent.MoneyBalanceReceived(
+                            moneyBalance = parsed.moneyBalance,
+                            transactionSuccess = parsed.transactionSuccess,
+                            description = parsed.description,
+                            amount = parsed.amount,
+                            transactionType = parsed.transactionType
+                        )
+                    )
+                }
+            }
+            LludpPackets.MSG_ROUTED_MONEY_BALANCE_REPLY -> {
+                val parsed = LludpPackets.parseMoneyBalanceReply(buf, hasRoutedTargetHeader = true)
+                if (parsed != null) {
+                    _events.tryEmit(
+                        SimEvent.MoneyBalanceReceived(
+                            moneyBalance = parsed.moneyBalance,
+                            transactionSuccess = parsed.transactionSuccess,
+                            description = parsed.description,
+                            amount = parsed.amount,
+                            transactionType = parsed.transactionType
+                        )
+                    )
                 }
             }
             LludpPackets.MSG_LOGOUT_REPLY -> {
@@ -1309,6 +1403,50 @@ class LludpCircuitEngine {
         if (!running.get()) return
         val body = LludpPackets.buildDetachAttachment(agentId, sessionId, itemId)
         send(LludpPackets.MSG_DETACH_ATTACHMENT, body, reliable = true)
+    }
+
+    fun sendScriptAnswerYes(taskId: UUID, itemId: UUID, questions: Int) {
+        if (!running.get()) return
+        val body = LludpPackets.buildScriptAnswerYes(agentId, sessionId, taskId, itemId, questions)
+        send(LludpPackets.MSG_SCRIPT_ANSWER_YES, body, reliable = true, zeroCode = false)
+    }
+
+    fun requestMoneyBalance() {
+        if (!running.get()) return
+        val body = LludpPackets.buildMoneyBalanceRequest(agentId, sessionId, UUID.randomUUID())
+        send(LludpPackets.MSG_MONEY_BALANCE_REQUEST, body, reliable = true, zeroCode = true)
+    }
+
+    fun sendMoneyTransfer(
+        destId: UUID,
+        amount: Int,
+        transactionType: Int,
+        description: String = "",
+        flags: Int = 0,
+        aggregatePermNextOwner: Int = 0,
+        aggregatePermInventory: Int = 0
+    ) {
+        if (!running.get()) return
+        if (amount <= 0) return
+        val body = LludpPackets.buildMoneyTransferRequest(
+            agentId = agentId,
+            sessionId = sessionId,
+            sourceId = agentId,
+            destId = destId,
+            amount = amount,
+            transactionType = transactionType,
+            flags = flags,
+            aggregatePermNextOwner = aggregatePermNextOwner,
+            aggregatePermInventory = aggregatePermInventory,
+            description = description
+        )
+        send(LludpPackets.MSG_MONEY_TRANSFER_REQUEST, body, reliable = true, zeroCode = true)
+    }
+
+    internal fun decodeAndDispatchForTesting(rawBytes: ByteArray, length: Int = rawBytes.size): Boolean {
+        val decoded = LludpPackets.decodePacket(rawBytes, length) ?: return false
+        handleDecodedPacket(decoded)
+        return true
     }
 
     private fun flushPendingAcks() {

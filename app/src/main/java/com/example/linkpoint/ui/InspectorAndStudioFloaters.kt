@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.CenterFocusStrong
 import androidx.compose.material.icons.filled.Chair
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.TouchApp
@@ -38,6 +39,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -75,6 +77,7 @@ fun ObjectInspectorContent(
     val tokens = LocalLinkpointDesign.current
     val clipboard = LocalClipboardManager.current
     val obj = state.selectedObject
+    var showPayDialog by remember(obj?.uuid) { mutableStateOf(false) }
 
     Column(modifier = Modifier.fillMaxWidth()) {
         LinkpointFloaterHeader(
@@ -151,18 +154,42 @@ fun ObjectInspectorContent(
                 modifier = Modifier.weight(1f)
             )
             LinkpointActionButton(
+                text = "Pay L$",
+                icon = Icons.Default.Payments,
+                onClick = { showPayDialog = true },
+                primary = false,
+                testTag = "inspector_pay_button",
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        Spacer(Modifier.height(6.dp))
+
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            LinkpointActionButton(
                 text = if (state.isSitting) "Stand" else "Sit",
                 icon = Icons.Default.Chair,
                 onClick = client::toggleSitOnSelected,
                 primary = false,
-                modifier = Modifier.weight(0.9f)
+                modifier = Modifier.weight(1f)
             )
             LinkpointActionButton(
                 text = "Focus",
                 icon = Icons.Default.CenterFocusStrong,
                 onClick = { client.focusCameraOn(obj.position) },
                 primary = false,
-                modifier = Modifier.weight(0.9f)
+                modifier = Modifier.weight(1f)
+            )
+        }
+
+        if (showPayDialog) {
+            QuickPayModal(
+                recipientName = obj.name,
+                isObjectPayment = true,
+                currentBalance = state.lindenBalance,
+                client = client,
+                onConfirmPayment = { amount, note -> client.payObject(obj, amount, note) },
+                onDismiss = { showPayDialog = false }
             )
         }
     }

@@ -32,6 +32,7 @@ import com.example.linkpoint.protocol.LludpPackets
 import com.example.linkpoint.protocol.LoginRequestParams
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
+import com.example.linkpoint.protocol.ScriptAndEconomyProtocol
 import com.example.linkpoint.protocol.SimEvent
 import com.example.linkpoint.protocol.SlBinaryParsers
 import com.example.linkpoint.protocol.XmlRpcLoginClient
@@ -60,6 +61,7 @@ import com.example.linkpoint.store.InventoryEntry
 import com.example.linkpoint.store.MapRegionTile
 import com.example.linkpoint.store.NearbyAvatarInfo
 import com.example.linkpoint.store.ScriptDialogPrompt
+import com.example.linkpoint.store.ScriptPermissionPrompt
 import com.example.linkpoint.store.ViewerState
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Job
@@ -493,6 +495,39 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             pushSceneSnapshot()
                         }
                     }
+                    is SimEvent.ScriptQuestionReceived -> {
+                        _state.update {
+                            it.copy(
+                                scriptQuestion = ScriptPermissionPrompt(
+                                    taskId = evt.taskId,
+                                    itemId = evt.itemId,
+                                    objectName = evt.objectName,
+                                    ownerName = evt.objectOwner,
+                                    questions = evt.questions,
+                                    permissions = evt.permissions,
+                                    hasDebitPermission = evt.hasDebitPermission
+                                )
+                            )
+                        }
+                    }
+                    is SimEvent.ScriptDialogReceived -> {
+                        _state.update {
+                            it.copy(
+                                scriptDialog = ScriptDialogPrompt(
+                                    objectName = evt.objectName,
+                                    message = evt.message,
+                                    buttons = evt.buttons,
+                                    channel = evt.channel,
+                                    isTextBox = evt.isTextBox,
+                                    objectId = evt.objectId,
+                                    ownerName = evt.ownerName
+                                )
+                            )
+                        }
+                    }
+                    is SimEvent.MoneyBalanceReceived -> {
+                        handleMoneyBalanceUpdate(evt.moneyBalance, evt.transactionSuccess, evt.description)
+                    }
                     is SimEvent.TerrainPatchReceived -> {
                         terrain.applyPatch(evt.patchX, evt.patchY, evt.avgHeight)
                         pushSceneSnapshot()
@@ -566,7 +601,20 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 when (evt) {
                     is CapsEvent.ParcelProperties -> _state.update { it.copy(parcelName = evt.parcelName) }
                     is CapsEvent.ScriptDialog -> _state.update {
-                        it.copy(scriptDialog = ScriptDialogPrompt(evt.objectName, evt.message, evt.buttons, evt.channel))
+                        it.copy(
+                            scriptDialog = ScriptDialogPrompt(
+                                objectName = evt.objectName,
+                                message = evt.message,
+                                buttons = evt.buttons,
+                                channel = evt.channel,
+                                isTextBox = evt.isTextBox,
+                                objectId = evt.objectId,
+                                ownerName = evt.ownerName
+                            )
+                        )
+                    }
+                    is CapsEvent.MoneyBalanceUpdated -> {
+                        handleMoneyBalanceUpdate(evt.moneyBalance, evt.transactionSuccess, evt.description)
                     }
                     is CapsEvent.AttachmentsUpdated -> {
                         applyCapsAttachmentUpdates(evt.updates)
@@ -1103,6 +1151,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     ),
                     avatarPosition = Vec3(128f, 128f, 23f),
                     inventoryEntries = invEntries,
+                    lindenBalance = null,
+                    scriptDialog = null,
+                    scriptQuestion = null,
                     localChat = listOf(
                         ChatMessage(speaker = grid.name, text = response.message, isSystem = true),
                         ChatMessage(
@@ -1209,6 +1260,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 inventoryEntries = sandboxInventory,
                 expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
                 mapRegions = sandboxMap,
+                lindenBalance = ScriptAndEconomyProtocol.SANDBOX_DEFAULT_BALANCE,
+                scriptDialog = null,
+                scriptQuestion = null,
                 localChat = listOf(
                     ChatMessage(
                         speaker = "Linkpoint Sandbox",
@@ -1249,7 +1303,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 selectedAvatarId = null,
                 projectedNametags = emptyList(),
                 activeKeyboardHint = null,
+                lindenBalance = null,
                 scriptDialog = null,
+                scriptQuestion = null,
                 hudEditMode = false
             )
         }
@@ -2065,14 +2121,164 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     }
 
     override fun respondScriptDialog(buttonLabel: String, channel: Int) {
+        val currentDialog = _state.value.scriptDialog
+        val payload = if (currentDialog?.isTextBox == true) {
+            val bytes = buttonLabel.toByteArray(Charsets.UTF_8)
+            if (bytes.size <= 250) buttonLabel else String(bytes, 0, 250, Charsets.UTF_8)
+        } else {
+            buttonLabel
+        }
+        setTextInputFocused(false)
         if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendChat(buttonLabel, 1, channel)
+            lludpEngine.sendChat(payload, 1, channel)
+        } else if (_state.value.connection is ConnectionState.LocalSandbox) {
+            appendLocalChat(
+                ChatMessage(
+                    speaker = selfAvatarName,
+                    text = "[ch $channel] $payload",
+                    channel = channel,
+                    isSystem = true
+                )
+            )
+            showToast("Submitted to ${currentDialog?.objectName ?: "Script"} on ch $channel")
         }
         _state.update { it.copy(scriptDialog = null) }
     }
 
     override fun dismissScriptDialog() {
+        setTextInputFocused(false)
         _state.update { it.copy(scriptDialog = null) }
+    }
+
+    override fun respondScriptPermission(grant: Boolean) {
+        val prompt = _state.value.scriptQuestion ?: return
+        val answerMask = if (grant) prompt.questions else 0
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendScriptAnswerYes(prompt.taskId, prompt.itemId, answerMask)
+        }
+        _state.update { it.copy(scriptQuestion = null) }
+        val statusMsg = if (grant) {
+            "Granted script permissions to ${prompt.objectName}"
+        } else {
+            "Denied script permissions for ${prompt.objectName}"
+        }
+        appendLocalChat(ChatMessage(speaker = "Permissions", text = statusMsg, isSystem = true))
+        showToast(statusMsg)
+    }
+
+    override fun dismissScriptPermission() {
+        respondScriptPermission(grant = false)
+    }
+
+    override fun requestBalanceRefresh() {
+        when (_state.value.connection) {
+            is ConnectionState.Connected -> {
+                lludpEngine.requestMoneyBalance()
+                showToast("Refreshing L$ balance…")
+            }
+            is ConnectionState.LocalSandbox -> {
+                val bal = _state.value.lindenBalance ?: ScriptAndEconomyProtocol.SANDBOX_DEFAULT_BALANCE
+                showToast("Sandbox Demo Balance: ${ScriptAndEconomyProtocol.formatLindenAmount(bal)}")
+            }
+            else -> Unit
+        }
+    }
+
+    override fun payAvatar(targetAvatarId: UUID, targetName: String, amount: Int, description: String) {
+        executePayment(
+            destId = targetAvatarId,
+            recipientLabel = targetName.ifBlank { "Resident" },
+            amount = amount,
+            transactionType = ScriptAndEconomyProtocol.TRANS_PAY_GIFT,
+            description = description
+        )
+    }
+
+    override fun payObject(targetObject: SceneObject, amount: Int, description: String) {
+        executePayment(
+            destId = targetObject.uuid,
+            recipientLabel = targetObject.name.ifBlank { "Object #${targetObject.localId}" },
+            amount = amount,
+            transactionType = ScriptAndEconomyProtocol.TRANS_PAY_OBJECT,
+            description = description
+        )
+    }
+
+    private fun executePayment(
+        destId: UUID,
+        recipientLabel: String,
+        amount: Int,
+        transactionType: Int,
+        description: String
+    ) {
+        setTextInputFocused(false)
+        if (amount <= 0) {
+            showToast("Enter an L$ amount greater than 0")
+            return
+        }
+        val cleanNote = description.trim()
+        val formattedAmount = ScriptAndEconomyProtocol.formatLindenAmount(amount)
+        when (_state.value.connection) {
+            is ConnectionState.Connected -> {
+                val knownBalance = _state.value.lindenBalance
+                if (knownBalance != null && amount > knownBalance) {
+                    showToast("Insufficient balance (${ScriptAndEconomyProtocol.formatLindenAmount(knownBalance)})")
+                    return
+                }
+                lludpEngine.sendMoneyTransfer(
+                    destId = destId,
+                    amount = amount,
+                    transactionType = transactionType,
+                    description = cleanNote
+                )
+                val noteSuffix = if (cleanNote.isNotEmpty()) " — \"$cleanNote\"" else ""
+                appendLocalChat(
+                    ChatMessage(
+                        speaker = "Economy",
+                        text = "Sent $formattedAmount to $recipientLabel$noteSuffix",
+                        isSystem = true
+                    )
+                )
+                showToast("Sending $formattedAmount to $recipientLabel…")
+            }
+            is ConnectionState.LocalSandbox -> {
+                val current = _state.value.lindenBalance ?: ScriptAndEconomyProtocol.SANDBOX_DEFAULT_BALANCE
+                if (amount > current) {
+                    showToast("Insufficient sandbox balance (${ScriptAndEconomyProtocol.formatLindenAmount(current)})")
+                    return
+                }
+                val nextBalance = current - amount
+                val noteSuffix = if (cleanNote.isNotEmpty()) " — \"$cleanNote\"" else ""
+                _state.update { it.copy(lindenBalance = nextBalance) }
+                appendLocalChat(
+                    ChatMessage(
+                        speaker = "Economy",
+                        text = "Paid $formattedAmount to $recipientLabel$noteSuffix (Balance: ${ScriptAndEconomyProtocol.formatLindenAmount(nextBalance)})",
+                        isSystem = true
+                    )
+                )
+                showToast("Paid $formattedAmount to $recipientLabel")
+            }
+            else -> {
+                showToast("Connect to a grid or enter Local Sandbox to send L$")
+            }
+        }
+    }
+
+    private fun handleMoneyBalanceUpdate(moneyBalance: Int, transactionSuccess: Boolean, description: String) {
+        _state.update { it.copy(lindenBalance = moneyBalance) }
+        if (description.isNotBlank()) {
+            appendLocalChat(
+                ChatMessage(
+                    speaker = "Economy",
+                    text = description,
+                    isSystem = true
+                )
+            )
+            showToast(description)
+        } else if (!transactionSuccess) {
+            showToast("L$ transaction could not be completed")
+        }
     }
 
     override fun dismissToast() {

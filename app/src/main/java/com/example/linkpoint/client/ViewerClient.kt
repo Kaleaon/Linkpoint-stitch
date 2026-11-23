@@ -91,6 +91,11 @@ interface ViewerClient {
     fun toggleWearInventoryItem(itemId: UUID, targetHudSlot: Int? = null)
     fun respondScriptDialog(buttonLabel: String, channel: Int)
     fun dismissScriptDialog()
+    fun respondScriptPermission(grant: Boolean)
+    fun dismissScriptPermission()
+    fun requestBalanceRefresh()
+    fun payAvatar(targetAvatarId: UUID, targetName: String, amount: Int, description: String = "")
+    fun payObject(targetObject: SceneObject, amount: Int, description: String = "")
     fun dismissToast()
 
     // Personal Layout & Multi-Language Design Studio

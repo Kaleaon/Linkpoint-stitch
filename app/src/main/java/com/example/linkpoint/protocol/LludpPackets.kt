@@ -40,12 +40,15 @@ object LludpPackets {
     const val MSG_AGENT_THROTTLE: Int = 0xFFFF0051.toInt()
     const val MSG_OBJECT_GRAB: Int = 0xFFFF0075.toInt()
     const val MSG_OBJECT_DEGRAB: Int = 0xFFFF0077.toInt()
+    const val MSG_SCRIPT_ANSWER_YES: Int = 0xFFFF0084.toInt()        // Low 132
     const val MSG_CHAT_FROM_SIMULATOR: Int = 0xFFFF008B.toInt()
     const val MSG_REGION_HANDSHAKE: Int = 0xFFFF0094.toInt()
     const val MSG_REGION_HANDSHAKE_REPLY: Int = 0xFFFF0095.toInt()
     const val MSG_AVATAR_APPEARANCE: Int = 0xFFFF009E.toInt()       // Low 158
     const val MSG_AVATAR_PROPERTIES_REQUEST: Int = 0xFFFF00A9.toInt() // Low 169
     const val MSG_AVATAR_PROPERTIES_REPLY: Int = 0xFFFF00AB.toInt()   // Low 171
+    const val MSG_SCRIPT_QUESTION: Int = 0xFFFF00BC.toInt()          // Low 188
+    const val MSG_SCRIPT_DIALOG: Int = 0xFFFF00BE.toInt()            // Low 190
     const val MSG_AGENT_REQUEST_SIT: Int = 0xFFFF0006.toInt()
     const val MSG_OBJECT_SELECT: Int = 0xFFFF00CD.toInt()
     const val MSG_UUID_NAME_REQUEST: Int = 0xFFFF00EB.toInt()       // Low 235
@@ -54,6 +57,10 @@ object LludpPackets {
     const val MSG_LOGOUT_REQUEST: Int = 0xFFFF00FC.toInt()
     const val MSG_LOGOUT_REPLY: Int = 0xFFFF00FD.toInt()
     const val MSG_IMPROVED_INSTANT_MESSAGE: Int = 0xFFFF00FE.toInt()
+    const val MSG_MONEY_TRANSFER_REQUEST: Int = 0xFFFF0137.toInt()   // Low 311
+    const val MSG_MONEY_BALANCE_REQUEST: Int = 0xFFFF0139.toInt()    // Low 313
+    const val MSG_MONEY_BALANCE_REPLY: Int = 0xFFFF013A.toInt()      // Low 314
+    const val MSG_ROUTED_MONEY_BALANCE_REPLY: Int = 0xFFFF013B.toInt() // Low 315
     const val MSG_AGENT_WEARABLES_REQUEST: Int = 0xFFFF017D.toInt() // Low 381
     const val MSG_AGENT_WEARABLES_UPDATE: Int = 0xFFFF017E.toInt()  // Low 382
     const val MSG_REZ_SINGLE_ATTACHMENT: Int = 0xFFFF018B.toInt()
@@ -80,6 +87,19 @@ object LludpPackets {
     const val CONTROL_MOUSELOOK = 1 shl 18      // 0x00040000
     const val CONTROL_TURN_LEFT = 1 shl 25      // 0x02000000 A / Left (Turn Left explicit)
     const val CONTROL_TURN_RIGHT = 1 shl 26     // 0x04000000 D / Right (Turn Right explicit)
+
+    // Standard LSL ScriptQuestion Permission Bitflags
+    const val PERMISSION_DEBIT: Int = ScriptAndEconomyProtocol.PERMISSION_DEBIT
+    const val PERMISSION_TAKE_CONTROLS: Int = ScriptAndEconomyProtocol.PERMISSION_TAKE_CONTROLS
+    const val PERMISSION_TRIGGER_ANIMATION: Int = ScriptAndEconomyProtocol.PERMISSION_TRIGGER_ANIMATION
+    const val PERMISSION_ATTACH: Int = ScriptAndEconomyProtocol.PERMISSION_ATTACH
+    const val PERMISSION_TRACK_CAMERA: Int = ScriptAndEconomyProtocol.PERMISSION_TRACK_CAMERA
+    const val PERMISSION_CONTROL_CAMERA: Int = ScriptAndEconomyProtocol.PERMISSION_CONTROL_CAMERA
+    const val PERMISSION_TELEPORT: Int = ScriptAndEconomyProtocol.PERMISSION_TELEPORT
+
+    // Standard L$ Economy Transaction Types
+    const val TRANS_PAY_GIFT: Int = ScriptAndEconomyProtocol.TRANS_PAY_GIFT
+    const val TRANS_PAY_OBJECT: Int = ScriptAndEconomyProtocol.TRANS_PAY_OBJECT
 
     data class DecodedPacket(
         val flags: Int,
@@ -606,6 +626,56 @@ object LludpPackets {
         putUuid(buf, targetAvatarId)
         return buf.array()
     }
+
+    fun parseScriptQuestion(buf: ByteBuffer): ScriptAndEconomyProtocol.ParsedScriptQuestion? =
+        ScriptAndEconomyProtocol.parseScriptQuestion(buf)
+
+    fun buildScriptAnswerYes(
+        agentId: UUID,
+        sessionId: UUID,
+        taskId: UUID,
+        itemId: UUID,
+        questions: Int
+    ): ByteArray = ScriptAndEconomyProtocol.buildScriptAnswerYes(agentId, sessionId, taskId, itemId, questions)
+
+    fun parseScriptDialog(buf: ByteBuffer): ScriptAndEconomyProtocol.ParsedScriptDialog? =
+        ScriptAndEconomyProtocol.parseScriptDialog(buf)
+
+    fun buildMoneyBalanceRequest(
+        agentId: UUID,
+        sessionId: UUID,
+        transactionId: UUID = UUID(0L, 0L)
+    ): ByteArray = ScriptAndEconomyProtocol.buildMoneyBalanceRequest(agentId, sessionId, transactionId)
+
+    fun parseMoneyBalanceReply(
+        buf: ByteBuffer,
+        hasRoutedTargetHeader: Boolean = false
+    ): ScriptAndEconomyProtocol.ParsedMoneyBalanceReply? =
+        ScriptAndEconomyProtocol.parseMoneyBalanceReply(buf, hasRoutedTargetHeader)
+
+    fun buildMoneyTransferRequest(
+        agentId: UUID,
+        sessionId: UUID,
+        sourceId: UUID = agentId,
+        destId: UUID,
+        amount: Int,
+        transactionType: Int = TRANS_PAY_GIFT,
+        flags: Int = 0,
+        aggregatePermNextOwner: Int = 0,
+        aggregatePermInventory: Int = 0,
+        description: String = ""
+    ): ByteArray = ScriptAndEconomyProtocol.buildMoneyTransferRequest(
+        agentId = agentId,
+        sessionId = sessionId,
+        sourceId = sourceId,
+        destId = destId,
+        amount = amount,
+        transactionType = transactionType,
+        flags = flags,
+        aggregatePermNextOwner = aggregatePermNextOwner,
+        aggregatePermInventory = aggregatePermInventory,
+        description = description
+    )
 
     // --- Binary Helpers ---
 

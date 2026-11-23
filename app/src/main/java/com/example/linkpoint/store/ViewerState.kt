@@ -11,6 +11,7 @@ import com.example.linkpoint.protocol.AssetStreamStats
 import com.example.linkpoint.protocol.ConnectionHealthSnapshot
 import com.example.linkpoint.protocol.NetworkDiagnosticReport
 import com.example.linkpoint.protocol.NetworkErrorCategory
+import com.example.linkpoint.protocol.ScriptAndEconomyProtocol
 import com.example.linkpoint.render.RenderSceneSnapshot
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
@@ -122,7 +123,21 @@ data class ScriptDialogPrompt(
     val objectName: String,
     val message: String,
     val buttons: List<String>,
-    val channel: Int
+    val channel: Int,
+    val isTextBox: Boolean = false,
+    val objectId: UUID? = null,
+    val ownerName: String = ""
+)
+
+data class ScriptPermissionPrompt(
+    val taskId: UUID,
+    val itemId: UUID,
+    val objectName: String,
+    val ownerName: String,
+    val questions: Int,
+    val permissions: List<ScriptAndEconomyProtocol.LslPermissionInfo> =
+        ScriptAndEconomyProtocol.decodePermissionFlags(questions),
+    val hasDebitPermission: Boolean = ScriptAndEconomyProtocol.hasDebitPermission(questions)
 )
 
 /**
@@ -169,7 +184,9 @@ data class ViewerState(
     val inventoryEntries: List<InventoryEntry> = emptyList(),
     val expandedFolderIds: Set<UUID> = emptySet(),
     val mapRegions: List<MapRegionTile> = emptyList(),
+    val lindenBalance: Int? = null,
     val scriptDialog: ScriptDialogPrompt? = null,
+    val scriptQuestion: ScriptPermissionPrompt? = null,
     val toastMessage: String? = null
 )
 
