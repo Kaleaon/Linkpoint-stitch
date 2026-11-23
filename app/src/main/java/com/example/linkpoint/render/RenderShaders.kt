@@ -111,9 +111,12 @@ object RenderShaders {
     """
 
     /**
-     * Hybrid glTF Metallic-Roughness + SL Shininess/Bumpiness/Glow/AlphaMode fragment shader:
-     * - `uMaterialParams`: x = metallic [0..1], y = roughness [0.04..1], z = glow [0..1], w = bumpStrength [0..1]
-     * - `uAlphaParams`: x = alphaMode (0=NONE, 1=BLEND, 2=MASK, 3=EMISSIVE), y = alphaCutoff [0..1]
+     * Hybrid glTF 2.0 Metallic-Roughness + SL Shininess/Bumpiness/Glow/AlphaMode fragment shader:
+     * - `uMaterialParams`: x = metallicFactor [0..1], y = roughnessFactor [0.04..1], z = glow [0..1], w = bumpStrength [0..1]
+     * - `uAlphaParams`: x = alphaMode (0=NONE/OPAQUE, 1=BLEND, 2=MASK, 3=EMISSIVE), y = alphaCutoff [0..1]
+     * - `uMetallicRoughnessTex` (glTF 2.0 ORM packing): `.r` = Ambient Occlusion, `.g` = Roughness, `.b` = Metalness
+     * - `uNormalTex`: Second Life / OpenGL right-handed tangent-space normal map (`+X` right, `+Y` green-up relief, `+Z` outward)
+     * - `uPbrExtraParams`: x = normalScale, y = occlusionStrength [0..1], z = doubleSided (1.0 = two-sided, 0.0 = single-sided)
      */
     const val PRIM_FS = """#version 300 es
         precision mediump float;
@@ -132,11 +135,24 @@ object RenderShaders {
         uniform float uSelectedPulse;
         uniform vec4 uMaterialParams;
         uniform vec2 uAlphaParams;
+        uniform vec3 uEmissiveFactor;
+        uniform vec3 uPbrExtraParams;
         uniform sampler2D uTex;
         uniform float uUseTex;
+        uniform sampler2D uMetallicRoughnessTex;
+        uniform float uUseMetallicRoughnessTex;
+        uniform sampler2D uNormalTex;
+        uniform float uUseNormalTex;
+        uniform sampler2D uEmissiveTex;
+        uniform float uUseEmissiveTex;
         out vec4 fragColor;
 
         void main() {
+            // Enforce glTF 2.0 doubleSided=false backface discard when single-sided
+            if (!gl_FrontFacing && uPbrExtraParams.z < 0.5) {
+                discard;
+            }
+
             vec4 baseCol = uColor;
             float emissiveMaskBoost = 0.0;
             int alphaMode = int(uAlphaParams.x + 0.5);
@@ -159,6 +175,10 @@ object RenderShaders {
                     baseCol *= texCol;
                     if (baseCol.a < 0.06) discard;
                 }
+            } else if (alphaMode == 0) {
+                baseCol.a = 1.0;
+            } else if (alphaMode == 2 && baseCol.a < max(uAlphaParams.y, 0.10)) {
+                discard;
             }
 
             vec3 n = normalize(vNormal);
@@ -166,19 +186,53 @@ object RenderShaders {
                 n = -n;
             }
 
-            // Procedural SL TextureEntry bumpiness perturbation using screen-space derivatives
-            float bumpAmt = uMaterialParams.w;
-            if (bumpAmt > 0.01) {
-                float bu = cos(vUv.x * 37.699) * sin(vUv.y * 37.699);
-                vec3 dpdx = dFdx(vWorldPos);
-                vec3 dpdy = dFdy(vWorldPos);
-                vec3 tangent = normalize(dpdx + vec3(1e-4));
-                vec3 bitangent = normalize(dpdy + vec3(1e-4));
-                n = normalize(n + (tangent * dFdx(bu) + bitangent * dFdy(bu)) * (bumpAmt * 0.45));
+            // Screen-space world & UV derivatives for tangent-space normal maps and SL micro-bump
+            vec3 dp1 = dFdx(vWorldPos);
+            vec3 dp2 = dFdy(vWorldPos);
+            vec2 duv1 = dFdx(vUv);
+            vec2 duv2 = dFdy(vUv);
+
+            if (uUseNormalTex > 0.5) {
+                // Second Life & glTF 2.0 OpenGL right-handed tangent-space normal map convention:
+                // +X = +u tangent, +Y (green channel) = +v bitangent (upward relief, NOT inverted), +Z = +normal
+                float det = duv1.x * duv2.y - duv1.y * duv2.x;
+                vec3 rawT = dp1 * duv2.y - dp2 * duv1.y;
+                vec3 rawB = dp2 * duv1.x - dp1 * duv2.x;
+                float invDet = abs(det) > 1e-7 ? (1.0 / det) : 1.0;
+                vec3 T = rawT * invDet;
+                vec3 B = rawB * invDet;
+                T = T - n * dot(n, T);
+                B = B - n * dot(n, B);
+                float tLen = max(length(T), 1e-5);
+                float bLen = max(length(B), 1e-5);
+                T /= tLen;
+                B /= bLen;
+
+                vec3 tangentNormal = texture(uNormalTex, vUv).xyz * 2.0 - 1.0;
+                tangentNormal.xy *= uPbrExtraParams.x;
+                n = normalize(T * tangentNormal.x + B * tangentNormal.y + n * max(tangentNormal.z, 1e-3));
+            } else {
+                // Procedural SL TextureEntry bumpiness fallback
+                float bumpAmt = uMaterialParams.w;
+                if (bumpAmt > 0.01) {
+                    float bu = cos(vUv.x * 37.699) * sin(vUv.y * 37.699);
+                    vec3 tangent = normalize(dp1 + vec3(1e-4));
+                    vec3 bitangent = normalize(dp2 + vec3(1e-4));
+                    n = normalize(n + (tangent * dFdx(bu) + bitangent * dFdy(bu)) * (bumpAmt * 0.45));
+                }
             }
 
             float metallic = clamp(uMaterialParams.x, 0.0, 1.0);
-            float roughness = clamp(uMaterialParams.y, 0.06, 1.0);
+            float roughness = clamp(uMaterialParams.y, 0.04, 1.0);
+            float occlusion = 1.0;
+            if (uUseMetallicRoughnessTex > 0.5) {
+                // Canonical glTF 2.0 / Second Life ORM channel packing:
+                // Red (.r) = Occlusion, Green (.g) = Roughness, Blue (.b) = Metalness
+                vec4 ormSample = texture(uMetallicRoughnessTex, vUv);
+                occlusion = mix(1.0, ormSample.r, clamp(uPbrExtraParams.y, 0.0, 1.0));
+                roughness = clamp(roughness * ormSample.g, 0.04, 1.0);
+                metallic = clamp(metallic * ormSample.b, 0.0, 1.0);
+            }
             float glow = clamp(uMaterialParams.z + emissiveMaskBoost * 0.75, 0.0, 1.5);
 
             vec3 l = normalize(uSunDir);
@@ -201,22 +255,28 @@ object RenderShaders {
             float gVis = (nDotL / (nDotL * (1.0 - k) + k)) * (nDotV / (nDotV * (1.0 - k) + k));
             vec3 directSpec = (dGgx * gVis * fresnel / max(4.0 * nDotL * nDotV, 0.05)) * nDotL * uSunColor;
 
-            // Analytical sky/horizon IBL reflection for shiny & metallic surfaces
+            // Analytical sky/horizon IBL reflection attenuated by ORM ambient occlusion (.r)
             vec3 reflDir = reflect(-v, n);
             vec3 envSky = mix(uFogColor, uSkyZenith, clamp(reflDir.z * 0.65 + 0.35, 0.0, 1.0));
             vec3 envFresnel = f0 + (max(vec3(1.0 - roughness), f0) - f0) * pow(1.0 - nDotV, 4.0);
             float smoothness = 1.0 - roughness;
-            vec3 envRefl = envSky * envFresnel * (smoothness * smoothness * 0.75);
+            vec3 envRefl = envSky * envFresnel * (smoothness * smoothness * 0.75) * occlusion;
 
             float backFill = max(dot(n, -l), 0.0) * 0.18;
             float hemi = mix(0.80, 1.15, n.z * 0.5 + 0.5);
             vec3 kD = (vec3(1.0) - fresnel) * (1.0 - metallic);
-            vec3 diffuse = kD * baseCol.rgb * (uAmbient * hemi + backFill + nDotL * uSunColor * 0.86);
+            vec3 indirectDiffuse = kD * baseCol.rgb * (uAmbient * hemi + backFill) * occlusion;
+            vec3 directDiffuse = kD * baseCol.rgb * (nDotL * uSunColor * 0.86);
 
-            vec3 lit = diffuse + directSpec + envRefl;
+            vec3 lit = indirectDiffuse + directDiffuse + directSpec + envRefl;
             lit = mix(lit, baseCol.rgb * 1.10, uFullbright);
 
-            // Second Life Glow / glTF Emissive boost
+            // glTF 2.0 emissiveFactor * emissiveTexture + Second Life Glow
+            vec3 emissiveTerm = uEmissiveFactor;
+            if (uUseEmissiveTex > 0.5) {
+                emissiveTerm *= texture(uEmissiveTex, vUv).rgb;
+            }
+            lit += emissiveTerm;
             if (glow > 0.001) {
                 lit += baseCol.rgb * (glow * 1.15) + vec3(glow * 0.18);
             }

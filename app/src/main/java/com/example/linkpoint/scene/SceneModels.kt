@@ -207,6 +207,16 @@ data class FaceMaterialParams(
     val metallicFactor: Float? = null,
     val roughnessFactor: Float? = null,
     val emissiveColor: Vec3 = Vec3(0f, 0f, 0f),
+    val baseColorFactor: ColorRgba? = null,
+    val doubleSided: Boolean = false,
+    val hasGltfMaterial: Boolean = false,
+    val baseColorTextureId: UUID? = null,
+    val metallicRoughnessTextureId: UUID? = null,
+    val normalTextureId: UUID? = null,
+    val emissiveTextureId: UUID? = null,
+    val occlusionTextureId: UUID? = null,
+    val normalScale: Float = 1.0f,
+    val occlusionStrength: Float = 1.0f,
     val materialId: UUID? = null,
     val renderMaterialId: UUID? = null
 ) {
@@ -301,6 +311,9 @@ data class SceneObject(
     val isTouchable: Boolean = true,
     val isPhysical: Boolean = false,
     val isPhantom: Boolean = false,
+    val isAnimesh: Boolean = false,
+    val activeAnimationIds: List<UUID> = emptyList(),
+    val animState: AvatarAnimState = AvatarAnimState.STAND,
     val attachmentPoint: Int = 0, // 0 = world prim, 1..56 = body attachment, 31..38 = Avatar Attachment HUD
     val attachedAvatarId: UUID? = null,
     val isCapsTransform: Boolean = false,
@@ -320,6 +333,105 @@ data class SceneObject(
         } else {
             base
         }
+    }
+
+    /**
+     * Applies an `ObjectAnimation` (`MSG_OBJECT_ANIMATION`) update to this Animesh [SceneObject],
+     * marking it as an active pseudo-avatar (`isAnimesh = true`) and classifying its primary animation state.
+     */
+    fun withUpdatedAnimations(
+        animationIds: List<UUID>,
+        sequenceIds: Map<UUID, Int> = emptyMap()
+    ): SceneObject {
+        val resolved = AvatarAnimationCatalog.classifyAnimations(
+            animIds = animationIds,
+            sequenceIds = sequenceIds,
+            isSeatedOnPrim = false
+        )
+        return copy(
+            isAnimesh = true,
+            activeAnimationIds = resolved.activeAnimIds,
+            animState = resolved.primaryState
+        )
+    }
+
+    /**
+     * Applies fetched `RenderMaterials` glTF 2.0 material overrides keyed by material UUID
+     * onto `defaultMaterial` and per-face `faceMaterials`.
+     */
+    fun withResolvedRenderMaterials(resolvedById: Map<UUID, FaceMaterialParams>): SceneObject {
+        if (resolvedById.isEmpty()) return this
+        var changed = false
+        val nextDefaultMat = defaultMaterial.renderMaterialId?.let { resolvedById[it] }?.let { gltf ->
+            changed = true
+            mergeGltfIntoFaceMaterial(defaultMaterial, gltf)
+        } ?: defaultMaterial
+
+        val candidateFaces = LinkedHashSet<Int>().apply {
+            addAll(faceMaterials.keys)
+            addAll(renderMaterialIds.keys)
+        }
+        val nextFaceMats = LinkedHashMap<Int, FaceMaterialParams>(candidateFaces.size)
+        for (face in candidateFaces) {
+            val baseFace = faceMaterials[face] ?: nextDefaultMat
+            val matUuid = renderMaterialIds[face] ?: baseFace.renderMaterialId
+            val gltf = matUuid?.let { resolvedById[it] }
+            if (gltf != null) {
+                changed = true
+                nextFaceMats[face] = mergeGltfIntoFaceMaterial(baseFace, gltf)
+            } else if (faceMaterials.containsKey(face)) {
+                nextFaceMats[face] = baseFace
+            }
+        }
+        if (!changed) return this
+
+        val nextDefaultTex = nextDefaultMat.baseColorTextureId ?: defaultTextureId
+        val nextFaceTextures = if (nextFaceMats.values.any { it.baseColorTextureId != null }) {
+            val mergedTex = LinkedHashMap<Int, UUID>(faceTextures)
+            for ((face, fm) in nextFaceMats) {
+                fm.baseColorTextureId?.let { mergedTex[face] = it }
+            }
+            mergedTex
+        } else faceTextures
+
+        val nextDefaultColor = nextDefaultMat.baseColorFactor ?: color
+        val nextFaceColors = if (nextFaceMats.values.any { it.baseColorFactor != null }) {
+            val mergedCol = LinkedHashMap<Int, ColorRgba>(faceColors)
+            for ((face, fm) in nextFaceMats) {
+                fm.baseColorFactor?.let { mergedCol[face] = it }
+            }
+            mergedCol
+        } else faceColors
+
+        return copy(
+            color = nextDefaultColor,
+            defaultTextureId = nextDefaultTex,
+            faceTextures = nextFaceTextures,
+            faceColors = nextFaceColors,
+            defaultMaterial = nextDefaultMat,
+            faceMaterials = nextFaceMats
+        )
+    }
+
+    private fun mergeGltfIntoFaceMaterial(base: FaceMaterialParams, gltf: FaceMaterialParams): FaceMaterialParams {
+        return base.copy(
+            alphaMode = gltf.alphaMode,
+            alphaCutoff = gltf.alphaCutoff,
+            metallicFactor = gltf.metallicFactor ?: base.metallicFactor,
+            roughnessFactor = gltf.roughnessFactor ?: base.roughnessFactor,
+            emissiveColor = gltf.emissiveColor,
+            baseColorFactor = gltf.baseColorFactor ?: base.baseColorFactor,
+            doubleSided = gltf.doubleSided,
+            hasGltfMaterial = true,
+            baseColorTextureId = gltf.baseColorTextureId ?: base.baseColorTextureId,
+            metallicRoughnessTextureId = gltf.metallicRoughnessTextureId ?: base.metallicRoughnessTextureId,
+            normalTextureId = gltf.normalTextureId ?: base.normalTextureId,
+            emissiveTextureId = gltf.emissiveTextureId ?: base.emissiveTextureId,
+            occlusionTextureId = gltf.occlusionTextureId ?: base.occlusionTextureId,
+            normalScale = gltf.normalScale,
+            occlusionStrength = gltf.occlusionStrength,
+            renderMaterialId = gltf.renderMaterialId ?: base.renderMaterialId
+        )
     }
 }
 

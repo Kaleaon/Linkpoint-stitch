@@ -73,6 +73,10 @@ sealed class SimEvent {
         val animations: List<LludpPackets.AvatarAnimationEntry>,
         val sourceObjectIds: List<UUID> = emptyList()
     ) : SimEvent()
+    data class ObjectAnimationsUpdated(
+        val objectId: UUID,
+        val animations: List<LludpPackets.AvatarAnimationEntry>
+    ) : SimEvent()
     data class TerseObjectUpdated(
         val localId: Int,
         val isAvatar: Boolean,
@@ -562,6 +566,7 @@ class LludpCircuitEngine {
             LludpPackets.MSG_OBJECT_UPDATE_COMPRESSED -> parseObjectUpdateCompressed(buf)
             LludpPackets.MSG_IMPROVED_TERSE_OBJECT_UPDATE -> parseImprovedTerseObjectUpdate(buf)
             LludpPackets.MSG_AVATAR_ANIMATION -> parseAvatarAnimation(buf)
+            LludpPackets.MSG_OBJECT_ANIMATION -> parseObjectAnimation(buf)
             LludpPackets.MSG_AVATAR_APPEARANCE -> parseAvatarAppearance(buf)
             LludpPackets.MSG_AVATAR_PROPERTIES_REPLY -> parseAvatarPropertiesReply(buf)
             LludpPackets.MSG_AGENT_WEARABLES_UPDATE -> parseAgentWearablesUpdate(buf)
@@ -802,9 +807,12 @@ class LludpCircuitEngine {
             } else {
                 val attachmentPoint = SlBinaryParsers.decodeAttachmentPoint(state, parentId)
                 val shape = primShapeFromCurves(pCode, pathCurve, profileCurve)
+                val isAnimesh = extraParams.isAnimatedObject ||
+                    (updateFlags and SlBinaryParsers.OBJECT_FLAG_ANIM_SOURCE) != 0
                 val label = hoverText.takeIf { it.isNotBlank() }
                     ?: if (attachmentPoint in 31..38) "HUD Attachment #$localId"
                     else if (attachmentPoint in 1..56) "Attachment #$localId"
+                    else if (isAnimesh) "Animesh #$localId"
                     else if (extraParams.isMesh) "Mesh #$localId"
                     else "Object #$localId"
                 val defaultMat = if (extraParams.defaultRenderMaterialId != null) {
@@ -820,7 +828,11 @@ class LludpCircuitEngine {
                             parentId = parentId,
                             ownerId = ownerId,
                             name = label,
-                            description = if (extraParams.isMesh) "Streamed SL Mesh" else "Streamed LLUDP Object (PCode=$pCode)",
+                            description = when {
+                                isAnimesh -> "Streamed SL Animesh"
+                                extraParams.isMesh -> "Streamed SL Mesh"
+                                else -> "Streamed LLUDP Object (PCode=$pCode)"
+                            },
                             pCode = pCode,
                             shape = shape,
                             position = pos,
@@ -839,6 +851,7 @@ class LludpCircuitEngine {
                             isScripted = (updateFlags and 0x00000004) != 0,
                             isPhysical = (updateFlags and 0x00000001) != 0,
                             isPhantom = (updateFlags and 0x00000020) != 0,
+                            isAnimesh = isAnimesh,
                             attachmentPoint = attachmentPoint
                         )
                     )
@@ -979,9 +992,12 @@ class LludpCircuitEngine {
                     )
                 } else {
                     val attachmentPoint = SlBinaryParsers.decodeAttachmentPoint(state, parentId)
+                    val isAnimesh = extraParams.isAnimatedObject ||
+                        (updateFlags and SlBinaryParsers.OBJECT_FLAG_ANIM_SOURCE) != 0
                     val label = hoverText.takeIf { it.isNotBlank() }
                         ?: if (attachmentPoint in 31..38) "HUD Attachment #$localId"
                         else if (attachmentPoint in 1..56) "Attachment #$localId"
+                        else if (isAnimesh) "Animesh #$localId"
                         else if (extraParams.isMesh) "Mesh #$localId"
                         else "Prim #$localId"
                     val defaultMat = if (extraParams.defaultRenderMaterialId != null) {
@@ -997,7 +1013,11 @@ class LludpCircuitEngine {
                                 parentId = parentId,
                                 ownerId = ownerId,
                                 name = label,
-                                description = if (extraParams.isMesh) "Streamed SL Mesh" else "Compressed LLUDP Object (PCode=$pCode)",
+                                description = when {
+                                    isAnimesh -> "Streamed SL Animesh"
+                                    extraParams.isMesh -> "Streamed SL Mesh"
+                                    else -> "Compressed LLUDP Object (PCode=$pCode)"
+                                },
                                 pCode = pCode,
                                 shape = primShapeFromCurves(pCode, pathCurve, profileCurve),
                                 position = pos,
@@ -1016,6 +1036,7 @@ class LludpCircuitEngine {
                                 isScripted = (updateFlags and 0x00000004) != 0,
                                 isPhysical = (updateFlags and 0x00000001) != 0,
                                 isPhantom = (updateFlags and 0x00000020) != 0,
+                                isAnimesh = isAnimesh,
                                 attachmentPoint = attachmentPoint
                             )
                         )
@@ -1096,6 +1117,16 @@ class LludpCircuitEngine {
                 agentId = parsed.agentId,
                 animations = parsed.animations,
                 sourceObjectIds = parsed.sourceObjectIds
+            )
+        )
+    }
+
+    private fun parseObjectAnimation(buf: ByteBuffer) {
+        val parsed = LludpPackets.parseObjectAnimation(buf) ?: return
+        _events.tryEmit(
+            SimEvent.ObjectAnimationsUpdated(
+                objectId = parsed.objectId,
+                animations = parsed.animations
             )
         )
     }

@@ -31,10 +31,18 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
+import java.util.zip.Deflater
+import java.util.zip.Inflater
 import kotlin.math.PI
 
 class Phase5ViewerParityTest {
@@ -591,5 +599,371 @@ class Phase5ViewerParityTest {
                 assertEquals("Shared uniform '$uName' in $label must have identical precision & type", vsDecl, fsDecl)
             }
         }
+    }
+
+    @Test
+    fun `MSG_OBJECT_ANIMATION frames strictly unencoded High 30 packet and emits ObjectAnimationsUpdated`() = runBlocking {
+        // Choose an object UUID & sequenceId=0 containing embedded zero runs so zero-coding would compress it if mistakenly enabled
+        val animeshObjectId = UUID.fromString("00110022-0000-4000-8000-000000000033")
+        val customPetIdle = UUID.fromString("cafebabe-0000-4111-8222-000000000099")
+        val entries = listOf(
+            LludpPackets.AvatarAnimationEntry(AvatarAnimationCatalog.ANIM_AGENT_DANCE1, 0),
+            LludpPackets.AvatarAnimationEntry(customPetIdle, 7)
+        )
+
+        val payload = LludpPackets.buildObjectAnimationPayload(
+            objectId = animeshObjectId,
+            animations = entries
+        )
+        assertEquals(16 + 1 + entries.size * 20, payload.size)
+
+        val framed = LludpPackets.framePacket(
+            sequenceNumber = 29,
+            reliable = true,
+            messageId = LludpPackets.MSG_OBJECT_ANIMATION,
+            body = payload,
+            useZeroCoding = true // Must STILL frame unencoded because ObjectAnimation High 30 is Unencoded in message_template.msg
+        )
+
+        // Verify 6-byte LLUDP header (flags + seq[4] + extraLen=0) + High 30 (0x1E) message ID and strict absence of FLAG_ZEROCODED (0x80)
+        assertEquals("ObjectAnimation must NOT set FLAG_ZEROCODED", 0, framed[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        assertEquals(LludpPackets.FLAG_RELIABLE, framed[0].toInt() and LludpPackets.FLAG_RELIABLE)
+        assertEquals(0, framed[5].toInt() and 0xFF) // extraHeaderLen = 0
+        assertEquals(0x1E, framed[6].toInt() and 0xFF) // High frequency message ID 30
+        assertEquals("Unencoded frame must preserve exact raw payload length", 7 + payload.size, framed.size)
+
+        val decoded = LludpPackets.decodePacket(framed, framed.size)
+        assertNotNull(decoded)
+        assertEquals(LludpPackets.MSG_OBJECT_ANIMATION, decoded!!.messageId)
+
+        val engine = LludpCircuitEngine()
+        var emitted: SimEvent.ObjectAnimationsUpdated? = null
+        val collector = launch {
+            emitted = withTimeout(2_000L) {
+                engine.events.first { it is SimEvent.ObjectAnimationsUpdated } as SimEvent.ObjectAnimationsUpdated
+            }
+        }
+        kotlinx.coroutines.yield()
+        engine.handleDecodedPacketForTesting(decoded)
+        collector.join()
+        engine.disconnect(sendLogout = false)
+
+        val received = emitted!!
+        assertEquals(animeshObjectId, received.objectId)
+        assertEquals(2, received.animations.size)
+        assertEquals(AvatarAnimationCatalog.ANIM_AGENT_DANCE1, received.animations[0].animId)
+        assertEquals(0, received.animations[0].sequenceId)
+        assertEquals(customPetIdle, received.animations[1].animId)
+        assertEquals(7, received.animations[1].sequenceId)
+    }
+
+    @Test
+    fun `Animesh AnimatedObject flags in ExtraParams and ObjectUpdate animate SceneObject independently`() = runBlocking {
+        val animeshUuid = UUID.fromString("77777777-8888-4999-8aaa-bbbbbbbbbbbb")
+        val meshUuid = UUID.fromString("cccccccc-dddd-4eee-8fff-111111111111")
+
+        // 1. ExtraParams carrying Mesh (0x0060) + ExtendedMesh (0x0090) with EXTENDED_MESH_ANIMATED_OBJECT (0x01)
+        val extraBuf = ByteBuffer.allocate(1 + (6 + 16) + (6 + 4)).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put(2.toByte())
+            putShort(SlBinaryParsers.EXTRA_PARAM_MESH.toShort())
+            putInt(16)
+            LludpPackets.putUuid(this, meshUuid)
+            putShort(SlBinaryParsers.EXTRA_PARAM_EXTENDED_MESH.toShort())
+            putInt(4)
+            putInt(SlBinaryParsers.EXTENDED_MESH_ANIMATED_OBJECT)
+        }.array()
+
+        val parsedExtra = SlBinaryParsers.parseExtraParams(extraBuf)
+        assertTrue(parsedExtra.isMesh)
+        assertTrue("Expected ExtendedMesh bit 0x01 to mark isAnimatedObject=true", parsedExtra.isAnimatedObject)
+
+        // 2. Full MSG_OBJECT_UPDATE (12) for a rigged Animesh world object (PCode=9, OBJECT_FLAG_ANIM_SOURCE + ExtendedMesh)
+        val objData = ByteBuffer.allocate(60).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putFloat(132f); putFloat(126f); putFloat(23.5f)
+            repeat(6) { putFloat(0f) }
+            putFloat(0f); putFloat(0f); putFloat(0f)
+            repeat(3) { putFloat(0f) }
+        }.array()
+
+        val payloadBuf = ByteBuffer.allocate(512).order(ByteOrder.LITTLE_ENDIAN).apply {
+            putLong(0x000003E8000003E8L)
+            putShort(100)
+            put(1.toByte())
+            putInt(4242) // LocalID
+            put(0.toByte())
+            LludpPackets.putUuid(this, animeshUuid)
+            putInt(0)
+            put(9.toByte()) // PCode = 9 (PRIM / MESH)
+            put(3.toByte())
+            put(0.toByte())
+            putFloat(0.65f); putFloat(0.55f); putFloat(1.85f)
+            put(objData.size.toByte())
+            put(objData)
+            putInt(0) // World root object (not attached to an avatar)
+            putInt(SlBinaryParsers.OBJECT_FLAG_ANIM_SOURCE)
+            put(16.toByte()); put(1.toByte())
+            put(ByteArray(21))
+            putShort(0) // TE
+            put(0.toByte()) // TextureAnim
+            putShort(0) // NameValue
+            putShort(0) // Data
+            put(0.toByte()) // Text
+            putInt(0) // TextColor
+            put(0.toByte()) // MediaURL
+            put(0.toByte()) // PSBlock
+            put(extraBuf.size.toByte())
+            put(extraBuf)
+            put(ByteArray(66))
+        }
+        val objPayload = payloadBuf.array().copyOf(payloadBuf.position())
+        val framedUpdate = LludpPackets.framePacket(5, true, LludpPackets.MSG_OBJECT_UPDATE, objPayload, useZeroCoding = false)
+        val decoded = LludpPackets.decodePacket(framedUpdate, framedUpdate.size)!!
+
+        val engine = LludpCircuitEngine()
+        var objectEvt: SimEvent.ObjectUpdated? = null
+        val job = launch {
+            objectEvt = withTimeout(2_000L) {
+                engine.events.first { it is SimEvent.ObjectUpdated } as SimEvent.ObjectUpdated
+            }
+        }
+        kotlinx.coroutines.yield()
+        engine.handleDecodedPacketForTesting(decoded)
+        job.join()
+        engine.disconnect(sendLogout = false)
+
+        val animeshObj = objectEvt!!.sceneObject
+        assertTrue("Expected SceneObject.isAnimesh to be true from AnimatedObject flags", animeshObj.isAnimesh)
+        assertEquals(meshUuid, animeshObj.meshAssetId)
+
+        // Apply independent ObjectAnimation update and verify pseudo-avatar pose evaluation across time
+        val walkingAnimesh = animeshObj.withUpdatedAnimations(
+            animationIds = listOf(AvatarAnimationCatalog.ANIM_AGENT_WALK),
+            sequenceIds = mapOf(AvatarAnimationCatalog.ANIM_AGENT_WALK to 1)
+        )
+        assertTrue(walkingAnimesh.isAnimesh)
+        assertEquals(AvatarAnimState.WALK, walkingAnimesh.animState)
+        assertEquals(listOf(AvatarAnimationCatalog.ANIM_AGENT_WALK), walkingAnimesh.activeAnimationIds)
+
+        val poseT0 = AvatarSkeletonHierarchy.evaluateProceduralBodyPose(
+            animState = walkingAnimesh.animState,
+            isTyping = false,
+            timeSec = 0.05f,
+            heightMeters = walkingAnimesh.scale.z
+        )
+        val poseT1 = AvatarSkeletonHierarchy.evaluateProceduralBodyPose(
+            animState = walkingAnimesh.animState,
+            isTyping = false,
+            timeSec = 0.45f,
+            heightMeters = walkingAnimesh.scale.z
+        )
+        assertTrue(
+            "Animesh pseudo-avatar pose must animate dynamically over time",
+            kotlin.math.abs(poseT0.pelvisOffset.z - poseT1.pelvisOffset.z) > 1e-4f ||
+                kotlin.math.abs(poseT0.upperBodyRotation.x - poseT1.upperBodyRotation.x) > 1e-4f
+        )
+    }
+
+    @Test
+    fun `CapabilityManager REQUESTED_CAPS and RenderMaterials capability fetch zipped glTF 2_0 PBR materials`() = runBlocking {
+        assertTrue("REQUESTED_CAPS must include RenderMaterials", "RenderMaterials" in CapabilityManager.REQUESTED_CAPS)
+        assertTrue("REQUESTED_CAPS must include ExtEnvironment", "ExtEnvironment" in CapabilityManager.REQUESTED_CAPS)
+
+        val matId = UUID.fromString("aaaaaaaa-bbbb-4ccc-8ddd-1234567890ab")
+        val baseTexId = UUID.fromString("11111111-aaaa-4bbb-8ccc-000000000001")
+        val ormTexId = UUID.fromString("22222222-aaaa-4bbb-8ccc-000000000002")
+        val normTexId = UUID.fromString("33333333-aaaa-4bbb-8ccc-000000000003")
+        val emisTexId = UUID.fromString("44444444-aaaa-4bbb-8ccc-000000000004")
+
+        val gltfJson = """
+            {
+              "asset": { "version": "2.0" },
+              "images": [
+                { "uri": "$baseTexId" },
+                { "uri": "$ormTexId" },
+                { "uri": "$normTexId" },
+                { "uri": "$emisTexId" }
+              ],
+              "textures": [
+                { "source": 0 },
+                { "source": 1 },
+                { "source": 2 },
+                { "source": 3 }
+              ],
+              "materials": [
+                {
+                  "pbrMetallicRoughness": {
+                    "baseColorFactor": [0.90, 0.85, 0.80, 1.0],
+                    "baseColorTexture": { "index": 0 },
+                    "metallicFactor": 0.88,
+                    "roughnessFactor": 0.24,
+                    "metallicRoughnessTexture": { "index": 1 }
+                  },
+                  "normalTexture": { "index": 2, "scale": 1.35 },
+                  "occlusionTexture": { "index": 1, "strength": 0.82 },
+                  "emissiveTexture": { "index": 3 },
+                  "emissiveFactor": [0.15, 0.75, 0.95],
+                  "alphaMode": "MASK",
+                  "alphaCutoff": 0.38,
+                  "doubleSided": true
+                }
+              ]
+            }
+        """.trimIndent()
+
+        // Build Zipped binary LLSD response matching Second Life simulator RenderMaterials format
+        val innerEntries = com.example.linkpoint.protocol.LlsdValue.ArrayVal(
+            listOf(
+                com.example.linkpoint.protocol.LlsdValue.MapVal(
+                    mapOf(
+                        "ID" to com.example.linkpoint.protocol.LlsdValue.Binary(
+                            ByteBuffer.allocate(16).order(ByteOrder.BIG_ENDIAN)
+                                .putLong(matId.mostSignificantBits)
+                                .putLong(matId.leastSignificantBits)
+                                .array()
+                        ),
+                        "Material" to com.example.linkpoint.protocol.LlsdValue.MapVal(
+                            mapOf(
+                                "Type" to com.example.linkpoint.protocol.LlsdValue.Str("LLGLTFMaterial"),
+                                "Data" to com.example.linkpoint.protocol.LlsdValue.Str(gltfJson)
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        val innerBinary = LlsdCodec.toBinary(innerEntries, includeHeader = false)
+        val deflatedResponse = ByteArrayOutputStream().use { bos ->
+            val deflater = Deflater()
+            deflater.setInput(innerBinary)
+            deflater.finish()
+            val buf = ByteArray(512)
+            while (!deflater.finished()) {
+                val n = deflater.deflate(buf)
+                if (n > 0) bos.write(buf, 0, n)
+            }
+            deflater.end()
+            bos.toByteArray()
+        }
+        val responseXml = LlsdCodec.toXml(
+            com.example.linkpoint.protocol.LlsdValue.MapVal(
+                mapOf("Zipped" to com.example.linkpoint.protocol.LlsdValue.Binary(deflatedResponse))
+            )
+        )
+
+        var capturedRequestXml = ""
+        val mockHttp = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                val req = chain.request()
+                val reqBuf = okio.Buffer()
+                req.body?.writeTo(reqBuf)
+                capturedRequestXml = reqBuf.readUtf8()
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "application/llsd+xml")
+                    .body(responseXml.toResponseBody("application/llsd+xml".toMediaType()))
+                    .build()
+            })
+            .build()
+
+        val caps = CapabilityManager(httpClient = mockHttp)
+        caps.setCapabilityUrlForTesting("RenderMaterials", "https://sim.agni.lindenlab.com/cap/render-materials")
+
+        var emittedEvent: CapsEvent.RenderMaterialsUpdated? = null
+        val collector = launch {
+            emittedEvent = withTimeout(2_000L) {
+                caps.capsEvents.first { it is CapsEvent.RenderMaterialsUpdated } as CapsEvent.RenderMaterialsUpdated
+            }
+        }
+        kotlinx.coroutines.yield()
+
+        val fetched = caps.fetchRenderMaterials(listOf(matId))
+        collector.join()
+        caps.shutdown()
+
+        // Verify outgoing request contained Zipped binary LLSD with requested material ID bytes
+        val parsedReq = LlsdCodec.parseXml(capturedRequestXml)
+        val zippedReqBytes = (parsedReq["Zipped"] as? com.example.linkpoint.protocol.LlsdValue.Binary)?.bytes
+        assertNotNull("Outgoing RenderMaterials POST must contain Zipped binary LLSD", zippedReqBytes)
+        val inflatedReq = ByteArrayOutputStream().use { bos ->
+            val inf = Inflater()
+            inf.setInput(zippedReqBytes)
+            val buf = ByteArray(256)
+            while (!inf.finished()) {
+                val n = inf.inflate(buf)
+                if (n <= 0 && (inf.needsInput() || inf.needsDictionary())) break
+                if (n > 0) bos.write(buf, 0, n)
+            }
+            inf.end()
+            bos.toByteArray()
+        }
+        val reqIdArray = LlsdCodec.parseBinary(inflatedReq).asList()
+        assertEquals(1, reqIdArray.size)
+
+        // Verify parsed glTF 2.0 PBR material fields & CapsEvent.RenderMaterialsUpdated
+        assertNotNull(emittedEvent)
+        val resolvedMat = fetched[matId]
+        assertNotNull(resolvedMat)
+        assertTrue(resolvedMat!!.hasGltfMaterial)
+        assertTrue(resolvedMat.doubleSided)
+        assertEquals(baseTexId, resolvedMat.baseColorTextureId)
+        assertEquals(ormTexId, resolvedMat.metallicRoughnessTextureId)
+        assertEquals(normTexId, resolvedMat.normalTextureId)
+        assertEquals(emisTexId, resolvedMat.emissiveTextureId)
+        assertEquals(0.88f, resolvedMat.effectiveMetallic, 1e-3f)
+        assertEquals(0.24f, resolvedMat.effectiveRoughness, 1e-3f)
+        assertEquals(1.35f, resolvedMat.normalScale, 1e-3f)
+        assertEquals(0.82f, resolvedMat.occlusionStrength, 1e-3f)
+        assertEquals(MaterialAlphaMode.MASK, resolvedMat.alphaMode)
+        assertEquals(0.38f, resolvedMat.alphaCutoff, 1e-3f)
+        assertEquals(0.95f, resolvedMat.emissiveColor.z, 1e-3f)
+
+        // Verify SceneObject.withResolvedRenderMaterials binds material onto object face
+        val rawObj = SceneObject(
+            localId = 700,
+            name = "PBR Wall Panel",
+            renderMaterialIds = mapOf(1 to matId)
+        )
+        val hydratedObj = rawObj.withResolvedRenderMaterials(fetched)
+        val face1Mat = hydratedObj.materialForFace(1)
+        assertEquals(ormTexId, face1Mat.metallicRoughnessTextureId)
+        assertEquals(normTexId, face1Mat.normalTextureId)
+        assertEquals(baseTexId, hydratedObj.faceTextures[1])
+        assertTrue(face1Mat.doubleSided)
+    }
+
+    @Test
+    fun `RenderShaders PRIM_FS implements glTF 2_0 ORM channel packing doubleSided and SL normal map handedness`() {
+        val fs = com.example.linkpoint.render.RenderShaders.PRIM_FS
+
+        // 1. Canonical glTF 2.0 ORM channel packing: Occlusion = .r, Roughness = .g, Metalness = .b
+        assertTrue("PRIM_FS must declare uMetallicRoughnessTex", fs.contains("uniform sampler2D uMetallicRoughnessTex;"))
+        assertTrue(
+            "PRIM_FS must sample Ambient Occlusion from ormSample.r",
+            Regex("""occlusion\s*=\s*mix\(\s*1\.0\s*,\s*ormSample\.r""").containsMatchIn(fs)
+        )
+        assertTrue(
+            "PRIM_FS must sample Roughness from ormSample.g",
+            Regex("""roughness\s*=\s*clamp\(\s*roughness\s*\*\s*ormSample\.g""").containsMatchIn(fs)
+        )
+        assertTrue(
+            "PRIM_FS must sample Metalness from ormSample.b",
+            Regex("""metallic\s*=\s*clamp\(\s*metallic\s*\*\s*ormSample\.b""").containsMatchIn(fs)
+        )
+
+        // 2. Single-sided vs doubleSided backface handling
+        assertTrue(
+            "PRIM_FS must discard backfaces when doubleSided is false (uPbrExtraParams.z < 0.5)",
+            fs.contains("if (!gl_FrontFacing && uPbrExtraParams.z < 0.5)")
+        )
+
+        // 3. Second Life / OpenGL right-handed tangent-space normal map (+Y green-up, NOT DirectX -Y inverted)
+        assertTrue("PRIM_FS must declare uNormalTex", fs.contains("uniform sampler2D uNormalTex;"))
+        assertTrue(
+            "PRIM_FS must combine +T * tangentNormal.x + B * tangentNormal.y without negating green/Y relief",
+            fs.contains("T * tangentNormal.x + B * tangentNormal.y") && !fs.contains("-tangentNormal.y")
+        )
     }
 }

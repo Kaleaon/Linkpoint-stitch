@@ -29,6 +29,8 @@ data class ParsedExtraParams(
     val sculptTextureId: UUID? = null,
     val isFlexible: Boolean = false,
     val isLight: Boolean = false,
+    val isAnimatedObject: Boolean = false,
+    val extendedMeshFlags: Int = 0,
     val renderMaterialIds: Map<Int, UUID> = emptyMap(),
     val defaultRenderMaterialId: UUID? = null
 )
@@ -58,12 +60,15 @@ object SlBinaryParsers {
     const val BAKE_FACE_LEFT_ARM = 21
     const val BAKE_FACE_LEFT_LEG = 22
 
-    // ExtraParams type codes
+    // ExtraParams type codes & ObjectUpdate flags
     const val EXTRA_PARAM_FLEXIBLE = 0x0010
     const val EXTRA_PARAM_LIGHT = 0x0020
     const val EXTRA_PARAM_SCULPT = 0x0030
     const val EXTRA_PARAM_MESH = 0x0060
     const val EXTRA_PARAM_RENDER_MATERIAL = 0x0080
+    const val EXTRA_PARAM_EXTENDED_MESH = 0x0090 // LLExtendedMeshParams (Animesh AnimatedObject flag)
+    const val EXTENDED_MESH_ANIMATED_OBJECT = 0x0001 // ANIMATED_MESH_ENABLED_FLAG (bit 0)
+    const val OBJECT_FLAG_ANIM_SOURCE = 0x00200000 // FLAGS_ANIM_SOURCE (1 << 21) in ObjectUpdate UpdateFlags
 
     /**
      * Linden Lab's canonical ATTACHMENT_ID_FROM_STATE(state) nibble-swap decoding.
@@ -320,6 +325,8 @@ object SlBinaryParsers {
         var sculptId: UUID? = null
         var isFlex = false
         var isLight = false
+        var isAnimatedObj = false
+        var extMeshFlags = 0
         val renderMats = LinkedHashMap<Int, UUID>()
         var defaultRenderMat: UUID? = null
         try {
@@ -373,6 +380,19 @@ object SlBinaryParsers {
                             }
                         }
                     }
+                    EXTRA_PARAM_EXTENDED_MESH -> { // ExtendedMesh (0x0090: U32 LE flags, bit 0x01 = AnimatedObject / Animesh)
+                        if (size >= 4) {
+                            extMeshFlags = buf.int
+                            if ((extMeshFlags and EXTENDED_MESH_ANIMATED_OBJECT) != 0) {
+                                isAnimatedObj = true
+                            }
+                        } else if (size >= 1) {
+                            extMeshFlags = buf.get().toInt() and 0xFF
+                            if ((extMeshFlags and EXTENDED_MESH_ANIMATED_OBJECT) != 0) {
+                                isAnimatedObj = true
+                            }
+                        }
+                    }
                 }
                 buf.position(nextPos)
             }
@@ -385,34 +405,109 @@ object SlBinaryParsers {
             sculptTextureId = sculptId,
             isFlexible = isFlex,
             isLight = isLight,
+            isAnimatedObject = isAnimatedObj,
+            extendedMeshFlags = extMeshFlags,
             renderMaterialIds = renderMats,
             defaultRenderMaterialId = defaultRenderMat
         )
     }
 
     /**
-     * Parses LLSD `RenderMaterials` / glTF 2.0 material override metadata into [FaceMaterialParams]
-     * (supporting `pbrMetallicRoughness` `metallicFactor`, `roughnessFactor`, `emissiveFactor`,
-     * `alphaMode` = OPAQUE/MASK/BLEND/EMISSIVE, and `alphaCutoff`).
+     * Parses glTF 2.0 JSON (`LLGLTFMaterial`) into [FaceMaterialParams].
+     */
+    fun parseGltfMaterialJson(json: String, base: FaceMaterialParams = FaceMaterialParams()): FaceMaterialParams {
+        val node = LlsdCodec.parseJson(json)
+        if (node is LlsdValue.Undef) return base
+        return parseGltfMaterialOverride(node, base)
+    }
+
+    /**
+     * Parses LLSD `RenderMaterials` / glTF 2.0 material override metadata into [FaceMaterialParams]:
+     * - Supports both full glTF 2.0 root documents (`materials[0]`, `textures[idx].source`, `images[src].uri`)
+     *   and flat/nested LLSD material override maps.
+     * - Extracts `pbrMetallicRoughness` (`baseColorFactor`, `baseColorTexture`, `metallicFactor`,
+     *   `roughnessFactor`, `metallicRoughnessTexture` with `.r`=Occlusion, `.g`=Roughness, `.b`=Metalness),
+     *   `normalTexture` + `scale`, `occlusionTexture` + `strength`, `emissiveTexture` + `emissiveFactor`,
+     *   `doubleSided`, `alphaMode` (`OPAQUE`/`MASK`/`BLEND`/`EMISSIVE`), and `alphaCutoff`.
      */
     fun parseGltfMaterialOverride(node: LlsdValue, base: FaceMaterialParams = FaceMaterialParams()): FaceMaterialParams {
-        val map = node.asMap()
-        if (map.isEmpty()) return base
-        val pbr = (map["pbrMetallicRoughness"] ?: map["pbr_metallic_roughness"])?.asMap().orEmpty()
+        val rootMap = node.asMap()
+        if (rootMap.isEmpty()) return base
 
-        val metallic = (pbr["metallicFactor"] ?: pbr["metallic_factor"] ?: map["metallicFactor"] ?: map["metallic_factor"])
+        val texturesList = rootMap["textures"]?.asList().orEmpty()
+        val imagesList = rootMap["images"]?.asList().orEmpty()
+        val matMap = rootMap["materials"]?.asList()?.firstOrNull()?.asMap()?.takeIf { it.isNotEmpty() }
+            ?: rootMap
+
+        fun extractUuidFromNode(v: LlsdValue?): UUID? {
+            if (v == null || v is LlsdValue.Undef) return null
+            v.asUuidOrNull()?.let { return it }
+            if (v is LlsdValue.Binary && v.bytes.size == 16) {
+                val bb = ByteBuffer.wrap(v.bytes).order(ByteOrder.BIG_ENDIAN)
+                return UUID(bb.long, bb.long).takeIf { it != ZERO_UUID }
+            }
+            if (v is LlsdValue.MapVal) {
+                for (k in listOf("uri", "uuid", "id", "texture_id", "asset_id", "image_id")) {
+                    extractUuidFromNode(v[k])?.let { return it }
+                }
+                val extras = v["extras"]
+                if (extras is LlsdValue.MapVal) {
+                    extractUuidFromNode(extras)?.let { return it }
+                }
+                val texIdxNode = v["index"]
+                if (texIdxNode !is LlsdValue.Undef) {
+                    val texIdx = texIdxNode.asInt(-1)
+                    if (texIdx in texturesList.indices) {
+                        val texObj = texturesList[texIdx]
+                        extractUuidFromNode(texObj)?.let { return it }
+                        val srcIdx = texObj["source"].asInt(-1)
+                        if (srcIdx in imagesList.indices) {
+                            extractUuidFromNode(imagesList[srcIdx])?.let { return it }
+                        }
+                    }
+                    if (texIdx in imagesList.indices) {
+                        extractUuidFromNode(imagesList[texIdx])?.let { return it }
+                    }
+                }
+            }
+            return null
+        }
+
+        val pbr = (matMap["pbrMetallicRoughness"] ?: matMap["pbr_metallic_roughness"])?.asMap().orEmpty()
+
+        val metallic = (pbr["metallicFactor"] ?: pbr["metallic_factor"] ?: matMap["metallicFactor"] ?: matMap["metallic_factor"])
             ?.takeIf { it !is LlsdValue.Undef }
             ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
             ?: base.metallicFactor
+            ?: 1.0f
 
-        val roughness = (pbr["roughnessFactor"] ?: pbr["roughness_factor"] ?: map["roughnessFactor"] ?: map["roughness_factor"])
+        val roughness = (pbr["roughnessFactor"] ?: pbr["roughness_factor"] ?: matMap["roughnessFactor"] ?: matMap["roughness_factor"])
             ?.takeIf { it !is LlsdValue.Undef }
             ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0.04f, 1f)
             ?: base.roughnessFactor
+            ?: 1.0f
 
-        val emissive = (map["emissiveFactor"] ?: map["emissive_factor"])?.asVec3OrNull() ?: base.emissiveColor
+        val baseColorFactorNode = pbr["baseColorFactor"] ?: pbr["base_color_factor"] ?: matMap["baseColorFactor"]
+        val baseColorFactor = if (baseColorFactorNode is LlsdValue.ArrayVal && baseColorFactorNode.items.size >= 3) {
+            val r = baseColorFactorNode.items[0].asDouble(1.0).toFloat().coerceIn(0f, 1f)
+            val g = baseColorFactorNode.items[1].asDouble(1.0).toFloat().coerceIn(0f, 1f)
+            val b = baseColorFactorNode.items[2].asDouble(1.0).toFloat().coerceIn(0f, 1f)
+            val a = if (baseColorFactorNode.items.size >= 4) {
+                baseColorFactorNode.items[3].asDouble(1.0).toFloat().coerceIn(0f, 1f)
+            } else 1f
+            ColorRgba(r, g, b, a)
+        } else base.baseColorFactor
 
-        val alphaModeNode = map["alphaMode"] ?: map["alpha_mode"]
+        val emissive = (matMap["emissiveFactor"] ?: matMap["emissive_factor"])?.asVec3OrNull() ?: base.emissiveColor
+
+        val doubleSidedNode = matMap["doubleSided"] ?: matMap["double_sided"] ?: rootMap["doubleSided"]
+        val doubleSided = if (doubleSidedNode != null && doubleSidedNode !is LlsdValue.Undef) {
+            doubleSidedNode.asBool(base.doubleSided)
+        } else {
+            base.doubleSided
+        }
+
+        val alphaModeNode = matMap["alphaMode"] ?: matMap["alpha_mode"]
         val alphaMode = when (alphaModeNode) {
             is LlsdValue.Str -> when (alphaModeNode.value.trim().uppercase()) {
                 "OPAQUE", "NONE" -> MaterialAlphaMode.NONE
@@ -421,21 +516,61 @@ object SlBinaryParsers {
                 else -> MaterialAlphaMode.BLEND
             }
             is LlsdValue.IntVal -> MaterialAlphaMode.fromCode(alphaModeNode.value)
-            else -> base.alphaMode
+            else -> if (matMap !== rootMap) MaterialAlphaMode.NONE else base.alphaMode
         }
 
-        val alphaCutoff = (map["alphaCutoff"] ?: map["alpha_cutoff"])
+        val alphaCutoff = (matMap["alphaCutoff"] ?: matMap["alpha_cutoff"])
             ?.takeIf { it !is LlsdValue.Undef }
             ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
             ?: if (alphaMode == MaterialAlphaMode.MASK && base.alphaCutoff <= 0f) 0.5f else base.alphaCutoff
 
-        val renderMatId = (map["id"] ?: map["material_id"] ?: map["render_material_id"])?.asUuidOrNull()
+        val baseColorTexId = extractUuidFromNode(
+            pbr["baseColorTexture"] ?: pbr["base_color_texture"] ?: matMap["baseColorTexture"] ?: matMap["base_color_texture"]
+        ) ?: base.baseColorTextureId
+
+        val ormTexId = extractUuidFromNode(
+            pbr["metallicRoughnessTexture"] ?: pbr["metallic_roughness_texture"]
+                ?: matMap["metallicRoughnessTexture"] ?: matMap["metallic_roughness_texture"]
+                ?: matMap["ormTexture"]
+        ) ?: base.metallicRoughnessTextureId
+
+        val normalTexNode = matMap["normalTexture"] ?: matMap["normal_texture"]
+        val normalTexId = extractUuidFromNode(normalTexNode) ?: base.normalTextureId
+        val normalScale = (normalTexNode?.asMap()?.get("scale") ?: matMap["normalScale"] ?: matMap["normal_scale"])
+            ?.takeIf { it !is LlsdValue.Undef }
+            ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0f, 4f)
+            ?: base.normalScale
+
+        val occlusionTexNode = matMap["occlusionTexture"] ?: matMap["occlusion_texture"]
+        val occlusionTexId = extractUuidFromNode(occlusionTexNode) ?: ormTexId ?: base.occlusionTextureId
+        val occlusionStrength = (occlusionTexNode?.asMap()?.get("strength") ?: matMap["occlusionStrength"] ?: matMap["occlusion_strength"])
+            ?.takeIf { it !is LlsdValue.Undef }
+            ?.asDouble(Double.NaN)?.toFloat()?.takeIf { it.isFinite() }?.coerceIn(0f, 1f)
+            ?: base.occlusionStrength
+
+        val emissiveTexId = extractUuidFromNode(
+            matMap["emissiveTexture"] ?: matMap["emissive_texture"]
+        ) ?: base.emissiveTextureId
+
+        val renderMatId = (rootMap["id"] ?: rootMap["ID"] ?: rootMap["material_id"] ?: rootMap["render_material_id"]
+            ?: matMap["id"] ?: matMap["material_id"])
+            ?.let { extractUuidFromNode(it) }
             ?: base.renderMaterialId
 
         return base.copy(
             metallicFactor = metallic,
             roughnessFactor = roughness,
             emissiveColor = emissive,
+            baseColorFactor = baseColorFactor,
+            doubleSided = doubleSided,
+            hasGltfMaterial = true,
+            baseColorTextureId = baseColorTexId,
+            metallicRoughnessTextureId = ormTexId ?: occlusionTexId,
+            normalTextureId = normalTexId,
+            emissiveTextureId = emissiveTexId,
+            occlusionTextureId = occlusionTexId,
+            normalScale = normalScale,
+            occlusionStrength = occlusionStrength,
             alphaMode = alphaMode,
             alphaCutoff = alphaCutoff,
             renderMaterialId = renderMatId

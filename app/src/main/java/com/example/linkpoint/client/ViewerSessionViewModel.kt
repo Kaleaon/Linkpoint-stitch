@@ -44,6 +44,7 @@ import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
 import com.example.linkpoint.scene.ColorRgba
 import com.example.linkpoint.scene.EnvironmentPreset
+import com.example.linkpoint.scene.FaceMaterialParams
 import com.example.linkpoint.scene.HudAttachmentPoint
 import com.example.linkpoint.scene.HudHitResult
 import com.example.linkpoint.scene.LocalSandboxBuilder
@@ -107,6 +108,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private val manualHudAttachments = LinkedHashMap<Int, SceneObject>()
     private val capsAttachmentOverridesByUuid = ConcurrentHashMap<UUID, CapsAttachmentTransform>()
     private val capsAttachmentOverridesByLocalId = ConcurrentHashMap<Int, CapsAttachmentTransform>()
+    private val animeshAnimationsByUuid = ConcurrentHashMap<UUID, List<LludpPackets.AvatarAnimationEntry>>()
+    private val resolvedRenderMaterials = ConcurrentHashMap<UUID, FaceMaterialParams>()
+    private val requestedRenderMaterialIds = ConcurrentHashMap.newKeySet<UUID>()
     private val avatars = LinkedHashMap<UUID, AvatarEntity>()
     private val knownNames = LinkedHashMap<UUID, String>()
 
@@ -224,12 +228,24 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         appendImMessage(evt.imSessionId, evt.fromAgentId, evt.fromName, evt.fromName, evt.message)
                     }
                     is SimEvent.ObjectUpdated -> {
-                        val obj = mergeIncomingObjectWithCaps(evt.sceneObject)
+                        var obj = mergeIncomingObjectWithCaps(evt.sceneObject)
+                        animeshAnimationsByUuid[obj.uuid]?.let { cachedAnims ->
+                            obj = obj.withUpdatedAnimations(
+                                animationIds = cachedAnims.map { it.animId },
+                                sequenceIds = cachedAnims.associate { it.animId to it.sequenceId }
+                            )
+                        }
+                        if (resolvedRenderMaterials.isNotEmpty()) {
+                            obj = obj.withResolvedRenderMaterials(resolvedRenderMaterials)
+                        }
                         // Prioritize any attachment root OR child prim (linkset children frequently carry rigged mesh bodies/heads/hair!)
-                        val isAvatarPriority = obj.parentId != 0 || obj.isAvatarBodyAttachment || obj.isHudAttachment
+                        val isAvatarPriority = obj.parentId != 0 || obj.isAvatarBodyAttachment || obj.isHudAttachment || obj.isAnimesh
                         obj.meshAssetId?.let { assetManager.requestMesh(it, highPriority = isAvatarPriority) }
                         obj.defaultTextureId?.let { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
                         obj.faceTextures.values.forEach { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
+                        requestPbrMaterialTextures(obj.defaultMaterial, highPriority = isAvatarPriority)
+                        obj.faceMaterials.values.forEach { requestPbrMaterialTextures(it, highPriority = isAvatarPriority) }
+                        requestUnresolvedRenderMaterials(obj)
 
                         allSceneObjects[obj.localId] = obj
                         pushSceneSnapshot()
@@ -502,6 +518,26 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         }
                         pushSceneSnapshot()
                     }
+                    is SimEvent.ObjectAnimationsUpdated -> {
+                        animeshAnimationsByUuid[evt.objectId] = evt.animations
+                        val animIds = evt.animations.map { it.animId }
+                        val seqMap = evt.animations.associate { it.animId to it.sequenceId }
+                        var updatedAny = false
+                        for (entry in allSceneObjects.entries) {
+                            val existing = entry.value
+                            if (existing.uuid == evt.objectId) {
+                                val updated = existing.withUpdatedAnimations(animIds, seqMap)
+                                entry.setValue(updated)
+                                updatedAny = true
+                                if (_state.value.selectedObject?.localId == existing.localId) {
+                                    _state.update { it.copy(selectedObject = updated) }
+                                }
+                            }
+                        }
+                        if (updatedAny) {
+                            pushSceneSnapshot()
+                        }
+                    }
                     is SimEvent.AvatarAppearanceReceived -> {
                         val baked = evt.bakedTextures
                         val headTex = baked.faceTextures[SlBinaryParsers.BAKE_FACE_HEAD]
@@ -706,6 +742,30 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             "[EEP] Live region environment synced (daylight=${evt.settings.isDaylight}, sunZ=${"%.2f".format(evt.settings.sunDirection.z)})"
                         )
                         pushSceneSnapshot()
+                    }
+                    is CapsEvent.RenderMaterialsUpdated -> {
+                        if (evt.materials.isNotEmpty()) {
+                            resolvedRenderMaterials.putAll(evt.materials)
+                            evt.materials.values.forEach { mat ->
+                                requestPbrMaterialTextures(mat, highPriority = false)
+                            }
+                            var updatedCount = 0
+                            for (entry in allSceneObjects.entries) {
+                                val existing = entry.value
+                                val updated = existing.withResolvedRenderMaterials(evt.materials)
+                                if (updated !== existing) {
+                                    entry.setValue(updated)
+                                    updatedCount++
+                                    if (_state.value.selectedObject?.localId == existing.localId) {
+                                        _state.update { it.copy(selectedObject = updated) }
+                                    }
+                                }
+                            }
+                            appendDiagnostic("[PBR] Synced ${evt.materials.size} glTF RenderMaterials ($updatedCount objects updated)")
+                            if (updatedCount > 0) {
+                                pushSceneSnapshot()
+                            }
+                        }
                     }
                     is CapsEvent.GenericNotice -> appendLocalChat(
                         ChatMessage(speaker = evt.title, text = evt.message, isSystem = true)
@@ -1198,6 +1258,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             manualHudAttachments.clear()
             capsAttachmentOverridesByUuid.clear()
             capsAttachmentOverridesByLocalId.clear()
+            animeshAnimationsByUuid.clear()
+            resolvedRenderMaterials.clear()
+            requestedRenderMaterialIds.clear()
             avatars.clear()
             knownNames.clear()
             requestedProfiles.clear()
@@ -1304,6 +1367,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         manualHudAttachments.clear()
         capsAttachmentOverridesByUuid.clear()
         capsAttachmentOverridesByLocalId.clear()
+        animeshAnimationsByUuid.clear()
+        resolvedRenderMaterials.clear()
+        requestedRenderMaterialIds.clear()
         knownNames.clear()
         requestedProfiles.clear()
         pressedMoveKeys.clear()
@@ -1381,6 +1447,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         manualHudAttachments.clear()
         capsAttachmentOverridesByUuid.clear()
         capsAttachmentOverridesByLocalId.clear()
+        animeshAnimationsByUuid.clear()
+        resolvedRenderMaterials.clear()
+        requestedRenderMaterialIds.clear()
         pressedMoveKeys.clear()
         requestedProfiles.clear()
         verticalVelocityZ = 0f
@@ -2408,6 +2477,34 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
     private fun isPlausibleJointLocalOffset(pos: Vec3): Boolean =
         kotlin.math.abs(pos.x) <= 16f && kotlin.math.abs(pos.y) <= 16f && kotlin.math.abs(pos.z) <= 16f
+
+    private fun requestPbrMaterialTextures(mat: FaceMaterialParams, highPriority: Boolean) {
+        mat.baseColorTextureId?.let { assetManager.requestTexture(it, highPriority = highPriority) }
+        mat.metallicRoughnessTextureId?.let { assetManager.requestTexture(it, highPriority = highPriority) }
+        mat.normalTextureId?.let { assetManager.requestTexture(it, highPriority = highPriority) }
+        mat.emissiveTextureId?.let { assetManager.requestTexture(it, highPriority = highPriority) }
+        mat.occlusionTextureId?.let { assetManager.requestTexture(it, highPriority = highPriority) }
+    }
+
+    private fun requestUnresolvedRenderMaterials(obj: SceneObject) {
+        if (!capabilityManager.hasCapability("RenderMaterials")) return
+        val zeroUuid = UUID(0L, 0L)
+        val candidates = LinkedHashSet<UUID>()
+        obj.defaultMaterial.renderMaterialId?.let { candidates.add(it) }
+        obj.faceMaterials.values.forEach { fm -> fm.renderMaterialId?.let { candidates.add(it) } }
+        obj.renderMaterialIds.values.forEach { candidates.add(it) }
+
+        val toFetch = candidates.filter { id ->
+            id != zeroUuid &&
+                !resolvedRenderMaterials.containsKey(id) &&
+                requestedRenderMaterialIds.add(id)
+        }
+        if (toFetch.isNotEmpty()) {
+            viewModelScope.launch {
+                capabilityManager.fetchRenderMaterials(toFetch)
+            }
+        }
+    }
 
     private fun mergeIncomingObjectWithCaps(incoming: SceneObject): SceneObject {
         val caps = capsAttachmentOverridesByUuid[incoming.uuid]

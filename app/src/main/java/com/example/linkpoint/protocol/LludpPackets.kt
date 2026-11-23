@@ -28,6 +28,7 @@ object LludpPackets {
     const val MSG_IMPROVED_TERSE_OBJECT_UPDATE: Int = 15
     const val MSG_KILL_OBJECT: Int = 16
     const val MSG_AVATAR_ANIMATION: Int = 20
+    const val MSG_OBJECT_ANIMATION: Int = 30 // High 30 (0x1E) — Rigged Animesh ObjectAnimation (Unencoded)
 
     // Medium frequency message IDs (0xFF + 1 byte)
     const val MSG_COARSE_LOCATION_UPDATE: Int = 0xFF06
@@ -254,8 +255,10 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        // Per canonical Second Life message_template.msg, ObjectAnimation (High 30) is marked Unencoded: never zero-code it.
+        val allowZeroCoding = useZeroCoding && messageId != MSG_OBJECT_ANIMATION
+        val encoded = if (allowZeroCoding) zeroEncode(msgBytes) else msgBytes
+        val actuallyZeroCoded = allowZeroCoding && encoded.size < msgBytes.size
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0
@@ -683,6 +686,62 @@ object LludpPackets {
             putUuid(buf, src)
         }
         buf.put(0.toByte()) // PhysicalAvatarEventList count = 0
+        return buf.array()
+    }
+
+    data class ParsedObjectAnimation(
+        val objectId: UUID,
+        val animations: List<AvatarAnimationEntry>
+    )
+
+    /**
+     * Parses High-Frequency `ObjectAnimation` (`MSG_OBJECT_ANIMATION = 30`, `Unencoded` in `message_template.msg`)
+     * for rigged Animesh pseudo-avatar objects:
+     * - `Sender` block: `ID` (LLUUID, 16B — Animesh object full UUID)
+     * - `AnimationList` block (Variable, U8 count): `[AnimID (LLUUID, 16B), AnimSequenceID (S32 LE, 4B)]`
+     */
+    fun parseObjectAnimation(payload: ByteArray): ParsedObjectAnimation? {
+        if (payload.size < 17) return null
+        val buf = ByteBuffer.wrap(payload).order(ByteOrder.LITTLE_ENDIAN)
+        return parseObjectAnimation(buf)
+    }
+
+    fun parseObjectAnimation(buf: ByteBuffer): ParsedObjectAnimation? {
+        if (buf.remaining() < 17) return null
+        val prevOrder = buf.order()
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        return try {
+            val objectId = readUuid(buf)
+            val animCount = (buf.get().toInt() and 0xFF).coerceAtMost(64)
+            val entries = ArrayList<AvatarAnimationEntry>(animCount)
+            repeat(animCount) {
+                if (buf.remaining() < 20) return@repeat
+                val animId = readUuid(buf)
+                val seqId = buf.int
+                entries.add(AvatarAnimationEntry(animId = animId, sequenceId = seqId))
+            }
+            ParsedObjectAnimation(
+                objectId = objectId,
+                animations = entries
+            )
+        } finally {
+            buf.order(prevOrder)
+        }
+    }
+
+    fun buildObjectAnimationPayload(
+        objectId: UUID,
+        animations: List<AvatarAnimationEntry>
+    ): ByteArray {
+        val cappedAnims = animations.take(64)
+        val totalSize = 16 + 1 + cappedAnims.size * 20
+        val buf = ByteBuffer.allocate(totalSize).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, objectId)
+        buf.put(cappedAnims.size.toByte())
+        for (entry in cappedAnims) {
+            putUuid(buf, entry.animId)
+            buf.putInt(entry.sequenceId)
+        }
         return buf.array()
     }
 
