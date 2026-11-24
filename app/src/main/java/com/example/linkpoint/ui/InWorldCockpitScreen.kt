@@ -97,6 +97,7 @@ import com.example.linkpoint.designsystem.LocalLinkpointDesign
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.protocol.LayerHealthStatus
 import com.example.linkpoint.render.LinkpointGlRenderer
+import com.example.linkpoint.rlv.RlvConstants
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
 import com.example.linkpoint.scene.HudAttachmentPoint
@@ -150,6 +151,7 @@ fun InWorldCockpitScreen(
             FloatingAvatarNametagsOverlay(
                 nametags = state.projectedNametags,
                 selectedAvatarId = state.selectedAvatarId,
+                hideNames = state.rlvSnapshot.showNamesRestricted,
                 viewportW = viewportW.value,
                 viewportH = viewportH.value,
                 onSelectAvatar = client::onAvatarSelected
@@ -544,6 +546,21 @@ fun InWorldCockpitScreen(
             }
         )
     }
+
+    state.activeNotecardPreview?.let { (title, body) ->
+        val noteTokens = LocalLinkpointDesign.current
+        AlertDialog(
+            onDismissRequest = client::dismissNotecardPreview,
+            containerColor = noteTokens.surfaceFloater,
+            title = { Text(title, color = noteTokens.textPrimary) },
+            text = { Text(body, color = noteTokens.textSecondary) },
+            confirmButton = {
+                TextButton(onClick = client::dismissNotecardPreview) {
+                    Text("Close", color = noteTokens.accentPrimary)
+                }
+            }
+        )
+    }
 }
 
 @Composable
@@ -741,6 +758,7 @@ private fun NativeGlViewport(
 private fun FloatingAvatarNametagsOverlay(
     nametags: List<ProjectedNametag>,
     selectedAvatarId: UUID?,
+    hideNames: Boolean,
     viewportW: Float,
     viewportH: Float,
     onSelectAvatar: (UUID) -> Unit
@@ -759,7 +777,8 @@ private fun FloatingAvatarNametagsOverlay(
     Box(modifier = Modifier.fillMaxSize()) {
         nametags.forEach { tag ->
             val isSelected = selectedAvatarId == tag.agentId
-            val approxW = (tag.displayName.length * 6.5f + 42f).coerceIn(76f, 178f)
+            val shownName = if (hideNames && !tag.isSelf) RlvConstants.REDACTED_TEXT else tag.displayName
+            val approxW = (shownName.length * 6.5f + 42f).coerceIn(76f, 178f)
             val xDp = (tag.normX * viewportW - approxW * 0.5f).coerceIn(8f, (viewportW - approxW - 8f).coerceAtLeast(8f))
             val yDp = (tag.normY * viewportH - 18f).coerceIn(48f, (viewportH - 84f).coerceAtLeast(48f))
 
@@ -796,7 +815,7 @@ private fun FloatingAvatarNametagsOverlay(
                         )
                 )
                 Text(
-                    text = if (tag.isSelf) tag.displayName else "${tag.displayName} • ${tag.distanceMeters.roundToInt()}m",
+                    text = if (tag.isSelf) shownName else "$shownName • ${tag.distanceMeters.roundToInt()}m",
                     style = MaterialTheme.typography.labelSmall.copy(
                         fontSize = 10.sp,
                         fontWeight = FontWeight.SemiBold,
@@ -908,6 +927,9 @@ private fun CompactTelemetryPill(
     }
 
     val pos = state.avatarPosition
+    val hideLoc = state.rlvSnapshot.showLocRestricted
+    val displayRegionTitle = if (hideLoc && state.connection !is ConnectionState.Disconnected) RlvConstants.REDACTED_TEXT else regionTitle
+    val rlvBadge = if (state.rlvSnapshot.activeRuleCount > 0) " • RLV:${state.rlvSnapshot.activeRuleCount}" else ""
     val stats = state.assetStats
     val pillShape = RoundedCornerShape(
         when (tokens.language) {
@@ -943,7 +965,7 @@ private fun CompactTelemetryPill(
                 horizontalArrangement = Arrangement.spacedBy(5.dp)
             ) {
                 Text(
-                    text = tokens.formatHeader(regionTitle),
+                    text = tokens.formatHeader(displayRegionTitle),
                     style = MaterialTheme.typography.labelMedium.copy(
                         color = if (tokens.language == DesignLanguage.LCARS) tokens.accentPrimary else tokens.textPrimary,
                         fontWeight = FontWeight.Bold,
@@ -966,8 +988,9 @@ private fun CompactTelemetryPill(
             val assetSuffix = if (state.connection is ConnectionState.Connected) {
                 " • M:${stats.meshesLoaded} T:${stats.texturesLoaded}"
             } else ""
+            val coordsLabel = if (hideLoc) RlvConstants.REDACTED_TEXT else "<${pos.x.toInt()},${pos.y.toInt()},${pos.z.toInt()}>"
             Text(
-                text = "<${pos.x.toInt()},${pos.y.toInt()},${pos.z.toInt()}> • ${state.fps}fps$assetSuffix",
+                text = "$coordsLabel • ${state.fps}fps$rlvBadge$assetSuffix",
                 style = MaterialTheme.typography.labelSmall.copy(
                     fontFamily = tokens.monoFont,
                     color = tokens.textSecondary,

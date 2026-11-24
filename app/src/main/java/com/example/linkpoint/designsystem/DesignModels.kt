@@ -70,7 +70,8 @@ data class PersonalDesignState(
     val hudTouchCaptureEnabled: Boolean = true,
     val pinnedTools: List<DockToolId> = DockToolId.entries.toList(),
     val drawDistance: Float = 128f,
-    val environmentPreset: EnvironmentPreset = EnvironmentPreset.TWILIGHT
+    val environmentPreset: EnvironmentPreset = EnvironmentPreset.TWILIGHT,
+    val rlvaEnabled: Boolean = false
 )
 
 data class DesignStarterPreset(

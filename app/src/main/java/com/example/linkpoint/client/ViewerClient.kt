@@ -56,6 +56,7 @@ interface ViewerClient {
     fun toggleFly()
     fun elevateAvatar(deltaZ: Float)
     fun toggleSitOnSelected()
+    fun standUp() = toggleSitOnSelected()
     fun cycleCameraMode(mode: CameraMode? = null)
     fun focusCameraOn(position: Vec3?)
     fun onViewportMetricsChanged(isWideScreen: Boolean)
@@ -84,14 +85,23 @@ interface ViewerClient {
     fun sendInstantMessage(sessionId: UUID, text: String)
     fun searchMapRegions(query: String)
     fun teleportToRegion(regionName: String, x: Int, y: Int, z: Int)
+    fun teleportToLandmark(regionName: String, x: Int, y: Int, z: Int) = teleportToRegion(regionName, x, y, z)
     fun teleportHome()
     fun saveCurrentLandmark(name: String)
     fun deleteLandmark(landmarkId: String)
     fun toggleInventoryFolder(folderId: UUID)
     fun toggleWearInventoryItem(itemId: UUID, targetHudSlot: Int? = null)
+    fun openInventoryNotecard(itemId: UUID) {}
+    fun dismissNotecardPreview() {}
     fun respondScriptDialog(buttonLabel: String, channel: Int)
     fun dismissScriptDialog()
     fun dismissToast()
+
+    // RLV / RLVa Behavioral Restriction Engine Controls
+    fun setRlvaEnabled(enabled: Boolean) {}
+    fun clearAllRlvRestrictions() {}
+    fun clearRlvObjectRestrictions(objectId: UUID) {}
+    fun triggerSandboxRlvDemo(preset: String = "lock_and_gag") {}
 
     // Personal Layout & Multi-Language Design Studio
     fun setDesignLanguage(language: DesignLanguage)

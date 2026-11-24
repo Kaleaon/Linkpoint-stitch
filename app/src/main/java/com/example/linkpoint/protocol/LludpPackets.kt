@@ -253,13 +253,11 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
-        val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
+        val payloadBytes = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
 
         var flags = 0
         if (reliable) flags = flags or FLAG_RELIABLE
-        if (actuallyZeroCoded) flags = flags or FLAG_ZEROCODED
+        if (useZeroCoding) flags = flags or FLAG_ZEROCODED
         if (acks.isNotEmpty()) flags = flags or FLAG_ACK
 
         val ackTailSize = if (acks.isNotEmpty()) acks.size * 4 + 1 else 0
@@ -415,7 +413,17 @@ object LludpPackets {
         chatType: Byte = 1, // 0=Whisper, 1=Normal, 2=Shout
         channel: Int = 0
     ): ByteArray {
-        val msgBytes = (message + "\u0000").toByteArray(Charsets.UTF_8)
+        val rawUtf8 = message.toByteArray(Charsets.UTF_8)
+        val clampedLen = if (rawUtf8.size <= 1023) {
+            rawUtf8.size
+        } else {
+            var end = 1023
+            while (end > 0 && (rawUtf8[end].toInt() and 0xC0) == 0x80) end--
+            end
+        }
+        val msgBytes = ByteArray(clampedLen + 1)
+        System.arraycopy(rawUtf8, 0, msgBytes, 0, clampedLen)
+        msgBytes[clampedLen] = 0
         val buf = ByteBuffer.allocate(16 + 16 + 2 + msgBytes.size + 1 + 4)
             .order(ByteOrder.LITTLE_ENDIAN)
         putUuid(buf, agentId)

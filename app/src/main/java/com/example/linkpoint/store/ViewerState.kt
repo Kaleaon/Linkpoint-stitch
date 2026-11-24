@@ -12,6 +12,7 @@ import com.example.linkpoint.protocol.ConnectionHealthSnapshot
 import com.example.linkpoint.protocol.NetworkDiagnosticReport
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.render.RenderSceneSnapshot
+import com.example.linkpoint.rlv.RlvUiSnapshot
 import com.example.linkpoint.scene.AvatarHudSlotState
 import com.example.linkpoint.scene.CameraMode
 import com.example.linkpoint.scene.HudSafeRect
@@ -148,7 +149,9 @@ data class ViewerState(
     val parcelName: String = "Welcome Plaza",
     val isFlying: Boolean = false,
     val isSitting: Boolean = false,
+    val sittingOnObjectId: UUID? = null,
     val cameraMode: CameraMode = CameraMode.FOLLOW,
+    val rlvSnapshot: RlvUiSnapshot = RlvUiSnapshot(),
 
     // Active Floaters & Dual-Layer HUD state
     val activeFloater: DockToolId? = null,
@@ -170,6 +173,7 @@ data class ViewerState(
     val expandedFolderIds: Set<UUID> = emptySet(),
     val mapRegions: List<MapRegionTile> = emptyList(),
     val scriptDialog: ScriptDialogPrompt? = null,
+    val activeNotecardPreview: Pair<String, String>? = null,
     val toastMessage: String? = null
 )
 
