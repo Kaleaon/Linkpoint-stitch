@@ -1,5 +1,7 @@
 package com.example.linkpoint.protocol
 
+import com.example.linkpoint.build.PrimBuildPackets
+import com.example.linkpoint.scene.ColorRgba
 import com.example.linkpoint.scene.PrimShape
 import com.example.linkpoint.scene.Quat
 import com.example.linkpoint.scene.SceneObject
@@ -97,6 +99,7 @@ sealed class SimEvent {
     ) : SimEvent()
     data class UuidNamesResolved(val names: Map<UUID, String>) : SimEvent()
     data class ObjectKilled(val localId: Int) : SimEvent()
+    data class DeRezAckReceived(val transactionId: UUID, val success: Boolean) : SimEvent()
     data class ObjectPropertiesReceived(
         val objectId: UUID,
         val creatorId: UUID,
@@ -645,6 +648,12 @@ class LludpCircuitEngine {
             LludpPackets.MSG_LOGOUT_REPLY -> {
                 _events.tryEmit(SimEvent.LoggedOut)
             }
+            LludpPackets.MSG_DEREZ_ACK -> {
+                if (buf.remaining() >= 17) {
+                    val ack = PrimBuildPackets.parseDeRezAckPayload(buf)
+                    _events.tryEmit(SimEvent.DeRezAckReceived(ack.transactionId, ack.success))
+                }
+            }
         }
     }
 
@@ -819,6 +828,8 @@ class LludpCircuitEngine {
                             defaultTextureId = texEntry.defaultTextureId,
                             faceTextures = texEntry.faceTextures,
                             faceColors = texEntry.faceColors,
+                            isFullbright = texEntry.defaultFullbright,
+                            glow = texEntry.defaultGlow,
                             isScripted = (updateFlags and 0x00000004) != 0,
                             isPhysical = (updateFlags and 0x00000001) != 0,
                             isPhantom = (updateFlags and 0x00000020) != 0,
@@ -986,6 +997,8 @@ class LludpCircuitEngine {
                                 defaultTextureId = texEntry.defaultTextureId,
                                 faceTextures = texEntry.faceTextures,
                                 faceColors = texEntry.faceColors,
+                                isFullbright = texEntry.defaultFullbright,
+                                glow = texEntry.defaultGlow,
                                 isScripted = (updateFlags and 0x00000004) != 0,
                                 isPhysical = (updateFlags and 0x00000001) != 0,
                                 isPhantom = (updateFlags and 0x00000020) != 0,
@@ -1224,14 +1237,7 @@ class LludpCircuitEngine {
 
     private fun primShapeFromCurves(pCode: Int, pathCurve: Int, profileCurve: Int): PrimShape {
         if (pCode == 47) return PrimShape.AVATAR
-        val prof = profileCurve and 0x0F
-        return when {
-            pathCurve == 32 && prof == 0 -> PrimShape.TORUS
-            pathCurve == 32 && prof == 5 -> PrimShape.SPHERE
-            prof == 0 -> PrimShape.CYLINDER
-            prof == 3 -> PrimShape.PRISM
-            else -> PrimShape.BOX
-        }
+        return PrimBuildPackets.PrimPreset.fromCurves(pathCurve, profileCurve).shape
     }
 
     fun requestUuidNames(uuids: Collection<UUID>) {
@@ -1257,7 +1263,7 @@ class LludpCircuitEngine {
     fun sendChat(message: String, chatType: Byte = 1, channel: Int = 0) {
         if (!running.get()) return
         val body = LludpPackets.buildChatFromViewer(agentId, sessionId, message, chatType, channel)
-        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true)
+        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true, zeroCode = true)
     }
 
     fun sendInstantMessage(toAgentId: UUID, imSessionId: UUID, fromName: String, message: String) {
@@ -1309,6 +1315,185 @@ class LludpCircuitEngine {
         if (!running.get()) return
         val body = LludpPackets.buildDetachAttachment(agentId, sessionId, itemId)
         send(LludpPackets.MSG_DETACH_ATTACHMENT, body, reliable = true)
+    }
+
+    // --- Phase 7: Prim Build, Transform, Appearance & Linkset Dispatchers ---
+
+    fun rezObject(
+        preset: PrimBuildPackets.PrimPreset,
+        rayStart: Vec3,
+        rayEnd: Vec3,
+        scale: Vec3 = preset.defaultScale,
+        rotation: Quat = Quat.IDENTITY,
+        material: PrimBuildPackets.PrimMaterial = PrimBuildPackets.PrimMaterial.WOOD,
+        groupId: UUID = PrimBuildPackets.ZERO_UUID,
+        createSelected: Boolean = true,
+        rayEndIsIntersection: Boolean = false
+    ) {
+        if (!running.get()) return
+        val flags = if (createSelected) PrimBuildPackets.ADD_FLAG_CREATE_SELECTED else 0
+        val body = PrimBuildPackets.buildObjectAddBody(
+            agentId = agentId,
+            sessionId = sessionId,
+            groupId = groupId,
+            preset = preset,
+            material = material,
+            addFlags = flags,
+            rayStart = rayStart,
+            rayEnd = rayEnd,
+            rayEndIsIntersection = rayEndIsIntersection,
+            scale = scale,
+            rotation = rotation
+        )
+        send(PrimBuildPackets.MSG_OBJECT_ADD, body, reliable = true, zeroCode = true)
+    }
+
+    fun updateObjectTransform(
+        localId: Int,
+        position: Vec3? = null,
+        rotation: Quat? = null,
+        scale: Vec3? = null,
+        editLinkedParts: Boolean = false
+    ) {
+        if (!running.get()) return
+        val entry = PrimBuildPackets.ObjectTransformEntry(
+            localId = localId,
+            position = position,
+            rotation = rotation,
+            scale = scale,
+            editLinkedParts = editLinkedParts
+        )
+        if ((entry.computeTypeMask() and 0x07) == 0) return
+        val body = PrimBuildPackets.buildMultipleObjectUpdateBody(agentId, sessionId, listOf(entry))
+        send(PrimBuildPackets.MSG_MULTIPLE_OBJECT_UPDATE, body, reliable = true, zeroCode = true)
+    }
+
+    fun setObjectName(localId: Int, name: String) {
+        if (!running.get()) return
+        val body = PrimBuildPackets.buildObjectNameBody(agentId, sessionId, localId, name)
+        send(PrimBuildPackets.MSG_OBJECT_NAME, body, reliable = true, zeroCode = true)
+    }
+
+    fun setObjectDescription(localId: Int, description: String) {
+        if (!running.get()) return
+        val body = PrimBuildPackets.buildObjectDescriptionBody(agentId, sessionId, localId, description)
+        send(PrimBuildPackets.MSG_OBJECT_DESCRIPTION, body, reliable = true, zeroCode = true)
+    }
+
+    fun updateObjectFlags(
+        localId: Int,
+        usePhysics: Boolean,
+        isPhantom: Boolean,
+        isTemporary: Boolean = false,
+        castsShadows: Boolean = true
+    ) {
+        if (!running.get()) return
+        val body = PrimBuildPackets.buildObjectFlagUpdateBody(
+            agentId = agentId,
+            sessionId = sessionId,
+            localId = localId,
+            usePhysics = usePhysics,
+            isTemporary = isTemporary,
+            isPhantom = isPhantom,
+            castsShadows = castsShadows
+        )
+        send(PrimBuildPackets.MSG_OBJECT_FLAG_UPDATE, body, reliable = true, zeroCode = true)
+    }
+
+    fun updateObjectShape(localId: Int, volumeParams: PrimBuildPackets.PrimVolumeParams) {
+        if (!running.get()) return
+        val body = PrimBuildPackets.buildObjectShapeBody(agentId, sessionId, listOf(localId to volumeParams))
+        send(PrimBuildPackets.MSG_OBJECT_SHAPE, body, reliable = true, zeroCode = true)
+    }
+
+    fun updateObjectAppearance(
+        localId: Int,
+        defaultTextureId: UUID?,
+        faceTextures: Map<Int, UUID> = emptyMap(),
+        color: ColorRgba,
+        faceColors: Map<Int, ColorRgba> = emptyMap(),
+        fullbright: Boolean,
+        faceFullbright: Map<Int, Boolean> = emptyMap(),
+        glow: Float,
+        faceGlows: Map<Int, Float> = emptyMap()
+    ) {
+        if (!running.get()) return
+        val teBytes = PrimBuildPackets.buildCompactTextureEntry(
+            defaultTextureId = defaultTextureId,
+            faceTextures = faceTextures,
+            defaultColor = color,
+            faceColors = faceColors,
+            fullbright = fullbright,
+            faceFullbright = faceFullbright,
+            glow = glow,
+            faceGlows = faceGlows
+        )
+        val body = PrimBuildPackets.buildObjectImageBody(agentId, sessionId, localId, teBytes)
+        send(PrimBuildPackets.MSG_OBJECT_IMAGE, body, reliable = true, zeroCode = true)
+    }
+
+    fun updateObjectExtraParams(
+        localId: Int,
+        paramType: Int,
+        paramInUse: Boolean,
+        paramData: ByteArray
+    ) {
+        if (!running.get()) return
+        val body = PrimBuildPackets.buildObjectExtraParamsBody(
+            agentId = agentId,
+            sessionId = sessionId,
+            localId = localId,
+            paramType = paramType,
+            paramInUse = paramInUse,
+            paramData = paramData
+        )
+        send(PrimBuildPackets.MSG_OBJECT_EXTRA_PARAMS, body, reliable = true, zeroCode = true)
+    }
+
+    fun linkObjects(localIds: List<Int>) {
+        if (!running.get() || localIds.size < 2) return
+        val body = PrimBuildPackets.buildObjectLinkBody(agentId, sessionId, localIds)
+        send(PrimBuildPackets.MSG_OBJECT_LINK, body, reliable = true, zeroCode = false)
+    }
+
+    fun delinkObjects(localIds: List<Int>) {
+        if (!running.get() || localIds.isEmpty()) return
+        val body = PrimBuildPackets.buildObjectDelinkBody(agentId, sessionId, localIds)
+        send(PrimBuildPackets.MSG_OBJECT_DELINK, body, reliable = true, zeroCode = false)
+    }
+
+    fun duplicateObjects(
+        localIds: List<Int>,
+        offset: Vec3 = Vec3(0.5f, 0.5f, 0f),
+        groupId: UUID = PrimBuildPackets.ZERO_UUID
+    ) {
+        if (!running.get() || localIds.isEmpty()) return
+        val body = PrimBuildPackets.buildObjectDuplicateBody(
+            agentId = agentId,
+            sessionId = sessionId,
+            groupId = groupId,
+            offset = offset,
+            localIds = localIds
+        )
+        send(PrimBuildPackets.MSG_OBJECT_DUPLICATE, body, reliable = true, zeroCode = true)
+    }
+
+    fun deRezObjects(
+        localIds: List<Int>,
+        destination: PrimBuildPackets.DeRezDestination,
+        destinationId: UUID = PrimBuildPackets.ZERO_UUID,
+        groupId: UUID = PrimBuildPackets.ZERO_UUID
+    ) {
+        if (!running.get() || localIds.isEmpty()) return
+        val body = PrimBuildPackets.buildObjectDeRezBody(
+            agentId = agentId,
+            sessionId = sessionId,
+            groupId = groupId,
+            destination = destination,
+            destinationId = destinationId,
+            localIds = localIds
+        )
+        send(PrimBuildPackets.MSG_OBJECT_DEREZ, body, reliable = true, zeroCode = true)
     }
 
     private fun flushPendingAcks() {

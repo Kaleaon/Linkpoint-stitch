@@ -60,6 +60,7 @@ object LludpPackets {
     const val MSG_DETACH_ATTACHMENT: Int = 0xFFFF018D.toInt()
     const val MSG_MAP_BLOCK_REQUEST: Int = 0xFFFF0197.toInt()
     const val MSG_MAP_BLOCK_REPLY: Int = 0xFFFF0199.toInt()
+    const val MSG_DEREZ_ACK: Int = 0xFFFF0124.toInt()            // Low 292, Unencoded
     const val MSG_PACKET_ACK: Int = 0xFFFFFFFB.toInt()
 
     // RegionHandshakeReply flags (tells SL Server-Side Appearance to bake & stream self appearance)
@@ -240,7 +241,7 @@ object LludpPackets {
             (messageId and 0xFFFFFF00.toInt()) == 0 -> {
                 rawMsg.write(messageId and 0xFF)
             }
-            (messageId and 0xFFFF0000.toInt()) == 0x0000FF00 -> {
+            (messageId and 0xFFFFFF00.toInt()) == 0x0000FF00 -> {
                 rawMsg.write(0xFF)
                 rawMsg.write(messageId and 0xFF)
             }
@@ -253,8 +254,9 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
+        val ackTailSize = if (acks.isNotEmpty()) acks.size * 4 + 1 else 0
         val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        val actuallyZeroCoded = useZeroCoding && (6 + encoded.size + ackTailSize <= 1200 || encoded.size <= msgBytes.size)
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0
@@ -262,7 +264,6 @@ object LludpPackets {
         if (actuallyZeroCoded) flags = flags or FLAG_ZEROCODED
         if (acks.isNotEmpty()) flags = flags or FLAG_ACK
 
-        val ackTailSize = if (acks.isNotEmpty()) acks.size * 4 + 1 else 0
         val packet = ByteBuffer.allocate(6 + payloadBytes.size + ackTailSize).order(ByteOrder.BIG_ENDIAN)
         packet.put(flags.toByte())
         packet.putInt(sequenceNumber)
@@ -631,6 +632,11 @@ object LludpPackets {
         buf.putFloat(v.x)
         buf.putFloat(v.y)
         buf.putFloat(v.z)
+    }
+
+    fun readVec3(buf: ByteBuffer): Vec3 {
+        if (buf.remaining() < 12) return Vec3()
+        return Vec3(buf.float, buf.float, buf.float)
     }
 
     /**

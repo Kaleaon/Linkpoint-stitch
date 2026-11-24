@@ -160,6 +160,7 @@ class LinkpointGlRenderer(
         val uAmbient: Int,
         val uColor: Int,
         val uFullbright: Int,
+        val uGlow: Int,
         val uSelectedPulse: Int,
         val uTex: Int,
         val uUseTex: Int
@@ -204,6 +205,8 @@ class LinkpointGlRenderer(
     private lateinit var sphereMesh: GpuMeshBuffer
     private lateinit var torusMesh: GpuMeshBuffer
     private lateinit var prismMesh: GpuMeshBuffer
+    private lateinit var tubeMesh: GpuMeshBuffer
+    private lateinit var ringMesh: GpuMeshBuffer
     private lateinit var avatarLowerMesh: GpuMeshBuffer
     private lateinit var avatarUpperMesh: GpuMeshBuffer
     private lateinit var avatarHeadMesh: GpuMeshBuffer
@@ -316,6 +319,8 @@ class LinkpointGlRenderer(
         sphereMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildUnitSphere())
         torusMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildUnitTorus())
         prismMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildUnitPrism())
+        tubeMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildUnitTube())
+        ringMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildUnitRing())
         avatarLowerMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildAvatarLowerMesh())
         avatarUpperMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildAvatarUpperMesh())
         avatarHeadMesh = uploadMeshDataToGpu(PrimMeshGenerator.buildAvatarHeadMesh())
@@ -383,6 +388,7 @@ class LinkpointGlRenderer(
             uAmbient = GLES30.glGetUniformLocation(primProgram, "uAmbient"),
             uColor = GLES30.glGetUniformLocation(primProgram, "uColor"),
             uFullbright = GLES30.glGetUniformLocation(primProgram, "uFullbright"),
+            uGlow = GLES30.glGetUniformLocation(primProgram, "uGlow"),
             uSelectedPulse = GLES30.glGetUniformLocation(primProgram, "uSelectedPulse"),
             uTex = GLES30.glGetUniformLocation(primProgram, "uTex"),
             uUseTex = GLES30.glGetUniformLocation(primProgram, "uUseTex")
@@ -821,6 +827,7 @@ class LinkpointGlRenderer(
             GLES30.glUniformMatrix4fv(primLocs.uModel, 1, false, modelMatrix, 0)
             GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
             GLES30.glUniform1f(primLocs.uFullbright, if (obj.isFullbright) 1f else 0f)
+            GLES30.glUniform1f(primLocs.uGlow, obj.glow.coerceIn(0f, 1f))
             val pulse = if (snapshot.selectedLocalId == obj.localId) 0.55f + 0.45f * sin(timeSec * 5f) else 0f
             GLES30.glUniform1f(primLocs.uSelectedPulse, pulse)
 
@@ -841,6 +848,8 @@ class LinkpointGlRenderer(
                     PrimShape.SPHERE -> sphereMesh
                     PrimShape.TORUS -> torusMesh
                     PrimShape.PRISM -> prismMesh
+                    PrimShape.TUBE -> tubeMesh
+                    PrimShape.RING -> ringMesh
                     PrimShape.AVATAR -> continue
                 }
                 bindTextureCached(obj.defaultTextureId, primLocs.uUseTex)
@@ -920,6 +929,7 @@ class LinkpointGlRenderer(
                 GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
                 GLES30.glUniform4f(primLocs.uColor, tint.r, tint.g, tint.b, tint.a)
                 GLES30.glUniform1f(primLocs.uFullbright, 0f)
+                GLES30.glUniform1f(primLocs.uGlow, 0f)
                 GLES30.glUniform1f(primLocs.uSelectedPulse, avPulse)
                 drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, mesh)
             }
@@ -958,6 +968,7 @@ class LinkpointGlRenderer(
                 GLES30.glUniformMatrix4fv(primLocs.uModel, 1, false, modelMatrix, 0)
                 GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
                 GLES30.glUniform1f(primLocs.uFullbright, if (att.isFullbright) 1f else 0f)
+                GLES30.glUniform1f(primLocs.uGlow, att.glow.coerceIn(0f, 1f))
                 GLES30.glUniform1f(primLocs.uSelectedPulse, avPulse * 0.5f)
 
                 if (gpuMesh != null) {
@@ -976,6 +987,8 @@ class LinkpointGlRenderer(
                         PrimShape.CYLINDER -> cylinderMesh
                         PrimShape.TORUS -> torusMesh
                         PrimShape.PRISM -> prismMesh
+                        PrimShape.TUBE -> tubeMesh
+                        PrimShape.RING -> ringMesh
                         else -> boxMesh
                     }
                     bindTextureCached(att.defaultTextureId, primLocs.uUseTex)
@@ -996,6 +1009,7 @@ class LinkpointGlRenderer(
                 GLES30.glUniformMatrix3fv(primLocs.uNormalMat, 1, false, normalMatrix3, 0)
                 GLES30.glUniform4f(primLocs.uColor, 0.22f, 0.83f, 0.98f, 0.65f)
                 GLES30.glUniform1f(primLocs.uFullbright, 1f)
+                GLES30.glUniform1f(primLocs.uGlow, 0.35f)
                 GLES30.glUniform1f(primLocs.uSelectedPulse, 0f)
                 drawGpuMesh(primLocs.aPos, primLocs.aNormal, primLocs.aUv, torusMesh)
             }
@@ -1513,6 +1527,7 @@ class LinkpointGlRenderer(
             uniform float uAmbient;
             uniform vec4 uColor;
             uniform float uFullbright;
+            uniform float uGlow;
             uniform float uSelectedPulse;
             uniform sampler2D uTex;
             uniform float uUseTex;
@@ -1538,6 +1553,7 @@ class LinkpointGlRenderer(
 
                 vec3 lit = baseCol.rgb * (uAmbient * hemi + backFill + diff * uSunColor * 0.85) + uSunColor * spec;
                 lit = mix(lit, baseCol.rgb * 1.12, uFullbright);
+                lit += baseCol.rgb * (uGlow * 0.85);
 
                 float edge = smoothstep(0.035, 0.0, min(min(vUv.x, 1.0 - vUv.x), min(vUv.y, 1.0 - vUv.y)));
                 float untexturedEdge = (1.0 - uUseTex) * 0.08;

@@ -95,7 +95,7 @@ data class Quat(val x: Float = 0f, val y: Float = 0f, val z: Float = 0f, val w: 
         }
 
         /**
-         * Intrinsic XYZ / extrinsic ZYX Euler angles in degrees (Second Life avatar_lad.xml convention).
+         * Intrinsic XYZ / extrinsic ZYX Euler angles in degrees (Second Life avatar_lad.xml & Build Floater convention).
          */
         fun fromEulerDeg(rxDeg: Float, ryDeg: Float, rzDeg: Float): Quat {
             val degToRad = (Math.PI / 180.0).toFloat()
@@ -104,6 +104,25 @@ data class Quat(val x: Float = 0f, val y: Float = 0f, val z: Float = 0f, val w: 
             val qz = fromAxisAngle(Vec3(0f, 0f, 1f), rzDeg * degToRad)
             return (qz * qy * qx).normalized()
         }
+    }
+
+    /**
+     * Extracts extrinsic XYZ / intrinsic ZYX Euler angles in degrees matching [fromEulerDeg].
+     */
+    fun toEulerDeg(): Vec3 {
+        val u = normalized()
+        val radToDeg = (180.0 / Math.PI).toFloat()
+        val sinrCosp = 2f * (u.w * u.x + u.y * u.z)
+        val cosrCosp = 1f - 2f * (u.x * u.x + u.y * u.y)
+        val rx = kotlin.math.atan2(sinrCosp, cosrCosp) * radToDeg
+
+        val sinp = (2f * (u.w * u.y - u.z * u.x)).coerceIn(-1f, 1f)
+        val ry = kotlin.math.asin(sinp) * radToDeg
+
+        val sinyCosp = 2f * (u.w * u.z + u.x * u.y)
+        val cosyCosp = 1f - 2f * (u.y * u.y + u.z * u.z)
+        val rz = kotlin.math.atan2(sinyCosp, cosyCosp) * radToDeg
+        return Vec3(rx, ry, rz)
     }
 }
 
@@ -177,7 +196,7 @@ data class Transform3D(
 data class ColorRgba(val r: Float, val g: Float, val b: Float, val a: Float = 1f)
 
 enum class PrimShape {
-    BOX, CYLINDER, SPHERE, TORUS, PRISM, AVATAR
+    BOX, CYLINDER, SPHERE, TORUS, PRISM, TUBE, RING, AVATAR
 }
 
 /**
@@ -238,10 +257,13 @@ data class SceneObject(
     val faceTextures: Map<Int, UUID> = emptyMap(),
     val faceColors: Map<Int, ColorRgba> = emptyMap(),
     val isFullbright: Boolean = false,
+    val glow: Float = 0f,
     val isScripted: Boolean = false,
     val isTouchable: Boolean = true,
     val isPhysical: Boolean = false,
     val isPhantom: Boolean = false,
+    val isTemporary: Boolean = false,
+    val castsShadows: Boolean = true,
     val attachmentPoint: Int = 0, // 0 = world prim, 1..56 = body attachment, 31..38 = Avatar Attachment HUD
     val attachedAvatarId: UUID? = null,
     val isCapsTransform: Boolean = false,

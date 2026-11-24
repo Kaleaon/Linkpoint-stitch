@@ -10,10 +10,22 @@ data class ParsedTextureEntry(
     val defaultTextureId: UUID? = null,
     val faceTextures: Map<Int, UUID> = emptyMap(),
     val defaultColor: ColorRgba = ColorRgba(0.84f, 0.86f, 0.90f, 1f),
-    val faceColors: Map<Int, ColorRgba> = emptyMap()
+    val faceColors: Map<Int, ColorRgba> = emptyMap(),
+    val defaultFullbright: Boolean = false,
+    val faceFullbright: Map<Int, Boolean> = emptyMap(),
+    val defaultGlow: Float = 0f,
+    val faceGlows: Map<Int, Float> = emptyMap(),
+    val defaultRepeatU: Float = 1f,
+    val faceRepeatU: Map<Int, Float> = emptyMap(),
+    val defaultRepeatV: Float = 1f,
+    val faceRepeatV: Map<Int, Float> = emptyMap()
 ) {
     fun textureForFace(faceIndex: Int): UUID? = faceTextures[faceIndex] ?: defaultTextureId
     fun colorForFace(faceIndex: Int): ColorRgba = faceColors[faceIndex] ?: defaultColor
+    fun fullbrightForFace(faceIndex: Int): Boolean = faceFullbright[faceIndex] ?: defaultFullbright
+    fun glowForFace(faceIndex: Int): Float = faceGlows[faceIndex] ?: defaultGlow
+    fun repeatUForFace(faceIndex: Int): Float = faceRepeatU[faceIndex] ?: defaultRepeatU
+    fun repeatVForFace(faceIndex: Int): Float = faceRepeatV[faceIndex] ?: defaultRepeatV
 }
 
 data class ParsedExtraParams(
@@ -114,11 +126,103 @@ object SlBinaryParsers {
                 }
             }
 
+            var defaultRepeatU = 1f
+            val faceRepeatU = LinkedHashMap<Int, Float>()
+            var defaultRepeatV = 1f
+            val faceRepeatV = LinkedHashMap<Int, Float>()
+            var defaultFullbright = false
+            val faceFullbright = LinkedHashMap<Int, Boolean>()
+            var defaultGlow = 0f
+            val faceGlows = LinkedHashMap<Int, Float>()
+
+            fun readFloatFieldBlock(targetMap: MutableMap<Int, Float>): Float? {
+                if (buf.remaining() < 4) return null
+                val defVal = buf.float
+                while (buf.hasRemaining()) {
+                    val faceBits = readFaceBitfield(buf)
+                    if (faceBits == 0L) return defVal
+                    if (buf.remaining() < 4) return null
+                    val fVal = buf.float
+                    for (bit in 0 until 32) {
+                        if ((faceBits and (1L shl bit)) != 0L) {
+                            targetMap[bit] = fVal
+                        }
+                    }
+                }
+                return null
+            }
+
+            fun skipFieldBlock(valueBytes: Int): Boolean {
+                if (buf.remaining() < valueBytes) return false
+                buf.position(buf.position() + valueBytes)
+                while (buf.hasRemaining()) {
+                    val faceBits = readFaceBitfield(buf)
+                    if (faceBits == 0L) return true
+                    if (buf.remaining() < valueBytes) return false
+                    buf.position(buf.position() + valueBytes)
+                }
+                return false
+            }
+
+            val parsedRepU = readFloatFieldBlock(faceRepeatU)
+            if (parsedRepU != null) {
+                defaultRepeatU = parsedRepU
+                val parsedRepV = readFloatFieldBlock(faceRepeatV)
+                if (parsedRepV != null) {
+                    defaultRepeatV = parsedRepV
+                    // Skip OffsetU (2B), OffsetV (2B), Rotation (2B) blocks when present
+                    if (skipFieldBlock(2) && skipFieldBlock(2) && skipFieldBlock(2) && buf.remaining() >= 1) {
+                        // Material byte: bit 0x20 (TEM_FULLBRIGHT_MASK) indicates Fullbright
+                        val matByte = buf.get().toInt() and 0xFF
+                        defaultFullbright = (matByte and 0x20) != 0
+                        var matTerminated = false
+                        while (buf.hasRemaining()) {
+                            val faceBits = readFaceBitfield(buf)
+                            if (faceBits == 0L) {
+                                matTerminated = true
+                                break
+                            }
+                            if (buf.remaining() < 1) break
+                            val fMat = buf.get().toInt() and 0xFF
+                            val fb = (fMat and 0x20) != 0
+                            for (bit in 0 until 32) {
+                                if ((faceBits and (1L shl bit)) != 0L) {
+                                    faceFullbright[bit] = fb
+                                }
+                            }
+                        }
+                        // Media byte block (1B) -> Glow byte block (1B, 0..255 -> 0f..1f)
+                        if (matTerminated && skipFieldBlock(1) && buf.remaining() >= 1) {
+                            defaultGlow = ((buf.get().toInt() and 0xFF) / 255f).coerceIn(0f, 1f)
+                            while (buf.hasRemaining()) {
+                                val faceBits = readFaceBitfield(buf)
+                                if (faceBits == 0L) break
+                                if (buf.remaining() < 1) break
+                                val fg = ((buf.get().toInt() and 0xFF) / 255f).coerceIn(0f, 1f)
+                                for (bit in 0 until 32) {
+                                    if ((faceBits and (1L shl bit)) != 0L) {
+                                        faceGlows[bit] = fg
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             ParsedTextureEntry(
                 defaultTextureId = defaultTex.takeIf { it != ZERO_UUID },
                 faceTextures = faceTextures,
                 defaultColor = defaultColor,
-                faceColors = faceColors
+                faceColors = faceColors,
+                defaultFullbright = defaultFullbright,
+                faceFullbright = faceFullbright,
+                defaultGlow = defaultGlow,
+                faceGlows = faceGlows,
+                defaultRepeatU = defaultRepeatU,
+                faceRepeatU = faceRepeatU,
+                defaultRepeatV = defaultRepeatV,
+                faceRepeatV = faceRepeatV
             )
         } catch (_: Exception) {
             ParsedTextureEntry()

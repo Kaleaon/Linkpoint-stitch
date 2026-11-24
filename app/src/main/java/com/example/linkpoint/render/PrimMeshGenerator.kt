@@ -188,6 +188,49 @@ object PrimMeshGenerator {
     fun buildUnitPrism(): MeshData = buildUnitCylinder(segments = 3)
 
     /**
+     * Revolved square cross-section (Second Life Tube preset: PathCurve = CIRCLE, ProfileCurve = SQUARE).
+     */
+    fun buildUnitTube(majorSegs: Int = 24): MeshData =
+        buildRevolvedPolygon(majorSegs = majorSegs, polySides = 4, phaseRad = (PI / 4.0).toFloat())
+
+    /**
+     * Revolved equilateral-triangle cross-section (Second Life Ring preset: PathCurve = CIRCLE, ProfileCurve = EQUALTRI).
+     */
+    fun buildUnitRing(majorSegs: Int = 24): MeshData =
+        buildRevolvedPolygon(majorSegs = majorSegs, polySides = 3, phaseRad = 0f)
+
+    private fun buildRevolvedPolygon(majorSegs: Int, polySides: Int, phaseRad: Float): MeshData {
+        val out = ArrayList<Float>(majorSegs * polySides * 6 * 8)
+        val majorR = 0.34f
+        val minorR = 0.16f
+        for (i in 0 until majorSegs) {
+            val u0 = (2.0 * PI * i / majorSegs).toFloat()
+            val u1 = (2.0 * PI * (i + 1) / majorSegs).toFloat()
+            val cu0 = cos(u0); val su0 = sin(u0)
+            val cu1 = cos(u1); val su1 = sin(u1)
+            for (j in 0 until polySides) {
+                val v0 = phaseRad + (2.0 * PI * j / polySides).toFloat()
+                val v1 = phaseRad + (2.0 * PI * (j + 1) / polySides).toFloat()
+                val midV = 0.5f * (v0 + v1)
+                val nRad = cos(midV)
+                val nz = sin(midV)
+
+                val r0 = majorR + minorR * cos(v0); val z0 = minorR * sin(v0)
+                val r1 = majorR + minorR * cos(v1); val z1 = minorR * sin(v1)
+
+                pushVert(out, r0 * cu0, r0 * su0, z0, nRad * cu0, nRad * su0, nz, i.toFloat() / majorSegs, j.toFloat() / polySides)
+                pushVert(out, r0 * cu1, r0 * su1, z0, nRad * cu1, nRad * su1, nz, (i + 1f) / majorSegs, j.toFloat() / polySides)
+                pushVert(out, r1 * cu1, r1 * su1, z1, nRad * cu1, nRad * su1, nz, (i + 1f) / majorSegs, (j + 1f) / polySides)
+
+                pushVert(out, r0 * cu0, r0 * su0, z0, nRad * cu0, nRad * su0, nz, i.toFloat() / majorSegs, j.toFloat() / polySides)
+                pushVert(out, r1 * cu1, r1 * su1, z1, nRad * cu1, nRad * su1, nz, (i + 1f) / majorSegs, (j + 1f) / polySides)
+                pushVert(out, r1 * cu0, r1 * su0, z1, nRad * cu0, nRad * su0, nz, i.toFloat() / majorSegs, (j + 1f) / polySides)
+            }
+        }
+        return MeshData(toFloatBuffer(out), out.size / MeshData.FLOATS_PER_VERTEX)
+    }
+
+    /**
      * Builds the 256m x 256m terrain mesh from TerrainGrid height samples with smooth vertex normals.
      */
     fun buildTerrainMesh(terrain: TerrainGrid): MeshData {
