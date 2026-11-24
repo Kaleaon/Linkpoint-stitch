@@ -175,6 +175,8 @@ class LinkpointGlRenderer(
         val uUseMrTex: Int,
         val uMrUvTr: Int,
         val uMrUvRot: Int,
+        val uOrmFactors: Int,
+        val uAlphaCutoff: Int,
         val uEmissiveTex: Int,
         val uUseEmissiveTex: Int,
         val uEmissiveUvTr: Int,
@@ -478,6 +480,8 @@ class LinkpointGlRenderer(
             uUseMrTex = GLES30.glGetUniformLocation(primProgram, "uUseMrTex"),
             uMrUvTr = GLES30.glGetUniformLocation(primProgram, "uMrUvTr"),
             uMrUvRot = GLES30.glGetUniformLocation(primProgram, "uMrUvRot"),
+            uOrmFactors = GLES30.glGetUniformLocation(primProgram, "uOrmFactors"),
+            uAlphaCutoff = GLES30.glGetUniformLocation(primProgram, "uAlphaCutoff"),
             uEmissiveTex = GLES30.glGetUniformLocation(primProgram, "uEmissiveTex"),
             uUseEmissiveTex = GLES30.glGetUniformLocation(primProgram, "uUseEmissiveTex"),
             uEmissiveUvTr = GLES30.glGetUniformLocation(primProgram, "uEmissiveUvTr"),
@@ -902,7 +906,20 @@ class LinkpointGlRenderer(
         val mr = transforms.metallicRoughness
         GLES30.glUniform4f(primLocs.uMrUvTr, mr.offsetU, mr.offsetV, mr.scaleU, mr.scaleV)
         GLES30.glUniform1f(primLocs.uMrUvRot, mr.rotationRad)
-        val mrGl = transforms.metallicRoughnessTextureId?.let { gpuTextureCache[it] } ?: 0
+        GLES30.glUniform3f(
+            primLocs.uOrmFactors,
+            transforms.occlusionStrength.coerceIn(0f, 1f),
+            transforms.roughnessFactor.coerceIn(0f, 1f),
+            transforms.metallicFactor.coerceIn(0f, 1f)
+        )
+        val alphaCutoff = when {
+            transforms === PbrMaterialChannelTransforms.IDENTITY -> 0.08f
+            transforms.alphaMode == "MASK" -> transforms.alphaCutoff.coerceIn(0.01f, 0.99f)
+            transforms.alphaMode == "BLEND" -> 0.01f
+            else -> -1.0f // explicit glTF OPAQUE never alpha-discards
+        }
+        GLES30.glUniform1f(primLocs.uAlphaCutoff, alphaCutoff)
+        val mrGl = (transforms.metallicRoughnessTextureId ?: transforms.occlusionTextureId)?.let { gpuTextureCache[it] } ?: 0
         if (mrGl != 0) {
             GLES30.glActiveTexture(GLES30.GL_TEXTURE2)
             GLES30.glBindTexture(GLES30.GL_TEXTURE_2D, mrGl)
@@ -1816,7 +1833,7 @@ class LinkpointGlRenderer(
             }
         """
 
-        private const val PRIM_FS = """#version 300 es
+        internal const val PRIM_FS = """#version 300 es
             precision mediump float;
             in vec3 vWorldPos;
             in vec3 vNormal;
@@ -1841,6 +1858,8 @@ class LinkpointGlRenderer(
             uniform float uUseMrTex;
             uniform vec4 uMrUvTr;
             uniform float uMrUvRot;
+            uniform vec3 uOrmFactors;
+            uniform float uAlphaCutoff;
             uniform sampler2D uEmissiveTex;
             uniform float uUseEmissiveTex;
             uniform vec4 uEmissiveUvTr;
@@ -1860,7 +1879,11 @@ class LinkpointGlRenderer(
                 if (uUseTex > 0.5) {
                     vec4 texCol = texture(uTex, baseUv);
                     baseCol *= texCol;
-                    if (baseCol.a < 0.08) discard;
+                    if (uAlphaCutoff < 0.0) {
+                        baseCol.a = 1.0;
+                    } else if (baseCol.a < uAlphaCutoff) {
+                        discard;
+                    }
                 }
                 vec3 n = normalize(vNormal);
                 if (!gl_FrontFacing) {
@@ -1872,13 +1895,16 @@ class LinkpointGlRenderer(
                     n = normalize(n + tangentSample * 0.35);
                 }
 
+                float occlusion = 1.0;
                 float roughness = 0.55;
                 float metallic = 0.05;
                 if (uUseMrTex > 0.5) {
                     vec2 mrUv = transformChannelUv(vUv, uMrUvTr, uMrUvRot);
                     vec4 mrSample = texture(uMrTex, mrUv);
-                    roughness = clamp(mrSample.g, 0.05, 1.0);
-                    metallic = clamp(mrSample.b, 0.0, 1.0);
+                    // Second Life glTF 2.0 ORM channel convention: R = occlusion, G = roughness, B = metalness
+                    occlusion = mix(1.0, clamp(mrSample.r, 0.0, 1.0), uOrmFactors.x);
+                    roughness = clamp(mrSample.g * uOrmFactors.y, 0.04, 1.0);
+                    metallic = clamp(mrSample.b * uOrmFactors.z, 0.0, 1.0);
                 }
 
                 vec3 l = normalize(uSunDir);
@@ -1891,7 +1917,7 @@ class LinkpointGlRenderer(
                 float specStrength = mix(0.20, 0.55, metallic);
                 float spec = pow(max(dot(n, hVec), 0.0), shininess) * specStrength;
 
-                vec3 lit = baseCol.rgb * (uAmbient * hemi + backFill + diff * uSunColor * (0.85 - metallic * 0.35)) + uSunColor * spec;
+                vec3 lit = baseCol.rgb * (uAmbient * hemi * occlusion + backFill * occlusion + diff * uSunColor * (0.85 - metallic * 0.35)) + uSunColor * spec;
                 lit = mix(lit, baseCol.rgb * 1.12, uFullbright);
 
                 if (uUseEmissiveTex > 0.5) {

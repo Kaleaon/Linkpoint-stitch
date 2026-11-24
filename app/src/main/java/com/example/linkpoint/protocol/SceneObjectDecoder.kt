@@ -4,12 +4,136 @@ import com.example.linkpoint.render.ExtraParamsAndSculptGenerator
 import com.example.linkpoint.render.FullExtraParamsResult
 import com.example.linkpoint.render.PartDataBinaryCodec
 import com.example.linkpoint.render.PartDataConfig
+import com.example.linkpoint.scene.SceneObject
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID
 
 /**
- * Decoded animation sequence entry from `AvatarAnimation` (`High 20`) or `ObjectAnimation` (`High 21`).
+ * Result of resolving an `ObjectUpdateCached` (`High 14`) batch against [RegionObjectCache].
+ */
+data class CachedBatchResolution(
+    val regionHandle: Long,
+    val hits: List<SceneObject>,
+    val misses: List<LludpPackets.ObjectCacheMissRequest>
+)
+
+/**
+ * Bounded per-region `(localId, crc)` object cache backing Second Life & OpenSimulator
+ * `ObjectUpdateCached` (`High 14` = `0x0E`, `Unencoded`) lookups and `RequestMultipleObjects`
+ * (`Medium 3` = `0xFF03`, `Zerocoded`) cache-miss fallback generation.
+ */
+class RegionObjectCache(
+    private val maxEntriesPerRegion: Int = 4096,
+    private val missDedupeWindowMs: Long = 1500L
+) {
+    private val lock = Any()
+    private val entriesByRegion = HashMap<Long, LinkedHashMap<Int, SceneObject>>()
+    private val pendingMissTimestamps = HashMap< Pair<Long, Int>, Pair<Int, Long>>()
+
+    fun put(regionHandle: Long, sceneObject: SceneObject) {
+        synchronized(lock) {
+            val map = entriesByRegion.getOrPut(regionHandle) {
+                object : LinkedHashMap<Int, SceneObject>(256, 0.75f, true) {
+                    override fun removeEldestEntry(eldest: MutableMap.MutableEntry<Int, SceneObject>?): Boolean =
+                        size > maxEntriesPerRegion
+                }
+            }
+            map[sceneObject.localId] = sceneObject
+            pendingMissTimestamps.remove(regionHandle to sceneObject.localId)
+        }
+    }
+
+    fun get(regionHandle: Long, localId: Int): SceneObject? = synchronized(lock) {
+        entriesByRegion[regionHandle]?.get(localId)
+    }
+
+    fun remove(localId: Int, regionHandle: Long? = null) {
+        synchronized(lock) {
+            if (regionHandle != null) {
+                entriesByRegion[regionHandle]?.remove(localId)
+                pendingMissTimestamps.remove(regionHandle to localId)
+            } else {
+                entriesByRegion.values.forEach { it.remove(localId) }
+                val keysToRemove = pendingMissTimestamps.keys.filter { it.second == localId }
+                keysToRemove.forEach { pendingMissTimestamps.remove(it) }
+            }
+        }
+    }
+
+    fun clear() {
+        synchronized(lock) {
+            entriesByRegion.clear()
+            pendingMissTimestamps.clear()
+        }
+    }
+
+    fun size(regionHandle: Long): Int = synchronized(lock) {
+        entriesByRegion[regionHandle]?.size ?: 0
+    }
+
+    /**
+     * Resolves every `(localId, crc, updateFlags)` entry in an `ObjectUpdateCached` (`0x0E`) message:
+     * - Matching `(localId, crc)` -> cache HIT (returns cached [SceneObject] with refreshed `updateFlags` and zero network round-trip).
+     * - Unknown `localId` -> cache MISS with `CACHE_MISS_TYPE_FULL` (`0`).
+     * - Known `localId` with mismatched `crc` -> cache MISS with `CACHE_MISS_TYPE_CRC` (`1`).
+     */
+    fun resolveCachedBatch(
+        decoded: LludpPackets.DecodedObjectUpdateCached,
+        nowMs: Long = System.currentTimeMillis()
+    ): CachedBatchResolution {
+        val hits = ArrayList<SceneObject>()
+        val misses = ArrayList<LludpPackets.ObjectCacheMissRequest>()
+        synchronized(lock) {
+            val regionMap = entriesByRegion[decoded.regionHandle]
+            for (entry in decoded.objects) {
+                val cached = regionMap?.get(entry.localId)
+                if (cached != null && cached.crc == entry.crc) {
+                    pendingMissTimestamps.remove(decoded.regionHandle to entry.localId)
+                    val refreshed = if (cached.updateFlags == entry.updateFlags) {
+                        cached
+                    } else {
+                        cached.copy(
+                            updateFlags = entry.updateFlags,
+                            isPhysical = (entry.updateFlags and 0x00000001) != 0,
+                            isScripted = (entry.updateFlags and 0x00000004) != 0,
+                            isPhantom = (entry.updateFlags and 0x00000020) != 0
+                        ).also { regionMap[entry.localId] = it }
+                    }
+                    hits.add(refreshed)
+                } else {
+                    val missType = if (cached == null) {
+                        LludpPackets.CACHE_MISS_TYPE_FULL
+                    } else {
+                        LludpPackets.CACHE_MISS_TYPE_CRC
+                    }
+                    val key = decoded.regionHandle to entry.localId
+                    val prev = pendingMissTimestamps[key]
+                    val shouldRequest = prev == null ||
+                        prev.first != entry.crc ||
+                        (nowMs - prev.second) >= missDedupeWindowMs
+                    if (shouldRequest) {
+                        pendingMissTimestamps[key] = entry.crc to nowMs
+                        misses.add(
+                            LludpPackets.ObjectCacheMissRequest(
+                                localId = entry.localId,
+                                cacheMissType = missType
+                            )
+                        )
+                    }
+                }
+            }
+        }
+        return CachedBatchResolution(
+            regionHandle = decoded.regionHandle,
+            hits = hits,
+            misses = misses
+        )
+    }
+}
+
+/**
+ * Decoded animation sequence entry from `AvatarAnimation` (`High 20`) or `ObjectAnimation` (`High 30`).
  */
 data class SignaledAnimation(
     val animId: UUID,
@@ -119,7 +243,7 @@ object SceneObjectDecoder {
     }
 
     /**
-     * Decodes `AvatarAnimation` (`High 20`) or `ObjectAnimation` (`High 21`) packet body:
+     * Decodes `AvatarAnimation` (`High 20`) or `ObjectAnimation` (`High 30`) packet body:
      * - `Sender` block: `ID` (16B UUID)
      * - `AnimationList` variable count (1B): `[AnimID (16B UUID), AnimSequenceID (4B S32 LE)] * count`
      * - `AnimationSourceList` variable count (1B, optional): `[ObjectID (16B UUID)] * count`

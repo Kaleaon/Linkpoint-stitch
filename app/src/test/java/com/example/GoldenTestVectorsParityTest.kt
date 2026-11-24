@@ -1,16 +1,25 @@
 package com.example
 
+import com.example.linkpoint.protocol.CapabilityManager
+import com.example.linkpoint.protocol.GridAssetManager
 import com.example.linkpoint.protocol.LlMeshDecoder
+import com.example.linkpoint.protocol.LlsdCodec
+import com.example.linkpoint.protocol.LludpCircuitEngine
 import com.example.linkpoint.protocol.LludpPackets
 import com.example.linkpoint.protocol.SceneObjectDecoder
+import com.example.linkpoint.protocol.SimEvent
+import com.example.linkpoint.protocol.SlAssetType
+import com.example.linkpoint.protocol.SlInventoryType
 import com.example.linkpoint.render.AnimJointMotion
 import com.example.linkpoint.render.AnimPosKeyframe
 import com.example.linkpoint.render.AnimRotKeyframe
+import com.example.linkpoint.render.ExtraParamTypes
 import com.example.linkpoint.render.ExtraParamsAndSculptGenerator
 import com.example.linkpoint.render.FlexibleParams
 import com.example.linkpoint.render.FlexiblePathSimulator
 import com.example.linkpoint.render.LindenAnimBinaryDecoder
 import com.example.linkpoint.render.LindenAnimData
+import com.example.linkpoint.render.LinkpointGlRenderer
 import com.example.linkpoint.render.PartDataBinaryCodec
 import com.example.linkpoint.render.PartDataConfig
 import com.example.linkpoint.render.ParticleBlendFunc
@@ -24,13 +33,21 @@ import com.example.linkpoint.scene.AvatarEntity
 import com.example.linkpoint.scene.AvatarSkeletonHierarchy
 import com.example.linkpoint.scene.ColorRgba
 import com.example.linkpoint.scene.LocalSandboxBuilder
+import com.example.linkpoint.scene.PrimShape
 import com.example.linkpoint.scene.Quat
+import com.example.linkpoint.scene.SceneObject
 import com.example.linkpoint.scene.Transform3D
 import com.example.linkpoint.scene.Vec3
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONObject
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -777,5 +794,349 @@ class GoldenTestVectorsParityTest {
         assertEquals(highPrioId, decodedPkt.animations[1].animId)
         assertEquals(12, decodedPkt.animations[1].sequenceId)
         assertEquals(listOf(sourceObjUuid), decodedPkt.objectSourceIds)
+    }
+
+    @Test
+    fun `verifies ObjectUpdateCached High 14 unencoded decoding and RequestMultipleObjects Medium 3 zerocoded cache-miss fallback`() {
+        val phase9Json = loadResourceJson("test-vectors/phase9/phase9_sl_binary_vectors.json")
+        val vec = phase9Json.getJSONArray("object_update_cached_vectors").getJSONObject(0)
+        val exp = vec.getJSONObject("expected")
+
+        // Canonical message IDs per secondlife_protocol (message_template.msg)
+        assertEquals(14, LludpPackets.MSG_OBJECT_UPDATE_CACHED)
+        assertEquals(0xFF03, LludpPackets.MSG_REQUEST_MULTIPLE_OBJECTS)
+        assertEquals(30, LludpPackets.MSG_OBJECT_ANIMATION)
+
+        // 1. Decode golden Unencoded ObjectUpdateCached (0x0E) datagram containing consecutive zero runs
+        val rawCachedPkt = hexToBytes(vec.getString("framed_packet_hex"))
+        val decodedHeader = LludpPackets.decodePacket(rawCachedPkt, rawCachedPkt.size)
+        assertNotNull(decodedHeader)
+        assertEquals("ObjectUpdateCached must be Unencoded (FLAG_ZEROCODED unset)", exp.getInt("flags"), decodedHeader!!.flags)
+        assertEquals(0, decodedHeader.flags and LludpPackets.FLAG_ZEROCODED)
+        assertEquals(exp.getInt("sequence_number"), decodedHeader.sequenceNumber)
+        assertEquals(exp.getInt("message_id"), decodedHeader.messageId)
+
+        val decodedCached = LludpPackets.parseObjectUpdateCached(decodedHeader.payload)
+        assertNotNull(decodedCached)
+        assertEquals(exp.getLong("region_handle"), decodedCached!!.regionHandle)
+        assertEquals(exp.getInt("time_dilation"), decodedCached.timeDilation)
+
+        val expEntries = exp.getJSONArray("entries")
+        assertEquals(expEntries.length(), decodedCached.objects.size)
+        for (i in 0 until expEntries.length()) {
+            val ee = expEntries.getJSONObject(i)
+            assertEquals(ee.getInt("local_id"), decodedCached.objects[i].localId)
+            assertEquals(ee.getInt("crc"), decodedCached.objects[i].crc)
+            assertEquals(ee.getInt("update_flags"), decodedCached.objects[i].updateFlags)
+        }
+
+        // Verify frameObjectUpdateCachedPacket reproduces exact Unencoded wire bytes byte-for-byte
+        val reFramedCached = LludpPackets.frameObjectUpdateCachedPacket(
+            sequenceNumber = decodedHeader.sequenceNumber,
+            regionHandle = decodedCached.regionHandle,
+            timeDilation = decodedCached.timeDilation,
+            objects = decodedCached.objects
+        )
+        assertArrayEquals(rawCachedPkt, reFramedCached)
+
+        // 2. End-to-end LludpCircuitEngine RegionObjectCache hit + RequestMultipleObjects (0xFF03 Zerocoded) miss dispatch
+        val agentId = UUID.fromString(vec.getString("agent_id"))
+        val sessionId = UUID.fromString(vec.getString("session_id"))
+        val regionHandle = decodedCached.regionHandle
+
+        val circuit = LludpCircuitEngine()
+        circuit.configureIdentityForTest(agentId, sessionId)
+        val prepop = vec.getJSONArray("prepopulated_cache")
+        for (i in 0 until prepop.length()) {
+            val item = prepop.getJSONObject(i)
+            val lid = item.getInt("local_id")
+            circuit.objectCache.put(
+                regionHandle,
+                SceneObject(
+                    localId = lid,
+                    uuid = UUID.fromString(item.getString("uuid")),
+                    name = "Cached Prim #$lid",
+                    shape = PrimShape.BOX,
+                    position = Vec3(128f, 128f, 25f),
+                    crc = item.getInt("crc"),
+                    updateFlags = item.getInt("update_flags")
+                )
+            )
+        }
+
+        val collectedEvents = mutableListOf<SimEvent>()
+        val collectJob = CoroutineScope(Dispatchers.Unconfined).launch {
+            circuit.events.collect { collectedEvents.add(it) }
+        }
+        try {
+            circuit.processRawDatagramForTest(rawCachedPkt)
+        } finally {
+            collectJob.cancel()
+        }
+
+        val updatedEvents = collectedEvents.filterIsInstance<SimEvent.ObjectUpdated>()
+        assertEquals(1, updatedEvents.size)
+        val hitObj = updatedEvents.single().sceneObject
+        assertEquals(exp.getJSONArray("hit_local_ids").getInt(0), hitObj.localId)
+        assertEquals(exp.getBoolean("refreshed_hit_is_physical"), hitObj.isPhysical)
+        assertEquals(exp.getBoolean("refreshed_hit_is_scripted"), hitObj.isScripted)
+
+        val missEvents = collectedEvents.filterIsInstance<SimEvent.ObjectCacheMissRequested>()
+        assertEquals(1, missEvents.size)
+        val missEvt = missEvents.single()
+        assertEquals(regionHandle, missEvt.regionHandle)
+
+        val expMisses = exp.getJSONArray("misses")
+        assertEquals(expMisses.length(), missEvt.misses.size)
+        for (i in 0 until expMisses.length()) {
+            val em = expMisses.getJSONObject(i)
+            assertEquals(em.getInt("local_id"), missEvt.misses[i].localId)
+            assertEquals(em.getInt("cache_miss_type"), missEvt.misses[i].cacheMissType)
+        }
+
+        // Inspect framed RequestMultipleObjects (Medium 3 = 0xFF03) packet: MUST be Reliable + Zerocoded (0xC0) with 2-byte Medium ID (0xFF, 0x03)
+        assertEquals(1, missEvt.framedPackets.size)
+        val rmoWire = missEvt.framedPackets.single()
+        val rmoFlags = rmoWire[0].toInt() and 0xFF
+        assertEquals(exp.getInt("request_multiple_objects_flags"), rmoFlags)
+        assertTrue("RequestMultipleObjects must set FLAG_ZEROCODED (0x80)", (rmoFlags and LludpPackets.FLAG_ZEROCODED) != 0)
+        assertTrue("RequestMultipleObjects must set FLAG_RELIABLE (0x40)", (rmoFlags and LludpPackets.FLAG_RELIABLE) != 0)
+        assertEquals("Medium frequency prefix byte must be 0xFF", 0xFF, rmoWire[6].toInt() and 0xFF)
+        assertEquals("Medium frequency message number must be 0x03", 0x03, rmoWire[7].toInt() and 0xFF)
+        // Unencoded size would be 6B header + 2B Medium ID + 33B Agent/Count + 10B ObjectData = 51 bytes; zero-coding shrinks zero runs
+        assertTrue("Zerocoded RequestMultipleObjects wire packet (${rmoWire.size}B) must compress zero runs (< 51B)", rmoWire.size < 51)
+
+        val decodedRmoPkt = LludpPackets.decodePacket(rmoWire, rmoWire.size)
+        assertNotNull(decodedRmoPkt)
+        assertEquals(exp.getInt("request_multiple_objects_message_id"), decodedRmoPkt!!.messageId)
+        val parsedRmo = LludpPackets.parseRequestMultipleObjects(decodedRmoPkt.payload)
+        assertNotNull(parsedRmo)
+        assertEquals(agentId, parsedRmo!!.agentId)
+        assertEquals(sessionId, parsedRmo.sessionId)
+        assertEquals(
+            listOf(
+                LludpPackets.ObjectCacheMissRequest(localId = 202, cacheMissType = LludpPackets.CACHE_MISS_TYPE_FULL),
+                LludpPackets.ObjectCacheMissRequest(localId = 1002, cacheMissType = LludpPackets.CACHE_MISS_TYPE_CRC)
+            ),
+            parsedRmo.requests
+        )
+
+        // 3. KillObject (High 16) evicts cached object so stale entries never linger
+        val killBody = ByteBuffer.allocate(5).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put(1.toByte())
+            putInt(1001)
+        }.array()
+        val killPkt = LludpPackets.framePacket(
+            sequenceNumber = 43,
+            reliable = false,
+            messageId = LludpPackets.MSG_KILL_OBJECT,
+            body = killBody,
+            useZeroCoding = false
+        )
+        circuit.processRawDatagramForTest(killPkt)
+        assertNull(circuit.objectCache.get(regionHandle, 1001))
+    }
+
+    @Test
+    fun `verifies SL glTF 2_0 PBR ORM channel mapping and strict asset_id vs item_id separation across sculpt, particle, llmesh, and anim fetches`() {
+        val phase9Json = loadResourceJson("test-vectors/phase9/phase9_sl_binary_vectors.json")
+        val vec = phase9Json.getJSONArray("gltf_orm_and_asset_identity_vectors").getJSONObject(0)
+        val expOrm = vec.getJSONObject("expected_orm")
+
+        // 1. SL glTF 2.0 PBR ORM convention: R = Occlusion, G = Roughness, B = Metalness
+        val mat = PbrMaterialChannelTransforms.fromGltfJson(vec.getString("gltf_json"))
+        assertEquals(expOrm.getString("alpha_mode"), mat.alphaMode)
+        assertEquals(expOrm.getDouble("alpha_cutoff").toFloat(), mat.alphaCutoff, 1e-4f)
+        assertEquals(expOrm.getBoolean("double_sided"), mat.doubleSided)
+        assertEquals(0.8f, mat.metallicFactor, 1e-4f)
+        assertEquals(0.75f, mat.roughnessFactor, 1e-4f)
+        assertEquals(0.6f, mat.occlusionStrength, 1e-4f)
+
+        // Verify independent KHR_texture_transform on baseColor, metallicRoughness, and occlusion
+        val (occU, occV) = mat.occlusion.apply(0.4f, 0.2f)
+        assertEquals(0.4f * 1.25f + 0.05f, occU, 1e-4f)
+        assertEquals(0.2f * 1.25f - 0.05f, occV, 1e-4f)
+        val (mrU, mrV) = mat.metallicRoughness.apply(0.4f, 0.2f)
+        assertFalse("occlusion and metallicRoughness UV transforms must remain independent", kotlin.math.abs(occU - mrU) < 1e-3f)
+
+        val ormPixel = java.lang.Long.parseLong(vec.getString("orm_pixel_argb_hex"), 16).toInt()
+        val unpackedOrm = mat.unpackOrmArgb(ormPixel)
+        assertEquals("SL ORM R channel must unpack as ambient occlusion", expOrm.getDouble("occlusion").toFloat(), unpackedOrm.occlusion, 1e-4f)
+        assertEquals("SL ORM G channel must unpack as perceptual roughness", expOrm.getDouble("roughness").toFloat(), unpackedOrm.roughness, 1e-4f)
+        assertEquals("SL ORM B channel must unpack as metalness", expOrm.getDouble("metalness").toFloat(), unpackedOrm.metalness, 1e-4f)
+
+        // Verify LinkpointGlRenderer.PRIM_FS shader binds R -> occlusion, G -> roughness, B -> metallic
+        assertTrue(LinkpointGlRenderer.PRIM_FS.contains("occlusion = mix(1.0, clamp(mrSample.r, 0.0, 1.0), uOrmFactors.x)"))
+        assertTrue(LinkpointGlRenderer.PRIM_FS.contains("roughness = clamp(mrSample.g * uOrmFactors.y, 0.04, 1.0)"))
+        assertTrue(LinkpointGlRenderer.PRIM_FS.contains("metallic = clamp(mrSample.b * uOrmFactors.z, 0.0, 1.0)"))
+
+        // Verify ExtraParams 0x0070 (RENDER_MATERIAL) & 0x0080 (EXTENDED_MESH) per-face glTF material asset IDs
+        val ids = vec.getJSONObject("inventory_and_caps_assets")
+        val face0MatAssetId = UUID.fromString(ids.getString("material_asset_id"))
+        val extraMatBuf = ByteBuffer.allocate(1 + 6 + 1 + 17).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put(1.toByte())
+            putShort(ExtraParamTypes.RENDER_MATERIAL.toShort())
+            putInt(18)
+            put(1.toByte()) // 1 face entry
+            put(0.toByte()) // face index 0
+            LludpPackets.putUuid(this, face0MatAssetId)
+        }.array()
+        val parsedMatExtra = ExtraParamsAndSculptGenerator.parseExtraParams(extraMatBuf)
+        assertEquals(face0MatAssetId, parsedMatExtra.renderMaterialIds[0])
+
+        // 2. SlAssetType vs SlInventoryType integer enum codes are distinct (secondlife_assets_mesh_texture)
+        assertNotEquals(SlAssetType.MESH.code, SlInventoryType.MESH.code)
+        assertEquals(49, SlAssetType.MESH.code)
+        assertEquals(22, SlInventoryType.MESH.code)
+        assertNotEquals(SlAssetType.ANIMATION.code, SlInventoryType.ANIMATION.code)
+        assertEquals(20, SlAssetType.ANIMATION.code)
+        assertEquals(19, SlInventoryType.ANIMATION.code)
+        assertNotEquals(SlAssetType.MATERIAL.code, SlInventoryType.MATERIAL.code)
+        assertEquals(57, SlAssetType.MATERIAL.code)
+        assertEquals(26, SlInventoryType.MATERIAL.code)
+
+        // 3. Strict asset_id vs item_id separation across Inventory CAPS, Attachment CAPS, and GridAssetManager URLs
+        val folderId = UUID.fromString(ids.getString("folder_id"))
+        val objectId = UUID.fromString(ids.getString("object_id"))
+        val meshItemId = UUID.fromString(ids.getString("mesh_item_id"))
+        val meshAssetId = UUID.fromString(ids.getString("mesh_asset_id"))
+        val sculptItemId = UUID.fromString(ids.getString("sculpt_item_id"))
+        val sculptAssetId = UUID.fromString(ids.getString("sculpt_asset_id"))
+        val particleItemId = UUID.fromString(ids.getString("particle_item_id"))
+        val particleAssetId = UUID.fromString(ids.getString("particle_asset_id"))
+        val animItemId = UUID.fromString(ids.getString("anim_item_id"))
+        val animAssetId = UUID.fromString(ids.getString("anim_asset_id"))
+        val materialItemId = UUID.fromString(ids.getString("material_item_id"))
+
+        val invXml = """
+            <llsd><map>
+              <key>folders</key><array>
+                <map>
+                  <key>folder_id</key><uuid>$folderId</uuid>
+                  <key>items</key><array>
+                    <map>
+                      <key>item_id</key><uuid>$meshItemId</uuid>
+                      <key>parent_id</key><uuid>$folderId</uuid>
+                      <key>asset_id</key><uuid>$meshAssetId</uuid>
+                      <key>type</key><integer>49</integer>
+                      <key>inv_type</key><integer>22</integer>
+                      <key>name</key><string>Cybernetic Visor Mesh</string>
+                      <key>desc</key><string>Rigged Mesh</string>
+                    </map>
+                    <map>
+                      <key>item_id</key><uuid>$animItemId</uuid>
+                      <key>parent_id</key><uuid>$folderId</uuid>
+                      <key>asset_id</key><uuid>$animItemId</uuid>
+                      <key>type</key><integer>20</integer>
+                      <key>inv_type</key><integer>19</integer>
+                      <key>name</key><string>Conflated No-Mod Anim</string>
+                      <key>desc</key><string>Bogus asset_id == item_id</string>
+                    </map>
+                  </array>
+                </map>
+              </array>
+            </map></llsd>
+        """.trimIndent()
+        val parsedInv = CapabilityManager.parseFetchInventoryDescendentsResponse(invXml, folderId)
+        assertEquals(2, parsedInv.size)
+        assertEquals(meshItemId, parsedInv[0].itemId)
+        assertEquals(folderId, parsedInv[0].parentId)
+        assertEquals(meshAssetId, parsedInv[0].assetId)
+        assertEquals(49, parsedInv[0].assetType)
+        assertEquals(22, parsedInv[0].inventoryType)
+        // Conflated asset_id == item_id is stripped to null rather than poisoning asset fetches!
+        assertEquals(animItemId, parsedInv[1].itemId)
+        assertNull("Inventory parser must strip conflated asset_id == item_id", parsedInv[1].assetId)
+
+        val attachCapsXml = """
+            <llsd><map>
+              <key>attachments</key><array>
+                <map>
+                  <key>object_id</key><uuid>$objectId</uuid>
+                  <key>item_id</key><uuid>$meshItemId</uuid>
+                  <key>attachment_point</key><integer>6</integer>
+                  <key>mesh_id</key><uuid>$meshAssetId</uuid>
+                  <key>sculpt_texture_id</key><uuid>$sculptAssetId</uuid>
+                  <key>particle_texture_id</key><uuid>$particleAssetId</uuid>
+                  <key>anim_id</key><uuid>$animAssetId</uuid>
+                </map>
+              </array>
+            </map></llsd>
+        """.trimIndent()
+        val parsedAttach = CapabilityManager.parseCapsAttachmentUpdates(LlsdCodec.parseXml(attachCapsXml))
+        assertEquals(1, parsedAttach.size)
+        val att = parsedAttach.single()
+        assertEquals(objectId, att.objectId)
+        assertEquals(meshItemId, att.itemId)
+        assertEquals(meshAssetId, att.meshAssetId)
+        assertEquals(sculptAssetId, att.sculptTextureId)
+        assertEquals(particleAssetId, att.particleTextureId)
+        assertEquals(animAssetId, att.animAssetId)
+
+        // Verify GridAssetManager capability priority order & asset_id vs item_id guard across all 5 asset kinds
+        val assetMgr = GridAssetManager()
+        assetMgr.configureCapabilities(
+            mapOf(
+                "GetMesh2" to "https://sim.agni.lindenlab.com:12043/cap/get_mesh2",
+                "GetMesh" to "https://sim.agni.lindenlab.com:12043/cap/get_mesh",
+                "GetTexture" to "https://sim.agni.lindenlab.com:12043/cap/get_texture",
+                "ViewerAsset" to "https://asset-cdn.glb.agni.lindenlab.com/cap/viewer_asset",
+                "RenderMaterials" to "https://sim.agni.lindenlab.com:12043/cap/render_materials"
+            )
+        )
+
+        val meshUrls = assetMgr.resolveMeshUrls(meshAssetId, itemId = meshItemId)
+        assertEquals(
+            listOf(
+                "https://sim.agni.lindenlab.com:12043/cap/get_mesh2?mesh_id=$meshAssetId",
+                "https://sim.agni.lindenlab.com:12043/cap/get_mesh?mesh_id=$meshAssetId",
+                "https://asset-cdn.glb.agni.lindenlab.com/cap/viewer_asset?mesh_id=$meshAssetId"
+            ),
+            meshUrls
+        )
+        assertTrue(meshUrls.none { it.contains(meshItemId.toString()) })
+
+        val sculptUrls = assetMgr.resolveSculptMapUrls(sculptAssetId, itemId = sculptItemId)
+        assertEquals(
+            listOf(
+                "https://sim.agni.lindenlab.com:12043/cap/get_texture?texture_id=$sculptAssetId",
+                "https://asset-cdn.glb.agni.lindenlab.com/cap/viewer_asset?texture_id=$sculptAssetId"
+            ),
+            sculptUrls
+        )
+        assertTrue(sculptUrls.none { it.contains(sculptItemId.toString()) })
+
+        val particleUrls = assetMgr.resolveParticleTextureUrls(particleAssetId, itemId = particleItemId)
+        assertEquals(
+            listOf(
+                "https://sim.agni.lindenlab.com:12043/cap/get_texture?texture_id=$particleAssetId",
+                "https://asset-cdn.glb.agni.lindenlab.com/cap/viewer_asset?texture_id=$particleAssetId"
+            ),
+            particleUrls
+        )
+        assertTrue(particleUrls.none { it.contains(particleItemId.toString()) })
+
+        val animUrls = assetMgr.resolveAnimationUrls(animAssetId, itemId = animItemId)
+        assertEquals(
+            listOf("https://asset-cdn.glb.agni.lindenlab.com/cap/viewer_asset?animatn_id=$animAssetId"),
+            animUrls
+        )
+        assertTrue(animUrls.none { it.contains(animItemId.toString()) })
+
+        val matUrls = assetMgr.resolveGltfMaterialUrls(face0MatAssetId, itemId = materialItemId)
+        assertEquals(
+            listOf("https://asset-cdn.glb.agni.lindenlab.com/cap/viewer_asset?material_id=$face0MatAssetId"),
+            matUrls
+        )
+        assertTrue(matUrls.none { it.contains(materialItemId.toString()) })
+
+        // Reject any attempt to fetch using item_id in place of asset_id across all asset types
+        assertTrue(assetMgr.resolveMeshUrls(meshItemId, itemId = meshItemId).isEmpty())
+        assertTrue(assetMgr.resolveSculptMapUrls(sculptItemId, itemId = sculptItemId).isEmpty())
+        assertTrue(assetMgr.resolveParticleTextureUrls(particleItemId, itemId = particleItemId).isEmpty())
+        assertTrue(assetMgr.resolveAnimationUrls(animItemId, itemId = animItemId).isEmpty())
+        assertTrue(assetMgr.resolveGltfMaterialUrls(materialItemId, itemId = materialItemId).isEmpty())
+        assertFalse(assetMgr.requestInventoryItemAsset(itemId = animItemId, assetId = animItemId, assetTypeCode = SlAssetType.ANIMATION.code))
+        assertFalse(assetMgr.requestInventoryItemAsset(itemId = animItemId, assetId = null, assetTypeCode = SlAssetType.ANIMATION.code))
     }
 }

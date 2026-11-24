@@ -5,6 +5,7 @@ import android.graphics.BitmapFactory
 import android.util.LruCache
 import com.example.linkpoint.render.LindenAnimBinaryDecoder
 import com.example.linkpoint.render.LindenAnimData
+import com.example.linkpoint.render.PbrMaterialChannelTransforms
 import com.gemalto.jp2.JP2Decoder
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -29,10 +30,77 @@ data class AssetStreamStats(
     val texturesPending: Int = 0
 )
 
+/**
+ * Canonical Second Life `LLAssetType::EType` (`indra/llcommon/llassettype.h`) — kept strictly
+ * separate from [SlInventoryType] (`llinventorytype.h`).
+ */
+enum class SlAssetType(val code: Int) {
+    TEXTURE(0),
+    SOUND(1),
+    CALLINGCARD(2),
+    LANDMARK(3),
+    CLOTHING(5),
+    OBJECT(6),
+    NOTECARD(7),
+    CATEGORY(8),
+    LSL_TEXT(10),
+    LSL_BYTECODE(11),
+    TEXTURE_TGA(12),
+    BODYPART(13),
+    SOUND_WAV(17),
+    IMAGE_TGA(18),
+    IMAGE_JPEG(19),
+    ANIMATION(20),
+    GESTURE(21),
+    SIMSTATE(22),
+    LINK(24),
+    LINK_FOLDER(25),
+    WIDGET(40),
+    PERSON(45),
+    MESH(49),
+    SETTINGS(56),
+    MATERIAL(57);
+
+    companion object {
+        fun fromCode(code: Int): SlAssetType? = entries.firstOrNull { it.code == code }
+    }
+}
+
+/**
+ * Canonical Second Life `LLInventoryType::EType` (`indra/llcommon/llinventorytype.h`) — note that
+ * `ANIMATION = 19` (vs `SlAssetType.ANIMATION = 20`), `MESH = 22` (vs `SlAssetType.MESH = 49`),
+ * and `MATERIAL = 26` (vs `SlAssetType.MATERIAL = 57`).
+ */
+enum class SlInventoryType(val code: Int) {
+    TEXTURE(0),
+    SOUND(1),
+    CALLINGCARD(2),
+    LANDMARK(3),
+    OBJECT(6),
+    NOTECARD(7),
+    CATEGORY(8),
+    ROOT_CATEGORY(9),
+    LSL(10),
+    SNAPSHOT(15),
+    ATTACHMENT(17),
+    WEARABLE(18),
+    ANIMATION(19),
+    GESTURE(20),
+    MESH(22),
+    WIDGET(23),
+    SETTINGS(25),
+    MATERIAL(26);
+
+    companion object {
+        fun fromCode(code: Int): SlInventoryType? = entries.firstOrNull { it.code == code }
+    }
+}
+
 sealed class AssetStreamEvent {
     data class MeshReady(val meshId: UUID, val asset: DecodedMeshAsset) : AssetStreamEvent()
     data class TextureReady(val textureId: UUID, val bitmap: Bitmap) : AssetStreamEvent()
     data class AnimationReady(val animId: UUID, val animData: LindenAnimData) : AssetStreamEvent()
+    data class GltfMaterialReady(val materialId: UUID, val material: PbrMaterialChannelTransforms) : AssetStreamEvent()
     data class DisplayNamesResolved(val names: Map<UUID, String>) : AssetStreamEvent()
     data class StatsUpdated(val stats: AssetStreamStats) : AssetStreamEvent()
 }
@@ -64,6 +132,7 @@ class GridAssetManager(
     // Memory-bounded LRU caches sized for dense Second Life / OpenSim regions
     private val meshCache = LruCache<UUID, DecodedMeshAsset>(240)
     private val animCache = LruCache<UUID, LindenAnimData>(160)
+    private val gltfMaterialCache = LruCache<UUID, PbrMaterialChannelTransforms>(160)
     private val textureCache = object : LruCache<UUID, Bitmap>(32 * 1024) { // 32 MB KB budget
         override fun sizeOf(key: UUID, value: Bitmap): Int = (value.byteCount / 1024).coerceAtLeast(1)
     }
@@ -77,6 +146,9 @@ class GridAssetManager(
     private val inFlightAnims = ConcurrentHashMap.newKeySet<UUID>()
     private val failedAnims = ConcurrentHashMap.newKeySet<UUID>()
     private val pendingPreCapAnims = ConcurrentHashMap.newKeySet<UUID>()
+    private val inFlightMaterials = ConcurrentHashMap.newKeySet<UUID>()
+    private val failedMaterials = ConcurrentHashMap.newKeySet<UUID>()
+    private val pendingPreCapMaterials = ConcurrentHashMap.newKeySet<UUID>()
     private val pendingPreCapMeshes = ConcurrentHashMap<UUID, Boolean>()
     private val pendingPreCapTextures = ConcurrentHashMap<UUID, Boolean>()
     private val pendingPreCapNames = ConcurrentHashMap.newKeySet<UUID>()
@@ -91,6 +163,7 @@ class GridAssetManager(
     @Volatile private var getMesh2Cap: String? = null
     @Volatile private var getMeshCap: String? = null
     @Volatile private var getTextureCap: String? = null
+    @Volatile private var renderMaterialsCap: String? = null
     @Volatile private var getDisplayNamesCap: String? = null
 
     private data class DownloadOutcome(
@@ -103,6 +176,7 @@ class GridAssetManager(
         getMesh2Cap = caps["GetMesh2"]
         getMeshCap = caps["GetMesh"]
         getTextureCap = caps["GetTexture"]
+        renderMaterialsCap = caps["RenderMaterials"]
         getDisplayNamesCap = caps["GetDisplayNames"]
 
         // Flush any meshes/textures/display names queued before CAPS became available
@@ -126,11 +200,18 @@ class GridAssetManager(
             pendingPreCapAnims.clear()
             queuedAnims.forEach { requestAnimation(it) }
         }
+        if ((viewerAssetCap != null || renderMaterialsCap != null) && pendingPreCapMaterials.isNotEmpty()) {
+            val queuedMats = pendingPreCapMaterials.toList()
+            pendingPreCapMaterials.clear()
+            queuedMats.forEach { requestGltfMaterial(it) }
+        }
     }
 
     fun getCachedMesh(meshId: UUID): DecodedMeshAsset? = synchronized(meshCache) { meshCache.get(meshId) }
     fun getCachedTexture(textureId: UUID): Bitmap? = synchronized(textureCache) { textureCache.get(textureId) }
     fun getCachedAnimation(animId: UUID): LindenAnimData? = synchronized(animCache) { animCache.get(animId) }
+    fun getCachedGltfMaterial(materialId: UUID): PbrMaterialChannelTransforms? =
+        synchronized(gltfMaterialCache) { gltfMaterialCache.get(materialId) }
     fun putCachedAnimation(animId: UUID, animData: LindenAnimData) {
         synchronized(animCache) { animCache.put(animId, animData) }
         _events.tryEmit(AssetStreamEvent.AnimationReady(animId, animData))
@@ -141,15 +222,29 @@ class GridAssetManager(
     fun snapshotMeshes(): Map<UUID, DecodedMeshAsset> = synchronized(meshCache) { meshCache.snapshot() }
     fun snapshotTextures(): Map<UUID, Bitmap> = synchronized(textureCache) { textureCache.snapshot() }
 
-    fun requestMesh(meshId: UUID, highPriority: Boolean = false) {
-        if (meshId == ZERO_UUID) return
-        if (getCachedMesh(meshId) != null || failedMeshes.contains(meshId)) return
-        val meshUrls = buildMeshUrls(meshId)
+    /**
+     * Guards capability asset fetches so inventory `item_id` is NEVER conflated with `asset_id`.
+     */
+    internal fun validateDistinctAssetId(assetId: UUID?, itemId: UUID?, assetKind: String): UUID? {
+        if (assetId == null || assetId == ZERO_UUID) return null
+        if (itemId != null && assetId == itemId) {
+            ProtocolAuditLogger.logWarn(
+                "[ASSET GUARD] Rejected $assetKind fetch where asset_id ($assetId) == item_id ($itemId); asset_id must remain distinct from item_id"
+            )
+            return null
+        }
+        return assetId
+    }
+
+    fun requestMesh(meshId: UUID, highPriority: Boolean = false, itemId: UUID? = null) {
+        val validMeshId = validateDistinctAssetId(meshId, itemId, "llmesh") ?: return
+        if (getCachedMesh(validMeshId) != null || failedMeshes.contains(validMeshId)) return
+        val meshUrls = resolveMeshUrls(validMeshId, itemId)
         if (meshUrls.isEmpty()) {
-            pendingPreCapMeshes.merge(meshId, highPriority) { a, b -> a || b }
+            pendingPreCapMeshes.merge(validMeshId, highPriority) { a, b -> a || b }
             return
         }
-        if (!inFlightMeshes.add(meshId)) return
+        if (!inFlightMeshes.add(validMeshId)) return
 
         emitStats(force = false)
         val sem = if (highPriority) avatarMeshSemaphore else meshSemaphore
@@ -197,15 +292,16 @@ class GridAssetManager(
         }
     }
 
-    fun requestTexture(textureId: UUID, highPriority: Boolean = false) {
-        if (!SlBinaryParsers.isUsefulTexture(textureId)) return
-        if (getCachedTexture(textureId) != null || failedTextures.contains(textureId)) return
-        val texUrls = buildTextureUrls(textureId)
+    fun requestTexture(textureId: UUID, highPriority: Boolean = false, itemId: UUID? = null) {
+        val validTexId = validateDistinctAssetId(textureId, itemId, "texture") ?: return
+        if (!SlBinaryParsers.isUsefulTexture(validTexId)) return
+        if (getCachedTexture(validTexId) != null || failedTextures.contains(validTexId)) return
+        val texUrls = resolveTextureUrls(validTexId, itemId)
         if (texUrls.isEmpty()) {
-            pendingPreCapTextures.merge(textureId, highPriority) { a, b -> a || b }
+            pendingPreCapTextures.merge(validTexId, highPriority) { a, b -> a || b }
             return
         }
-        if (!inFlightTextures.add(textureId)) return
+        if (!inFlightTextures.add(validTexId)) return
 
         emitStats(force = false)
         val sem = if (highPriority) avatarTextureSemaphore else textureSemaphore
@@ -253,40 +349,59 @@ class GridAssetManager(
         }
     }
 
+    /**
+     * Fetches a Second Life sculpted prim RGB heightmap (`ExtraParams 0x30`) by its `asset_id`,
+     * keeping `sculptAssetId` strictly distinct from any inventory `item_id`.
+     */
+    fun requestSculptMap(sculptAssetId: UUID, highPriority: Boolean = false, itemId: UUID? = null) {
+        val validAssetId = validateDistinctAssetId(sculptAssetId, itemId, "sculpt_map") ?: return
+        requestTexture(validAssetId, highPriority = highPriority, itemId = itemId)
+    }
+
+    /**
+     * Fetches an `llParticleSystem` (`PartData`) sprite texture by its `asset_id`,
+     * keeping `particleTextureAssetId` strictly distinct from any inventory `item_id`.
+     */
+    fun requestParticleTexture(particleTextureAssetId: UUID, itemId: UUID? = null) {
+        val validAssetId = validateDistinctAssetId(particleTextureAssetId, itemId, "particle_texture") ?: return
+        requestTexture(validAssetId, highPriority = false, itemId = itemId)
+    }
+
     fun retryFailedAsset(assetId: UUID) {
         failedMeshes.remove(assetId)
         transientMeshFailures.remove(assetId)
         failedTextures.remove(assetId)
         transientTextureFailures.remove(assetId)
         failedAnims.remove(assetId)
+        failedMaterials.remove(assetId)
     }
 
     /**
-     * Streams a custom Second Life `.anim` asset from `ViewerAsset` (`?animatn_id=<uuid>`)
-     * and decodes its quantized joint keyframes via [LindenAnimBinaryDecoder].
+     * Streams a custom Second Life `.anim` asset from `ViewerAsset` (`?animatn_id=<asset_id>`)
+     * keeping `animId` (`asset_id`) distinct from any inventory `item_id`, and decodes its
+     * quantized joint keyframes via [LindenAnimBinaryDecoder].
      */
-    fun requestAnimation(animId: UUID) {
-        if (animId == ZERO_UUID) return
-        if (getCachedAnimation(animId) != null || failedAnims.contains(animId)) return
-        val capBase = viewerAssetCap
-        if (capBase == null) {
-            pendingPreCapAnims.add(animId)
+    fun requestAnimation(animId: UUID, itemId: UUID? = null) {
+        val validAnimId = validateDistinctAssetId(animId, itemId, "anim") ?: return
+        if (getCachedAnimation(validAnimId) != null || failedAnims.contains(validAnimId)) return
+        val urls = resolveAnimationUrls(validAnimId, itemId)
+        if (urls.isEmpty()) {
+            pendingPreCapAnims.add(validAnimId)
             return
         }
-        if (!inFlightAnims.add(animId)) return
+        if (!inFlightAnims.add(validAnimId)) return
 
-        val sep = if (capBase.contains("?")) "&" else "?"
-        val url = "$capBase${sep}animatn_id=$animId"
+        val url = urls.first()
         scope.launch {
             try {
                 avatarMeshSemaphore.withPermit {
                     val outcome = downloadBytesWithStatus(url)
                     val parsed = outcome.bytes?.let { LindenAnimBinaryDecoder.decode(it) }
                     if (parsed != null) {
-                        synchronized(animCache) { animCache.put(animId, parsed) }
-                        _events.tryEmit(AssetStreamEvent.AnimationReady(animId, parsed))
+                        synchronized(animCache) { animCache.put(validAnimId, parsed) }
+                        _events.tryEmit(AssetStreamEvent.AnimationReady(validAnimId, parsed))
                     } else if (outcome.permanentFailure) {
-                        failedAnims.add(animId)
+                        failedAnims.add(validAnimId)
                     }
                 }
             } catch (e: CancellationException) {
@@ -294,8 +409,91 @@ class GridAssetManager(
             } catch (_: Exception) {
                 // Non-fatal
             } finally {
-                inFlightAnims.remove(animId)
+                inFlightAnims.remove(validAnimId)
             }
+        }
+    }
+
+    /**
+     * Streams a Second Life glTF 2.0 PBR material asset (`LLGLTFMaterial` / `AssetType.MATERIAL = 57`)
+     * via `ViewerAsset` (`?material_id=<asset_id>`) keeping `materialAssetId` distinct from `itemId`.
+     */
+    fun requestGltfMaterial(materialAssetId: UUID, itemId: UUID? = null) {
+        val validMatId = validateDistinctAssetId(materialAssetId, itemId, "gltf_material") ?: return
+        if (getCachedGltfMaterial(validMatId) != null || failedMaterials.contains(validMatId)) return
+        val urls = resolveGltfMaterialUrls(validMatId, itemId)
+        if (urls.isEmpty()) {
+            pendingPreCapMaterials.add(validMatId)
+            return
+        }
+        if (!inFlightMaterials.add(validMatId)) return
+
+        scope.launch {
+            try {
+                meshSemaphore.withPermit {
+                    var parsed: PbrMaterialChannelTransforms? = null
+                    var allPermanent = true
+                    for (url in urls) {
+                        val outcome = downloadBytesWithStatus(url)
+                        val bodyBytes = outcome.bytes
+                        if (bodyBytes != null && bodyBytes.isNotEmpty()) {
+                            val text = String(bodyBytes, Charsets.UTF_8).trim()
+                            val jsonStr = if (text.startsWith("{")) {
+                                text
+                            } else {
+                                // Handle LLSD-wrapped glTF JSON override payloads if returned by RenderMaterials
+                                val llsd = LlsdCodec.parseXml(text)
+                                llsd["data"].asString().ifBlank { text }
+                            }
+                            if (jsonStr.startsWith("{")) {
+                                parsed = PbrMaterialChannelTransforms.fromGltfJson(jsonStr)
+                                break
+                            }
+                        } else if (!outcome.permanentFailure) {
+                            allPermanent = false
+                        }
+                    }
+                    if (parsed != null) {
+                        synchronized(gltfMaterialCache) { gltfMaterialCache.put(validMatId, parsed) }
+                        _events.tryEmit(AssetStreamEvent.GltfMaterialReady(validMatId, parsed))
+                    } else if (allPermanent) {
+                        failedMaterials.add(validMatId)
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                // Non-fatal
+            } finally {
+                inFlightMaterials.remove(validMatId)
+            }
+        }
+    }
+
+    /**
+     * Dispatches an inventory item's underlying asset fetch ONLY if a distinct `assetId` is present
+     * (never substituting `itemId` when `assetId` is missing or conflated).
+     */
+    fun requestInventoryItemAsset(itemId: UUID, assetId: UUID?, assetTypeCode: Int): Boolean {
+        val distinctAsset = validateDistinctAssetId(assetId, itemId, "inventory_item") ?: return false
+        when (SlAssetType.fromCode(assetTypeCode)) {
+            SlAssetType.TEXTURE, SlAssetType.IMAGE_JPEG, SlAssetType.IMAGE_TGA, SlAssetType.TEXTURE_TGA -> {
+                requestTexture(distinctAsset, highPriority = false, itemId = itemId)
+                return true
+            }
+            SlAssetType.MESH -> {
+                requestMesh(distinctAsset, highPriority = true, itemId = itemId)
+                return true
+            }
+            SlAssetType.ANIMATION -> {
+                requestAnimation(distinctAsset, itemId = itemId)
+                return true
+            }
+            SlAssetType.MATERIAL -> {
+                requestGltfMaterial(distinctAsset, itemId = itemId)
+                return true
+            }
+            else -> return false
         }
     }
 
@@ -349,22 +547,49 @@ class GridAssetManager(
         }
     }
 
-    private fun buildMeshUrls(meshId: UUID): List<String> {
-        val bases = listOfNotNull(viewerAssetCap, getMesh2Cap, getMeshCap).distinct()
+    internal fun resolveMeshUrls(assetId: UUID, itemId: UUID? = null): List<String> {
+        val validId = validateDistinctAssetId(assetId, itemId, "llmesh") ?: return emptyList()
+        // Prioritize GetMesh2 -> GetMesh -> ViewerAsset per secondlife_assets_mesh_texture
+        val bases = listOfNotNull(getMesh2Cap, getMeshCap, viewerAssetCap).distinct()
         if (bases.isEmpty()) return emptyList()
         return bases.map { base ->
             val sep = if (base.contains("?")) "&" else "?"
-            "$base${sep}mesh_id=$meshId"
+            "$base${sep}mesh_id=$validId"
         }
     }
 
-    private fun buildTextureUrls(textureId: UUID): List<String> {
-        val bases = listOfNotNull(viewerAssetCap, getTextureCap).distinct()
+    internal fun resolveTextureUrls(assetId: UUID, itemId: UUID? = null): List<String> {
+        val validId = validateDistinctAssetId(assetId, itemId, "texture") ?: return emptyList()
+        val bases = listOfNotNull(getTextureCap, viewerAssetCap).distinct()
         if (bases.isEmpty()) return emptyList()
         return bases.map { base ->
             val sep = if (base.contains("?")) "&" else "?"
-            "$base${sep}texture_id=$textureId"
+            "$base${sep}texture_id=$validId"
         }
+    }
+
+    internal fun resolveSculptMapUrls(sculptAssetId: UUID, itemId: UUID? = null): List<String> {
+        val validId = validateDistinctAssetId(sculptAssetId, itemId, "sculpt_map") ?: return emptyList()
+        return resolveTextureUrls(validId, itemId)
+    }
+
+    internal fun resolveParticleTextureUrls(particleTextureAssetId: UUID, itemId: UUID? = null): List<String> {
+        val validId = validateDistinctAssetId(particleTextureAssetId, itemId, "particle_texture") ?: return emptyList()
+        return resolveTextureUrls(validId, itemId)
+    }
+
+    internal fun resolveAnimationUrls(animAssetId: UUID, itemId: UUID? = null): List<String> {
+        val validId = validateDistinctAssetId(animAssetId, itemId, "anim") ?: return emptyList()
+        val capBase = viewerAssetCap ?: return emptyList()
+        val sep = if (capBase.contains("?")) "&" else "?"
+        return listOf("$capBase${sep}animatn_id=$validId")
+    }
+
+    internal fun resolveGltfMaterialUrls(materialAssetId: UUID, itemId: UUID? = null): List<String> {
+        val validId = validateDistinctAssetId(materialAssetId, itemId, "gltf_material") ?: return emptyList()
+        val capBase = viewerAssetCap ?: return emptyList()
+        val sep = if (capBase.contains("?")) "&" else "?"
+        return listOf("$capBase${sep}material_id=$validId")
     }
 
     private fun downloadBytesWithStatus(url: String): DownloadOutcome {
@@ -454,6 +679,7 @@ class GridAssetManager(
         getMesh2Cap = null
         getMeshCap = null
         getTextureCap = null
+        renderMaterialsCap = null
         getDisplayNamesCap = null
         inFlightMeshes.clear()
         failedMeshes.clear()
@@ -463,9 +689,12 @@ class GridAssetManager(
         transientTextureFailures.clear()
         inFlightAnims.clear()
         failedAnims.clear()
+        inFlightMaterials.clear()
+        failedMaterials.clear()
         pendingPreCapMeshes.clear()
         pendingPreCapTextures.clear()
         pendingPreCapAnims.clear()
+        pendingPreCapMaterials.clear()
         pendingPreCapNames.clear()
         requestedNames.clear()
         resolvedNames.clear()
@@ -473,6 +702,7 @@ class GridAssetManager(
         texturesLoadedCount.set(0)
         synchronized(meshCache) { meshCache.evictAll() }
         synchronized(animCache) { animCache.evictAll() }
+        synchronized(gltfMaterialCache) { gltfMaterialCache.evictAll() }
         synchronized(textureCache) { textureCache.evictAll() }
         emitStats(force = true)
     }

@@ -215,5 +215,97 @@
         "duration": 0.93333334
       }
     }
+  ],
+  "object_update_cached_vectors": [
+    {
+      "name": "high_14_unencoded_hit_full_miss_and_crc_miss",
+      "framed_packet_hex": "000000002a000e00e8030000e80300ffff03e90300007856341205000000ca000000f0debc7a00000000ea0300003333222220000000",
+      "agent_id": "a1a20000-0000-4c1c-8000-00000000e5e6",
+      "session_id": "f1f2f3f4-a5a6-4b5b-9c5c-d5d6d7d8d9da",
+      "prepopulated_cache": [
+        {
+          "local_id": 1001,
+          "uuid": "10010000-1111-4222-8333-444444444444",
+          "crc": 305419896,
+          "update_flags": 0
+        },
+        {
+          "local_id": 1002,
+          "uuid": "10020000-1111-4222-8333-444444444444",
+          "crc": 286335522,
+          "update_flags": 0
+        }
+      ],
+      "expected": {
+        "flags": 0,
+        "sequence_number": 42,
+        "message_id": 14,
+        "region_handle": 1099511628032000,
+        "time_dilation": 65535,
+        "entries": [
+          {
+            "local_id": 1001,
+            "crc": 305419896,
+            "update_flags": 5
+          },
+          {
+            "local_id": 202,
+            "crc": 2059198192,
+            "update_flags": 0
+          },
+          {
+            "local_id": 1002,
+            "crc": 572666675,
+            "update_flags": 32
+          }
+        ],
+        "hit_local_ids": [
+          1001
+        ],
+        "refreshed_hit_is_physical": true,
+        "refreshed_hit_is_scripted": true,
+        "misses": [
+          {
+            "local_id": 202,
+            "cache_miss_type": 0
+          },
+          {
+            "local_id": 1002,
+            "cache_miss_type": 1
+          }
+        ],
+        "request_multiple_objects_message_id": 65283,
+        "request_multiple_objects_flags": 192
+      }
+    }
+  ],
+  "gltf_orm_and_asset_identity_vectors": [
+    {
+      "name": "sl_gltf_orm_rgb_and_distinct_asset_vs_item_ids",
+      "gltf_json": "{\"images\": [{\"uri\": \"22222222-1111-4333-8444-666666666601\"}, {\"uri\": \"22222222-1111-4333-8444-666666666602\"}, {\"uri\": \"22222222-1111-4333-8444-666666666603\"}, {\"uri\": \"22222222-1111-4333-8444-666666666604\"}], \"textures\": [{\"source\": 0}, {\"source\": 1}, {\"source\": 2}, {\"source\": 3}], \"materials\": [{\"name\": \"SLPackedOrmMaskDoubleSided\", \"alphaMode\": \"MASK\", \"alphaCutoff\": 0.42, \"doubleSided\": true, \"pbrMetallicRoughness\": {\"metallicFactor\": 0.8, \"roughnessFactor\": 0.75, \"baseColorTexture\": {\"index\": 0, \"extensions\": {\"KHR_texture_transform\": {\"offset\": [0.125, 0.25], \"scale\": [2.0, 2.0], \"rotation\": 0.0}}}, \"metallicRoughnessTexture\": {\"index\": 2, \"extensions\": {\"KHR_texture_transform\": {\"offset\": [-0.25, 0.5], \"scale\": [3.0, 1.5], \"rotation\": 0.5235988}}}}, \"occlusionTexture\": {\"index\": 2, \"strength\": 0.6, \"extensions\": {\"KHR_texture_transform\": {\"offset\": [0.05, -0.05], \"scale\": [1.25, 1.25], \"rotation\": 0.0}}}, \"normalTexture\": {\"index\": 1}, \"emissiveTexture\": {\"index\": 3}}]}",
+      "orm_pixel_argb_hex": "ff4080c0",
+      "expected_orm": {
+        "occlusion": 0.55058825,
+        "roughness": 0.3764706,
+        "metalness": 0.6023529,
+        "alpha_mode": "MASK",
+        "alpha_cutoff": 0.42,
+        "double_sided": true
+      },
+      "inventory_and_caps_assets": {
+        "folder_id": "30000000-0000-4000-8000-000000000000",
+        "object_id": "30000000-0000-4000-8000-000000000099",
+        "mesh_item_id": "31000000-0000-4000-8000-000000000001",
+        "mesh_asset_id": "41000000-0000-4000-8000-000000000001",
+        "sculpt_item_id": "32000000-0000-4000-8000-000000000002",
+        "sculpt_asset_id": "42000000-0000-4000-8000-000000000002",
+        "particle_item_id": "33000000-0000-4000-8000-000000000003",
+        "particle_asset_id": "43000000-0000-4000-8000-000000000003",
+        "anim_item_id": "34000000-0000-4000-8000-000000000004",
+        "anim_asset_id": "44000000-0000-4000-8000-000000000004",
+        "material_item_id": "35000000-0000-4000-8000-000000000005",
+        "material_asset_id": "45000000-0000-4000-8000-000000000005"
+      }
+    }
   ]
 }

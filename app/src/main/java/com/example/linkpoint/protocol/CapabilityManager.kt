@@ -23,6 +23,7 @@ import java.util.concurrent.TimeUnit
 
 data class CapsAttachmentTransform(
     val objectId: UUID? = null,
+    val itemId: UUID? = null,
     val localId: Int = 0,
     val agentId: UUID? = null,
     val parentId: Int = 0,
@@ -31,7 +32,10 @@ data class CapsAttachmentTransform(
     val rotationOffset: com.example.linkpoint.scene.Quat? = null,
     val scale: com.example.linkpoint.scene.Vec3? = null,
     val name: String? = null,
-    val meshAssetId: UUID? = null
+    val meshAssetId: UUID? = null,
+    val sculptTextureId: UUID? = null,
+    val particleTextureId: UUID? = null,
+    val animAssetId: UUID? = null
 )
 
 sealed class CapsEvent {
@@ -67,7 +71,9 @@ data class FetchedInventoryItem(
     val parentId: UUID,
     val name: String,
     val assetType: Int,
-    val description: String
+    val description: String,
+    val assetId: UUID? = null,
+    val inventoryType: Int = -1
 )
 
 /**
@@ -102,12 +108,14 @@ class CapabilityManager(
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
         private val REQUESTED_CAPS = listOf(
             "EventQueueGet",
+            "SimulatorFeatures",
             "FetchInventoryDescendents2",
             "FetchInventory2",
             "ViewerAsset",
             "GetTexture",
             "GetMesh2",
             "GetMesh",
+            "RenderMaterials",
             "GetDisplayNames",
             "AvatarRenderInfo",
             "AgentProfile",
@@ -143,9 +151,14 @@ class CapabilityManager(
             }
 
             val results = mutableListOf<CapsAttachmentTransform>()
+            val zeroUuid = UUID(0L, 0L)
             for (entry in entries) {
                 if (entry !is LlsdValue.MapVal) continue
-                val objId = firstUuid(entry, "object_id", "id", "item_id", "FullID", "ObjectID", "uuid")
+                // Keep in-world objectId, inventory itemId, and underlying asset UUIDs strictly separate
+                val objId = firstUuid(entry, "object_id", "id", "FullID", "ObjectID", "uuid")
+                    ?.takeIf { it != zeroUuid }
+                val itemId = firstUuid(entry, "item_id", "ItemID", "attach_item_id")
+                    ?.takeIf { it != zeroUuid }
                 val localId = firstInt(entry, "local_id", "LocalID")
                 val agentId = firstUuid(entry, "agent_id", "avatar_id", "AgentID", "AvatarID") ?: topAgentId
                 val parentId = firstInt(entry, "parent_id", "ParentID")
@@ -155,13 +168,21 @@ class CapabilityManager(
                 val scale = firstVec3(entry, "scale", "Scale")
                 val name = firstString(entry, "name", "Name", "object_name")
                 val meshId = firstUuid(entry, "mesh_id", "mesh_asset_id", "MeshID")
+                    ?.takeIf { it != zeroUuid && it != itemId }
+                val sculptTexId = firstUuid(entry, "sculpt_texture_id", "sculpt_id", "SculptTextureID")
+                    ?.takeIf { it != zeroUuid && it != itemId }
+                val partTexId = firstUuid(entry, "particle_texture_id", "ParticleTextureID")
+                    ?.takeIf { it != zeroUuid && it != itemId }
+                val animId = firstUuid(entry, "anim_id", "animation_id", "AnimID")
+                    ?.takeIf { it != zeroUuid && it != itemId }
 
                 // Only emit records that identify an attachment or carry a valid attachment point
                 val hasAttachmentIdentity = attachPoint in 1..56 || (agentId != null && (posOffset != null || rotOffset != null))
-                if (hasAttachmentIdentity && (objId != null || localId != 0)) {
+                if (hasAttachmentIdentity && (objId != null || itemId != null || localId != 0)) {
                     results.add(
                         CapsAttachmentTransform(
                             objectId = objId,
+                            itemId = itemId,
                             localId = localId,
                             agentId = agentId,
                             parentId = parentId,
@@ -170,12 +191,48 @@ class CapabilityManager(
                             rotationOffset = rotOffset,
                             scale = scale,
                             name = name,
-                            meshAssetId = meshId
+                            meshAssetId = meshId,
+                            sculptTextureId = sculptTexId,
+                            particleTextureId = partTexId,
+                            animAssetId = animId
                         )
                     )
                 }
             }
             return results
+        }
+
+        /**
+         * Parses `FetchInventoryDescendents2` LLSD XML keeping `item_id`, `parent_id` (`folder_id`),
+         * and `asset_id` as distinct UUIDs alongside separate `type` (`AssetType`) and `inv_type` (`InventoryType`).
+         */
+        internal fun parseFetchInventoryDescendentsResponse(
+            xmlBody: String,
+            fallbackFolderId: UUID
+        ): List<FetchedInventoryItem> {
+            val zeroUuid = UUID(0L, 0L)
+            val items = mutableListOf<FetchedInventoryItem>()
+            val parsed = LlsdCodec.parseXml(xmlBody)
+            parsed["folders"].asList().forEach { folder ->
+                val resolvedFolderId = folder["folder_id"].asUuidOrNull()?.takeIf { it != zeroUuid } ?: fallbackFolderId
+                folder["items"].asList().forEach { item ->
+                    val itemId = item["item_id"].asUuidOrNull()?.takeIf { it != zeroUuid } ?: return@forEach
+                    val parentId = item["parent_id"].asUuidOrNull()?.takeIf { it != zeroUuid } ?: resolvedFolderId
+                    val assetId = item["asset_id"].asUuidOrNull()?.takeIf { it != zeroUuid && it != itemId }
+                    items.add(
+                        FetchedInventoryItem(
+                            itemId = itemId,
+                            parentId = parentId,
+                            name = item["name"].asString("Unnamed Item"),
+                            assetType = item["type"].asInt(0),
+                            description = item["desc"].asString(),
+                            assetId = assetId,
+                            inventoryType = item["inv_type"].asInt(-1)
+                        )
+                    )
+                }
+            }
+            return items
         }
 
         private fun extractAttachmentPoint(entry: LlsdValue, parentId: Int): Int {
@@ -662,23 +719,10 @@ class CapabilityManager(
                 try {
                     httpClient.newCall(req).execute().use { resp ->
                         if (resp.isSuccessful) {
-                            val items = mutableListOf<FetchedInventoryItem>()
-                            val parsed = LlsdCodec.parseXml(resp.body?.string().orEmpty())
-                            parsed["folders"].asList().forEach { folder ->
-                                folder["items"].asList().forEach { item ->
-                                    val id = (item["item_id"] as? LlsdValue.Uuid)?.value ?: return@forEach
-                                    items.add(
-                                        FetchedInventoryItem(
-                                            itemId = id,
-                                            parentId = folderId,
-                                            name = item["name"].asString("Unnamed Item"),
-                                            assetType = item["type"].asInt(0),
-                                            description = item["desc"].asString()
-                                        )
-                                    )
-                                }
-                            }
-                            return@withContext items
+                            return@withContext parseFetchInventoryDescendentsResponse(
+                                xmlBody = resp.body?.string().orEmpty(),
+                                fallbackFolderId = folderId
+                            )
                         }
                         lastError = NetworkResilience.classifyHttpStatus(
                             ProtocolLayer.CAPS_SEED,

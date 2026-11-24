@@ -102,6 +102,11 @@ sealed class SimEvent {
     ) : SimEvent()
     data class UuidNamesResolved(val names: Map<UUID, String>) : SimEvent()
     data class ObjectKilled(val localId: Int) : SimEvent()
+    data class ObjectCacheMissRequested(
+        val regionHandle: Long,
+        val misses: List<LludpPackets.ObjectCacheMissRequest>,
+        val framedPackets: List<ByteArray>
+    ) : SimEvent()
     data class ObjectPropertiesReceived(
         val objectId: UUID,
         val creatorId: UUID,
@@ -161,6 +166,7 @@ class LludpCircuitEngine {
 
     private val pendingAcks = ConcurrentLinkedQueue<Int>()
     private val unackedReliable = ConcurrentHashMap<Int, Pair<Long, ByteArray>>()
+    val objectCache = RegionObjectCache()
     private var circuitJob: Job? = null
     private var heartbeatJob: Job? = null
     private var lastPingSentMs: Long = 0L
@@ -176,6 +182,7 @@ class LludpCircuitEngine {
         private const val MAX_CIRCUIT_RETRIES = 3
         private const val HANDSHAKE_WATCHDOG_MS = 3500L
         private const val IDLE_DEGRADED_THRESHOLD_MS = 18000L
+        private const val MAX_OBJECTS_PER_CACHE_MISS_PACKET = 64
     }
 
     fun connect(session: LoginSessionResponse) {
@@ -439,6 +446,24 @@ class LludpCircuitEngine {
         }
     }
 
+    internal fun configureIdentityForTest(testAgentId: UUID, testSessionId: UUID, testCircuitCode: Int = 1) {
+        agentId = testAgentId
+        sessionId = testSessionId
+        circuitCode = testCircuitCode
+    }
+
+    internal fun processRawDatagramForTest(raw: ByteArray, length: Int = raw.size): LludpPackets.DecodedPacket? {
+        val decoded = LludpPackets.decodePacket(raw, length) ?: return null
+        if ((decoded.flags and LludpPackets.FLAG_RELIABLE) != 0) {
+            pendingAcks.add(decoded.sequenceNumber)
+        }
+        for (ack in decoded.acks) {
+            unackedReliable.remove(ack)
+        }
+        handleDecodedPacket(decoded)
+        return decoded
+    }
+
     private fun handleDecodedPacket(pkt: LludpPackets.DecodedPacket) {
         val buf = pkt.payload
         when (pkt.messageId) {
@@ -559,6 +584,7 @@ class LludpCircuitEngine {
             }
             LludpPackets.MSG_OBJECT_UPDATE -> parseObjectUpdate(buf)
             LludpPackets.MSG_OBJECT_UPDATE_COMPRESSED -> parseObjectUpdateCompressed(buf)
+            LludpPackets.MSG_OBJECT_UPDATE_CACHED -> parseObjectUpdateCached(buf)
             LludpPackets.MSG_IMPROVED_TERSE_OBJECT_UPDATE -> parseImprovedTerseObjectUpdate(buf)
             LludpPackets.MSG_AVATAR_ANIMATION,
             LludpPackets.MSG_OBJECT_ANIMATION -> {
@@ -581,7 +607,9 @@ class LludpCircuitEngine {
                     val count = buf.get().toInt() and 0xFF
                     repeat(count) {
                         if (buf.remaining() >= 4) {
-                            _events.tryEmit(SimEvent.ObjectKilled(buf.int))
+                            val killedId = buf.int
+                            objectCache.remove(killedId)
+                            _events.tryEmit(SimEvent.ObjectKilled(killedId))
                         }
                     }
                 }
@@ -667,7 +695,7 @@ class LludpCircuitEngine {
 
     private fun parseObjectUpdate(buf: ByteBuffer) {
         if (buf.remaining() < 11) return
-        buf.long // RegionHandle
+        val regionHandle = buf.long
         buf.short // TimeDilation
         val count = buf.get().toInt() and 0xFF
         repeat(count) {
@@ -675,7 +703,7 @@ class LludpCircuitEngine {
             val localId = buf.int
             val state = buf.get().toInt() and 0xFF
             val fullId = LludpPackets.readUuid(buf)
-            buf.int // CRC
+            val crc = buf.int
             val pCode = buf.get().toInt() and 0xFF
             buf.get() // Material
             buf.get() // ClickAction
@@ -812,50 +840,55 @@ class LludpCircuitEngine {
                 )
             } else {
                 val attachmentPoint = SlBinaryParsers.decodeAttachmentPoint(state, parentId)
+                val attachItemId = nameValues["AttachItemID"]?.trim()?.let { raw ->
+                    runCatching { UUID.fromString(raw) }.getOrNull()?.takeIf { it != UUID(0L, 0L) }
+                }
                 val shape = primShapeFromCurves(pCode, pathCurve, profileCurve)
                 val label = hoverText.takeIf { it.isNotBlank() }
                     ?: if (attachmentPoint in 31..38) "HUD Attachment #$localId"
                     else if (attachmentPoint in 1..56) "Attachment #$localId"
                     else if (extraParams.isMesh) "Mesh #$localId"
                     else "Object #$localId"
-                _events.tryEmit(
-                    SimEvent.ObjectUpdated(
-                        SceneObject(
-                            localId = localId,
-                            uuid = fullId,
-                            parentId = parentId,
-                            ownerId = ownerId,
-                            name = label,
-                            description = if (extraParams.isMesh) "Streamed SL Mesh" else "Streamed LLUDP Object (PCode=$pCode)",
-                            pCode = pCode,
-                            shape = shape,
-                            position = pos,
-                            rotation = rot,
-                            scale = Vec3(sx, sy, sz),
-                            color = texEntry.defaultColor,
-                            meshAssetId = extraParams.meshAssetId,
-                            isMesh = extraParams.isMesh,
-                            defaultTextureId = texEntry.defaultTextureId,
-                            faceTextures = texEntry.faceTextures,
-                            faceColors = texEntry.faceColors,
-                            isScripted = (updateFlags and 0x00000004) != 0,
-                            isPhysical = (updateFlags and 0x00000001) != 0,
-                            isPhantom = (updateFlags and 0x00000020) != 0,
-                            attachmentPoint = attachmentPoint,
-                            partData = decodedBlocks.partData,
-                            flexibleParams = extraParams.flexibleParams,
-                            lightParams = extraParams.lightParams,
-                            sculptParams = extraParams.sculptParams
-                        )
-                    )
+                val sceneObject = SceneObject(
+                    localId = localId,
+                    uuid = fullId,
+                    parentId = parentId,
+                    ownerId = ownerId,
+                    name = label,
+                    description = if (extraParams.isMesh) "Streamed SL Mesh" else "Streamed LLUDP Object (PCode=$pCode)",
+                    pCode = pCode,
+                    shape = shape,
+                    position = pos,
+                    rotation = rot,
+                    scale = Vec3(sx, sy, sz),
+                    color = texEntry.defaultColor,
+                    meshAssetId = extraParams.meshAssetId,
+                    isMesh = extraParams.isMesh,
+                    defaultTextureId = texEntry.defaultTextureId,
+                    faceTextures = texEntry.faceTextures,
+                    faceColors = texEntry.faceColors,
+                    isScripted = (updateFlags and 0x00000004) != 0,
+                    isPhysical = (updateFlags and 0x00000001) != 0,
+                    isPhantom = (updateFlags and 0x00000020) != 0,
+                    attachmentPoint = attachmentPoint,
+                    crc = crc,
+                    updateFlags = updateFlags,
+                    itemId = attachItemId,
+                    renderMaterialIds = extraParams.renderMaterialIds,
+                    partData = decodedBlocks.partData,
+                    flexibleParams = extraParams.flexibleParams,
+                    lightParams = extraParams.lightParams,
+                    sculptParams = extraParams.sculptParams
                 )
+                objectCache.put(regionHandle, sceneObject)
+                _events.tryEmit(SimEvent.ObjectUpdated(sceneObject))
             }
         }
     }
 
     private fun parseObjectUpdateCompressed(buf: ByteBuffer) {
         if (buf.remaining() < 11) return
-        buf.long // RegionHandle
+        val regionHandle = buf.long
         buf.short // TimeDilation
         val count = buf.get().toInt() and 0xFF
         repeat(count) {
@@ -870,7 +903,7 @@ class LludpCircuitEngine {
                 val localId = buf.int
                 val pCode = buf.get().toInt() and 0xFF
                 val state = buf.get().toInt() and 0xFF
-                buf.int // CRC
+                val crc = buf.int
                 buf.get() // Material
                 buf.get() // ClickAction
                 val sx = buf.float.coerceIn(0.01f, 64f)
@@ -963,46 +996,87 @@ class LludpCircuitEngine {
                     )
                 } else {
                     val attachmentPoint = SlBinaryParsers.decodeAttachmentPoint(state, parentId)
+                    val attachItemId = nameValues["AttachItemID"]?.trim()?.let { raw ->
+                        runCatching { UUID.fromString(raw) }.getOrNull()?.takeIf { it != UUID(0L, 0L) }
+                    }
                     val label = hoverText.takeIf { it.isNotBlank() }
                         ?: if (attachmentPoint in 31..38) "HUD Attachment #$localId"
                         else if (attachmentPoint in 1..56) "Attachment #$localId"
                         else if (extraParams.isMesh) "Mesh #$localId"
                         else "Prim #$localId"
-                    _events.tryEmit(
-                        SimEvent.ObjectUpdated(
-                            SceneObject(
-                                localId = localId,
-                                uuid = fullId,
-                                parentId = parentId,
-                                ownerId = ownerId,
-                                name = label,
-                                description = if (extraParams.isMesh) "Streamed SL Mesh" else "Compressed LLUDP Object (PCode=$pCode)",
-                                pCode = pCode,
-                                shape = primShapeFromCurves(pCode, pathCurve, profileCurve),
-                                position = pos,
-                                rotation = rot,
-                                scale = Vec3(sx, sy, sz),
-                                color = texEntry.defaultColor,
-                                meshAssetId = extraParams.meshAssetId,
-                                isMesh = extraParams.isMesh,
-                                defaultTextureId = texEntry.defaultTextureId,
-                                faceTextures = texEntry.faceTextures,
-                                faceColors = texEntry.faceColors,
-                                isScripted = (updateFlags and 0x00000004) != 0,
-                                isPhysical = (updateFlags and 0x00000001) != 0,
-                                isPhantom = (updateFlags and 0x00000020) != 0,
-                                attachmentPoint = attachmentPoint,
-                                partData = decodedBlocks.partData,
-                                flexibleParams = extraParams.flexibleParams,
-                                lightParams = extraParams.lightParams,
-                                sculptParams = extraParams.sculptParams
-                            )
-                        )
+                    val sceneObject = SceneObject(
+                        localId = localId,
+                        uuid = fullId,
+                        parentId = parentId,
+                        ownerId = ownerId,
+                        name = label,
+                        description = if (extraParams.isMesh) "Streamed SL Mesh" else "Compressed LLUDP Object (PCode=$pCode)",
+                        pCode = pCode,
+                        shape = primShapeFromCurves(pCode, pathCurve, profileCurve),
+                        position = pos,
+                        rotation = rot,
+                        scale = Vec3(sx, sy, sz),
+                        color = texEntry.defaultColor,
+                        meshAssetId = extraParams.meshAssetId,
+                        isMesh = extraParams.isMesh,
+                        defaultTextureId = texEntry.defaultTextureId,
+                        faceTextures = texEntry.faceTextures,
+                        faceColors = texEntry.faceColors,
+                        isScripted = (updateFlags and 0x00000004) != 0,
+                        isPhysical = (updateFlags and 0x00000001) != 0,
+                        isPhantom = (updateFlags and 0x00000020) != 0,
+                        attachmentPoint = attachmentPoint,
+                        crc = crc,
+                        updateFlags = updateFlags,
+                        itemId = attachItemId,
+                        renderMaterialIds = extraParams.renderMaterialIds,
+                        partData = decodedBlocks.partData,
+                        flexibleParams = extraParams.flexibleParams,
+                        lightParams = extraParams.lightParams,
+                        sculptParams = extraParams.sculptParams
                     )
+                    objectCache.put(regionHandle, sceneObject)
+                    _events.tryEmit(SimEvent.ObjectUpdated(sceneObject))
                 }
             } finally {
                 buf.position(blockEnd)
             }
+        }
+    }
+
+    private fun parseObjectUpdateCached(buf: ByteBuffer) {
+        val parsed = LludpPackets.parseObjectUpdateCached(buf) ?: return
+        val resolution = objectCache.resolveCachedBatch(parsed)
+        for (hit in resolution.hits) {
+            _events.tryEmit(SimEvent.ObjectUpdated(hit))
+        }
+        if (resolution.misses.isNotEmpty()) {
+            val framedPackets = ArrayList<ByteArray>()
+            for (batch in resolution.misses.chunked(MAX_OBJECTS_PER_CACHE_MISS_PACKET)) {
+                val body = LludpPackets.buildRequestMultipleObjects(
+                    agentId = agentId,
+                    sessionId = sessionId,
+                    misses = batch
+                )
+                val framed = frameAndTrack(
+                    messageId = LludpPackets.MSG_REQUEST_MULTIPLE_OBJECTS,
+                    body = body,
+                    reliable = true,
+                    zeroCode = true,
+                    forceZeroCode = true
+                )
+                framedPackets.add(framed)
+                if (running.get()) {
+                    scope.launch { transmitRaw(framed) }
+                }
+            }
+            _events.tryEmit(
+                SimEvent.ObjectCacheMissRequested(
+                    regionHandle = parsed.regionHandle,
+                    misses = resolution.misses,
+                    framedPackets = framedPackets
+                )
+            )
         }
     }
 
@@ -1186,6 +1260,12 @@ class LludpCircuitEngine {
         handleDecodedPacket(pkt)
     }
 
+    internal fun configureIdentityForTesting(agentId: UUID, sessionId: UUID, circuitCode: Int = 1) {
+        this.agentId = agentId
+        this.sessionId = sessionId
+        this.circuitCode = circuitCode
+    }
+
     private fun readNullTerminatedUtf8(buf: ByteBuffer, limitEnd: Int): String {
         val start = buf.position()
         var end = start
@@ -1330,24 +1410,30 @@ class LludpCircuitEngine {
         send(LludpPackets.MSG_PACKET_ACK, buf.array(), reliable = false)
     }
 
-    private fun send(messageId: Int, body: ByteArray, reliable: Boolean, zeroCode: Boolean = false) {
-        val framed = frameAndTrack(messageId, body, reliable, zeroCode)
+    private fun send(messageId: Int, body: ByteArray, reliable: Boolean, zeroCode: Boolean = false, forceZeroCode: Boolean = false) {
+        val framed = frameAndTrack(messageId, body, reliable, zeroCode, forceZeroCode)
         scope.launch { transmitRaw(framed) }
     }
 
-    private fun sendDirect(messageId: Int, body: ByteArray, reliable: Boolean, zeroCode: Boolean = false) {
-        val framed = frameAndTrack(messageId, body, reliable, zeroCode)
+    private fun sendDirect(messageId: Int, body: ByteArray, reliable: Boolean, zeroCode: Boolean = false, forceZeroCode: Boolean = false) {
+        val framed = frameAndTrack(messageId, body, reliable, zeroCode, forceZeroCode)
         transmitRaw(framed)
     }
 
-    private fun frameAndTrack(messageId: Int, body: ByteArray, reliable: Boolean, zeroCode: Boolean): ByteArray {
+    private fun frameAndTrack(
+        messageId: Int,
+        body: ByteArray,
+        reliable: Boolean,
+        zeroCode: Boolean,
+        forceZeroCode: Boolean = false
+    ): ByteArray {
         val seq = seqCounter.getAndIncrement()
         val piggyAcks = mutableListOf<Int>()
         while (piggyAcks.size < 8) {
             val next = pendingAcks.poll() ?: break
             piggyAcks.add(next)
         }
-        val framed = LludpPackets.framePacket(seq, reliable, messageId, body, piggyAcks, zeroCode)
+        val framed = LludpPackets.framePacket(seq, reliable, messageId, body, piggyAcks, zeroCode, forceZeroCode)
         if (reliable) {
             unackedReliable[seq] = System.currentTimeMillis() to framed
         }
@@ -1406,6 +1492,7 @@ class LludpCircuitEngine {
         socket = null
         unackedReliable.clear()
         pendingAcks.clear()
+        objectCache.clear()
         emitHealth(LayerHealthStatus.IDLE, "Circuit closed")
     }
 }

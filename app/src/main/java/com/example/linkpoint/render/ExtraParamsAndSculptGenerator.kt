@@ -115,25 +115,71 @@ data class PbrUvTransform(
 }
 
 /**
- * Independent per-channel glTF PBR `KHR_texture_transform` set across Second Life's 4 PBR texture slots.
+ * Unpacked Second Life glTF 2.0 `metallicRoughnessTexture` ORM sample
+ * (`R = ambient occlusion`, `G = perceptual roughness`, `B = metalness`).
+ */
+data class SlGltfOrmSample(
+    val occlusion: Float,
+    val roughness: Float,
+    val metalness: Float
+)
+
+/**
+ * Independent per-channel glTF PBR `KHR_texture_transform` set and Second Life ORM (`R = occlusion`,
+ * `G = roughness`, `B = metalness`) material parameters across SL's glTF 2.0 PBR texture slots.
  */
 data class PbrMaterialChannelTransforms(
     val baseColor: PbrUvTransform = PbrUvTransform.IDENTITY,
     val normal: PbrUvTransform = PbrUvTransform.IDENTITY,
     val metallicRoughness: PbrUvTransform = PbrUvTransform.IDENTITY,
+    val occlusion: PbrUvTransform = PbrUvTransform.IDENTITY,
     val emissive: PbrUvTransform = PbrUvTransform.IDENTITY,
     val baseColorTextureId: UUID? = null,
     val normalTextureId: UUID? = null,
     val metallicRoughnessTextureId: UUID? = null,
-    val emissiveTextureId: UUID? = null
+    val occlusionTextureId: UUID? = null,
+    val emissiveTextureId: UUID? = null,
+    val metallicFactor: Float = 1f,
+    val roughnessFactor: Float = 1f,
+    val occlusionStrength: Float = 1f,
+    val alphaMode: String = "OPAQUE",
+    val alphaCutoff: Float = 0.5f,
+    val doubleSided: Boolean = false
 ) {
+    /**
+     * Unpacks a normalized `[0..1]` RGB sample from a Second Life glTF 2.0 `metallicRoughnessTexture`
+     * following SL's packed ORM convention:
+     * - **`R` = Occlusion** (`1 + occlusionStrength * (r - 1)`)
+     * - **`G` = Roughness** (`g * roughnessFactor`)
+     * - **`B` = Metalness** (`b * metallicFactor`)
+     */
+    fun unpackOrmRgb(rNorm: Float, gNorm: Float, bNorm: Float): SlGltfOrmSample {
+        val rawOcc = rNorm.coerceIn(0f, 1f)
+        val occ = (1f + occlusionStrength.coerceIn(0f, 1f) * (rawOcc - 1f)).coerceIn(0f, 1f)
+        val rough = (gNorm.coerceIn(0f, 1f) * roughnessFactor.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+        val metal = (bNorm.coerceIn(0f, 1f) * metallicFactor.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+        return SlGltfOrmSample(occlusion = occ, roughness = rough, metalness = metal)
+    }
+
+    /**
+     * Unpacks an `0xAARRGGBB` pixel from a Second Life glTF 2.0 packed ORM texture (`R=O, G=R, B=M`).
+     */
+    fun unpackOrmArgb(argbPixel: Int): SlGltfOrmSample {
+        val r = ((argbPixel ushr 16) and 0xFF) / 255.0f
+        val g = ((argbPixel ushr 8) and 0xFF) / 255.0f
+        val b = (argbPixel and 0xFF) / 255.0f
+        return unpackOrmRgb(r, g, b)
+    }
+
     companion object {
         val IDENTITY = PbrMaterialChannelTransforms()
 
         /**
-         * Parses a glTF 2.0 PBR material JSON document (matching `sl-asset-decoder.cjs` `normalizeGLTFMaterial`)
+         * Parses a glTF 2.0 PBR material JSON document (matching `LLGLTFMaterial` & `sl-asset-decoder.cjs`)
          * and extracts independent `KHR_texture_transform` values for `baseColorTexture`, `normalTexture`,
-         * `metallicRoughnessTexture`, and `emissiveTexture`.
+         * `metallicRoughnessTexture` (SL packed ORM: `R = occlusion`, `G = roughness`, `B = metalness`),
+         * `occlusionTexture`, and `emissiveTexture`, plus `metallicFactor`, `roughnessFactor`,
+         * `occlusionStrength`, `alphaMode` (`OPAQUE`, `MASK`, `BLEND`), `alphaCutoff`, and `doubleSided`.
          */
         fun fromGltfJson(gltfJson: String): PbrMaterialChannelTransforms {
             return try {
@@ -146,11 +192,20 @@ data class PbrMaterialChannelTransforms(
                 val textures = root.optJSONArray("textures")
 
                 fun resolveTexUuid(texInfo: JSONObject?): UUID? {
-                    if (texInfo == null || textures == null || images == null) return null
+                    if (texInfo == null) return null
+                    val directUuid = texInfo.optString("uuid", "").trim().ifEmpty {
+                        texInfo.optString("uri", "").trim()
+                    }
+                    if (directUuid.isNotEmpty()) {
+                        runCatching { UUID.fromString(directUuid) }.getOrNull()
+                            ?.takeIf { it != UUID(0L, 0L) }
+                            ?.let { return it }
+                    }
+                    if (textures == null || images == null) return null
                     val texIdx = texInfo.optInt("index", -1)
                     val srcIdx = textures.optJSONObject(texIdx)?.optInt("source", -1) ?: -1
                     val uri = images.optJSONObject(srcIdx)?.optString("uri", "")?.trim().orEmpty()
-                    return runCatching { UUID.fromString(uri) }.getOrNull()
+                    return runCatching { UUID.fromString(uri) }.getOrNull()?.takeIf { it != UUID(0L, 0L) }
                 }
 
                 fun parseTransform(texInfo: JSONObject?): PbrUvTransform {
@@ -172,18 +227,39 @@ data class PbrMaterialChannelTransforms(
 
                 val baseTex = pbr?.optJSONObject("baseColorTexture")
                 val mrTex = pbr?.optJSONObject("metallicRoughnessTexture")
+                val occTex = mat.optJSONObject("occlusionTexture")
                 val normTex = mat.optJSONObject("normalTexture")
                 val emTex = mat.optJSONObject("emissiveTexture")
+
+                val mrTransform = parseTransform(mrTex)
+                val mrUuid = resolveTexUuid(mrTex)
+                val occUuid = resolveTexUuid(occTex) ?: mrUuid
+                val occTransform = if (occTex != null) parseTransform(occTex) else mrTransform
+                val metallicFactor = (pbr?.optDouble("metallicFactor", 1.0) ?: 1.0).toFloat().coerceIn(0f, 1f)
+                val roughnessFactor = (pbr?.optDouble("roughnessFactor", 1.0) ?: 1.0).toFloat().coerceIn(0f, 1f)
+                val occStrength = (occTex?.optDouble("strength", 1.0) ?: 1.0).toFloat().coerceIn(0f, 1f)
+                val rawAlphaMode = mat.optString("alphaMode", "OPAQUE").trim().uppercase()
+                val alphaMode = if (rawAlphaMode in setOf("OPAQUE", "MASK", "BLEND")) rawAlphaMode else "OPAQUE"
+                val alphaCutoff = mat.optDouble("alphaCutoff", 0.5).toFloat().coerceIn(0f, 1f)
+                val doubleSided = mat.optBoolean("doubleSided", false)
 
                 PbrMaterialChannelTransforms(
                     baseColor = parseTransform(baseTex),
                     normal = parseTransform(normTex),
-                    metallicRoughness = parseTransform(mrTex),
+                    metallicRoughness = mrTransform,
+                    occlusion = occTransform,
                     emissive = parseTransform(emTex),
                     baseColorTextureId = resolveTexUuid(baseTex),
                     normalTextureId = resolveTexUuid(normTex),
-                    metallicRoughnessTextureId = resolveTexUuid(mrTex),
-                    emissiveTextureId = resolveTexUuid(emTex)
+                    metallicRoughnessTextureId = mrUuid,
+                    occlusionTextureId = occUuid,
+                    emissiveTextureId = resolveTexUuid(emTex),
+                    metallicFactor = metallicFactor,
+                    roughnessFactor = roughnessFactor,
+                    occlusionStrength = occStrength,
+                    alphaMode = alphaMode,
+                    alphaCutoff = alphaCutoff,
+                    doubleSided = doubleSided
                 )
             } catch (_: Exception) {
                 IDENTITY
@@ -294,7 +370,7 @@ object ExtraParamsAndSculptGenerator {
                         }
                     }
                 }
-                ExtraParamTypes.RENDER_MATERIAL -> {
+                ExtraParamTypes.RENDER_MATERIAL, ExtraParamTypes.EXTENDED_MESH -> {
                     if (paramSize >= 1) {
                         val count = buf.get().toInt() and 0xFF
                         repeat(count.coerceAtMost(16)) {

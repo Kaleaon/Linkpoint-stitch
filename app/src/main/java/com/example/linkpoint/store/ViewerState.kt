@@ -105,9 +105,11 @@ data class InventoryEntry(
     val parentId: UUID,
     val name: String,
     val isFolder: Boolean,
-    val assetType: Int, // 0=Texture, 3=Landmark, 6=Object, 7=Notecard, 10=Script, 13=Bodypart, 5=Clothing
+    val assetType: Int, // SlAssetType (llassettype.h): 0=Texture, 3=Landmark, 5=Clothing, 6=Object, 7=Notecard, 10=LSL, 13=Bodypart, 20=Anim, 49=Mesh, 57=Material
     val isWorn: Boolean = false,
-    val attachmentPoint: Int = 0
+    val attachmentPoint: Int = 0,
+    val assetId: UUID? = null,
+    val inventoryType: Int = -1 // SlInventoryType (llinventorytype.h): distinct from assetType
 )
 
 data class MapRegionTile(
