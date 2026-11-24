@@ -2,15 +2,67 @@ package com.example.linkpoint.designsystem
 
 import com.example.linkpoint.scene.EnvironmentPreset
 
+/**
+ * The 6 interchangeable `linkpoint-design` layout packs.
+ */
 enum class DesignLanguage(
     val displayName: String,
-    val tagline: String
+    val tagline: String,
+    val layoutKey: String = "glass"
 ) {
-    POLISHED("Polished", "Refined Linkpoint spatial glass & specular chrome"),
-    TERMINAL("Terminal", "Phosphor telemetry console & monospace CLI"),
-    LCARS("Sweep Console", "LCARS curved elbow rails & capsule bridge HUD"),
-    METRO("Metro", "Sharp flat typographic panorama & live tiles")
+    POLISHED(
+        displayName = "Polished",
+        tagline = "Refined Linkpoint spatial glass & specular chrome",
+        layoutKey = "glass"
+    ),
+    TERMINAL(
+        displayName = "Terminal",
+        tagline = "Phosphor telemetry console & monospace CLI",
+        layoutKey = "terminal"
+    ),
+    LCARS(
+        displayName = "Sweep Console",
+        tagline = "Black-field LCARS opposing elbows & unboxed readouts",
+        layoutKey = "sweep"
+    ),
+    METRO(
+        displayName = "Metro",
+        tagline = "Sharp flat typographic panorama & live tiles",
+        layoutKey = "tiles"
+    ),
+    RULE_AND_RAIL(
+        displayName = "Rule & Rail",
+        tagline = "Deco discipline hairline rules & wide-tracked uppercase headers",
+        layoutKey = "rules"
+    ),
+    PRESS(
+        displayName = "Press",
+        tagline = "Editorial serif body, double masthead rules & quiet borders",
+        layoutKey = "press"
+    );
+
+    val supportsLightPosture: Boolean
+        get() = this == POLISHED || this == METRO || this == RULE_AND_RAIL || this == PRESS
+
+    companion object {
+        /** Alias matching `POLISHED_DARK` / Glass layout pack nomenclature. */
+        val POLISHED_DARK: DesignLanguage = POLISHED
+
+        fun fromKeyOrDefault(raw: String?, default: DesignLanguage = POLISHED): DesignLanguage {
+            if (raw.isNullOrBlank()) return default
+            val normalized = raw.trim().uppercase().replace('-', '_')
+            if (normalized == "POLISHED_DARK" || normalized == "GLASS") return POLISHED
+            if (normalized == "SWEEP") return LCARS
+            if (normalized == "TILES") return METRO
+            if (normalized == "RULES" || normalized == "RULE_RAIL") return RULE_AND_RAIL
+            return entries.firstOrNull {
+                it.name == normalized || it.layoutKey.equals(raw.trim(), ignoreCase = true)
+            } ?: default
+        }
+    }
 }
+
+typealias LinkpointDesignLanguage = DesignLanguage
 
 enum class AccentPreset(val label: String) {
     AZURE_CYAN("Azure Cyan"),
@@ -49,15 +101,17 @@ enum class DockToolId(val shortLabel: String, val lcarsCode: String) {
     CHAT("Chat", "01-COM"),
     RADAR("Radar", "02-SEN"),
     MAP("Map", "03-NAV"),
-    INVENTORY("Inv", "04-INV"),
-    INSPECTOR("Inspect", "05-OBJ"),
-    HUDS("HUDs", "06-HUD"),
-    STUDIO("Design", "07-SYS")
+    WORLD("World", "04-WLD"),
+    INVENTORY("Inv", "05-INV"),
+    INSPECTOR("Inspect", "06-OBJ"),
+    HUDS("HUDs", "07-HUD"),
+    STUDIO("Design", "08-SYS")
 }
 
 data class PersonalDesignState(
     val designLanguage: DesignLanguage = DesignLanguage.POLISHED,
     val accentPreset: AccentPreset = AccentPreset.AZURE_CYAN,
+    val kthemeId: String = "",
     val useLightPosture: Boolean = false,
     val dockPosition: DockPosition = DockPosition.BOTTOM,
     val telemetryPosition: TelemetryPosition = TelemetryPosition.COMPACT,
@@ -71,7 +125,12 @@ data class PersonalDesignState(
     val pinnedTools: List<DockToolId> = DockToolId.entries.toList(),
     val drawDistance: Float = 128f,
     val environmentPreset: EnvironmentPreset = EnvironmentPreset.TWILIGHT
-)
+) {
+    val effectiveKthemeId: String
+        get() = kthemeId.ifBlank {
+            KthemeCatalog.defaultIdForLanguage(designLanguage, useLightPosture)
+        }
+}
 
 data class DesignStarterPreset(
     val id: String,
@@ -89,6 +148,7 @@ object DesignPresets {
             state = PersonalDesignState(
                 designLanguage = DesignLanguage.POLISHED,
                 accentPreset = AccentPreset.AZURE_CYAN,
+                kthemeId = "aurora-glass-night",
                 dockPosition = DockPosition.BOTTOM,
                 telemetryPosition = TelemetryPosition.COMPACT,
                 joystickSide = JoystickSide.LEFT,
@@ -100,14 +160,15 @@ object DesignPresets {
         DesignStarterPreset(
             id = "lcars_bridge",
             name = "Sweep Console (LCARS)",
-            subtitle = "Curved elbow bridge frame • Apricot & lilac pills",
+            subtitle = "Black-field opposing elbows • Unboxed readouts & pills",
             state = PersonalDesignState(
                 designLanguage = DesignLanguage.LCARS,
                 accentPreset = AccentPreset.LCARS_APRICOT,
+                kthemeId = "lcars",
                 dockPosition = DockPosition.LEFT,
                 telemetryPosition = TelemetryPosition.TOP,
                 joystickSide = JoystickSide.RIGHT,
-                panelOpacity = 0.94f
+                panelOpacity = 1.0f
             )
         ),
         DesignStarterPreset(
@@ -117,6 +178,7 @@ object DesignPresets {
             state = PersonalDesignState(
                 designLanguage = DesignLanguage.METRO,
                 accentPreset = AccentPreset.METRO_COBALT,
+                kthemeId = "windows-phone-metro",
                 dockPosition = DockPosition.BOTTOM,
                 telemetryPosition = TelemetryPosition.TOP,
                 joystickSide = JoystickSide.LEFT,
@@ -130,6 +192,7 @@ object DesignPresets {
             state = PersonalDesignState(
                 designLanguage = DesignLanguage.TERMINAL,
                 accentPreset = AccentPreset.PHOSPHOR_GREEN,
+                kthemeId = "ink-terminal-modern",
                 dockPosition = DockPosition.RIGHT,
                 telemetryPosition = TelemetryPosition.TOP,
                 joystickSide = JoystickSide.LEFT,
@@ -137,16 +200,32 @@ object DesignPresets {
             )
         ),
         DesignStarterPreset(
-            id = "one_handed",
-            name = "One-Handed Explorer",
-            subtitle = "Bottom bar • Right-thumb stick • Compact telemetry",
+            id = "deco_rule_rail",
+            name = "Art Deco Rule & Rail",
+            subtitle = "Hairline gold rules • Wide-tracked Deco headers • Left rail",
             state = PersonalDesignState(
-                designLanguage = DesignLanguage.POLISHED,
+                designLanguage = DesignLanguage.RULE_AND_RAIL,
                 accentPreset = AccentPreset.BEACON_AMBER,
+                kthemeId = "art-deco",
+                dockPosition = DockPosition.LEFT,
+                telemetryPosition = TelemetryPosition.TOP,
+                joystickSide = JoystickSide.RIGHT,
+                panelOpacity = 0.94f
+            )
+        ),
+        DesignStarterPreset(
+            id = "editorial_press",
+            name = "Editorial Press",
+            subtitle = "Paper & Ink daylight • Serif body & double masthead rules",
+            state = PersonalDesignState(
+                designLanguage = DesignLanguage.PRESS,
+                accentPreset = AccentPreset.AZURE_CYAN,
+                kthemeId = "paper-ink",
+                useLightPosture = true,
                 dockPosition = DockPosition.BOTTOM,
                 telemetryPosition = TelemetryPosition.COMPACT,
-                joystickSide = JoystickSide.RIGHT,
-                uiDensity = UiDensity.COMPACT
+                joystickSide = JoystickSide.LEFT,
+                panelOpacity = 0.96f
             )
         )
     )

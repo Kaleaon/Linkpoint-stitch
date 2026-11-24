@@ -10,6 +10,9 @@ import com.example.linkpoint.designsystem.DockToolId
 import com.example.linkpoint.designsystem.JoystickSide
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.designsystem.UiDensity
+import com.example.linkpoint.management.DirectoryCategory
+import com.example.linkpoint.management.MuteType
+import com.example.linkpoint.management.ParcelReturnType
 import com.example.linkpoint.scene.CameraMode
 import com.example.linkpoint.scene.EnvironmentPreset
 import com.example.linkpoint.scene.HudHitResult
@@ -96,6 +99,7 @@ interface ViewerClient {
     // Personal Layout & Multi-Language Design Studio
     fun setDesignLanguage(language: DesignLanguage)
     fun setAccentPreset(preset: AccentPreset)
+    fun setKthemePalette(kthemeId: String)
     fun setLightPosture(light: Boolean)
     fun setDockPosition(position: DockPosition)
     fun setTelemetryPosition(position: TelemetryPosition)
@@ -113,4 +117,24 @@ interface ViewerClient {
     fun saveAsCustomPreset()
     fun loadCustomPreset()
     fun resetDesignToDefault()
+
+    // Phase 10: Directory Search, Group Admin, Parcel Management, Outfits/Notecards, Mute & Quick-Pay
+    fun setSearchCategory(category: DirectoryCategory)
+    fun searchDirectory(query: String, category: DirectoryCategory? = null)
+    fun activateGroup(groupId: UUID)
+    fun inspectGroup(groupId: UUID)
+    fun selectGroupTitle(groupId: UUID, roleId: UUID)
+    fun sendGroupNotice(groupId: UUID, subject: String, message: String)
+    fun refreshParcelDetails()
+    fun returnParcelObjects(returnType: ParcelReturnType)
+    fun buyParcelPass()
+    fun selectNotecard(itemId: UUID)
+    fun createNewNotecard(title: String, initialBody: String = "")
+    fun saveNotecard(itemId: UUID, bodyText: String)
+    fun saveCurrentOutfit(outfitName: String)
+    fun syncMuteList()
+    fun muteEntity(muteId: UUID, name: String, type: MuteType = MuteType.AGENT)
+    fun unmuteEntity(muteId: UUID, name: String)
+    fun requestObjectPayPrice(objectId: UUID)
+    fun payObject(objectId: UUID, objectName: String, amount: Int)
 }

@@ -21,10 +21,12 @@ import com.example.R
 val SpaceGroteskFont = FontFamily(Font(R.font.space_grotesk, FontWeight.Normal))
 val PlusJakartaSansFont = FontFamily(Font(R.font.plus_jakarta_sans, FontWeight.Normal))
 val JetBrainsMonoFont = FontFamily(Font(R.font.jetbrains_mono, FontWeight.Normal))
+val EditorialSerifFont = FontFamily.Serif
 
 @Immutable
 data class LinkpointDesignTokens(
     val language: DesignLanguage,
+    val kthemeId: String,
     val isLight: Boolean,
     val canvasVoid: Color,
     val surfaceChrome: Color,
@@ -51,10 +53,13 @@ data class LinkpointDesignTokens(
     val bodyFont: FontFamily,
     val monoFont: FontFamily
 ) {
+    val surfaceCanvas: Color get() = canvasVoid
     fun formatHeader(raw: String): String = when (language) {
         DesignLanguage.LCARS -> raw.uppercase()
         DesignLanguage.METRO -> raw.lowercase()
         DesignLanguage.TERMINAL -> "[${raw.uppercase()}]"
+        DesignLanguage.RULE_AND_RAIL -> raw.uppercase()
+        DesignLanguage.PRESS -> raw
         DesignLanguage.POLISHED -> raw
     }
 
@@ -62,6 +67,8 @@ data class LinkpointDesignTokens(
         DesignLanguage.LCARS -> raw.uppercase()
         DesignLanguage.TERMINAL -> "> ${raw.uppercase()}"
         DesignLanguage.METRO -> raw.lowercase()
+        DesignLanguage.RULE_AND_RAIL -> raw.uppercase()
+        DesignLanguage.PRESS -> raw
         DesignLanguage.POLISHED -> raw
     }
 }
@@ -79,191 +86,178 @@ fun resolveAccentColor(preset: AccentPreset): Triple<Color, Color, Color> = when
     AccentPreset.NEON_MAGENTA -> Triple(Color(0xFFE3008C), Color(0xFFA855F7), Color(0xFF22D3EE))
 }
 
+/**
+ * Resolves full semantic + layout tokens for any combination of the 6 [DesignLanguage] packs
+ * and 28+ [KthemeCatalog] palettes, enforcing WCAG AA contrast via [LinkpointContrast].
+ */
 fun resolveLinkpointTokens(designState: PersonalDesignState): LinkpointDesignTokens {
-    val (accent1, accent2, accent3) = resolveAccentColor(designState.accentPreset)
+    val explicitPalette = KthemeCatalog.byId(designState.kthemeId)
+    val fallbackPaletteId = KthemeCatalog.defaultIdForLanguage(
+        designState.designLanguage,
+        designState.useLightPosture && designState.designLanguage.supportsLightPosture
+    )
+    val palette = explicitPalette ?: KthemeCatalog.byIdOrDefault(fallbackPaletteId)
+
+    val (presetAccent1, presetAccent2, presetAccent3) = resolveAccentColor(designState.accentPreset)
+    val usePaletteAccents = explicitPalette != null
+    val rawAccent1 = if (usePaletteAccents) palette.pri else presetAccent1
+    val rawAccent2 = if (usePaletteAccents) palette.sec else presetAccent2
+    val rawAccent3 = if (usePaletteAccents) palette.sec2 else presetAccent3
+
     val opacity = designState.panelOpacity.coerceIn(0.55f, 1.0f)
-    val light = designState.useLightPosture &&
-        (designState.designLanguage == DesignLanguage.POLISHED || designState.designLanguage == DesignLanguage.METRO)
 
-    return when (designState.designLanguage) {
-        DesignLanguage.POLISHED -> if (light) {
-            LinkpointDesignTokens(
-                language = DesignLanguage.POLISHED,
-                isLight = true,
-                canvasVoid = Color(0xFFEBF1F8),
-                surfaceChrome = Color(0xFFF7FAFF).copy(alpha = opacity),
-                surfaceFloater = Color(0xFFFFFFFF).copy(alpha = (opacity + 0.04f).coerceAtMost(1f)),
-                surfaceElevated = Color(0xFFE2EBF5),
-                borderHairline = Color(0xFFCBD5E1),
-                borderSpecular = Color(0xFFFFFFFF),
-                accentPrimary = accent1,
-                accentSecondary = accent2,
-                accentTertiary = accent3,
-                statusOnline = Color(0xFF059669),
-                statusWarning = Color(0xFFD97706),
-                statusError = Color(0xFFE11D48),
-                textPrimary = Color(0xFF0F172A),
-                textSecondary = Color(0xFF334155),
-                textMuted = Color(0xFF64748B),
-                onAccent = Color(0xFFFFFFFF),
-                cornerRadius = 16.dp,
-                buttonRadius = 12.dp,
-                borderWidth = 1.dp,
-                panelOpacity = opacity,
-                densityScale = designState.uiDensity.scale,
-                displayFont = SpaceGroteskFont,
-                bodyFont = PlusJakartaSansFont,
-                monoFont = JetBrainsMonoFont
-            )
-        } else {
-            LinkpointDesignTokens(
-                language = DesignLanguage.POLISHED,
-                isLight = false,
-                canvasVoid = Color(0xFF080C12),
-                surfaceChrome = Color(0xFF101722).copy(alpha = opacity),
-                surfaceFloater = Color(0xFF151F2E).copy(alpha = (opacity + 0.03f).coerceAtMost(0.98f)),
-                surfaceElevated = Color(0xFF1D2A3D),
-                borderHairline = Color(0xFF243247),
-                borderSpecular = Color(0xFF3A5273),
-                accentPrimary = accent1,
-                accentSecondary = accent2,
-                accentTertiary = accent3,
-                statusOnline = Color(0xFF10B981),
-                statusWarning = Color(0xFFF59E0B),
-                statusError = Color(0xFFF43F5E),
-                textPrimary = Color(0xFFF1F5F9),
-                textSecondary = Color(0xFF94A3B8),
-                textMuted = Color(0xFF64748B),
-                onAccent = Color(0xFF04101B),
-                cornerRadius = 16.dp,
-                buttonRadius = 12.dp,
-                borderWidth = 1.dp,
-                panelOpacity = opacity,
-                densityScale = designState.uiDensity.scale,
-                displayFont = SpaceGroteskFont,
-                bodyFont = PlusJakartaSansFont,
-                monoFont = JetBrainsMonoFont
-            )
-        }
-
-        DesignLanguage.TERMINAL -> LinkpointDesignTokens(
-            language = DesignLanguage.TERMINAL,
-            isLight = false,
-            canvasVoid = Color(0xFF030604),
-            surfaceChrome = Color(0xFF050A06).copy(alpha = (opacity + 0.04f).coerceAtMost(0.98f)),
-            surfaceFloater = Color(0xFF071009).copy(alpha = (opacity + 0.05f).coerceAtMost(0.99f)),
-            surfaceElevated = Color(0xFF0D1D11),
-            borderHairline = accent1.copy(alpha = 0.55f),
-            borderSpecular = accent1,
-            accentPrimary = accent1,
-            accentSecondary = accent2,
-            accentTertiary = accent3,
-            statusOnline = Color(0xFF22C55E),
-            statusWarning = Color(0xFFFACC15),
-            statusError = Color(0xFFEF4444),
-            textPrimary = Color(0xFFE2FBE8),
-            textSecondary = accent1.copy(alpha = 0.82f),
-            textMuted = Color(0xFF4D7C5B),
-            onAccent = Color(0xFF031006),
-            cornerRadius = 2.dp,
-            buttonRadius = 2.dp,
-            borderWidth = 1.25.dp,
-            panelOpacity = opacity,
-            densityScale = designState.uiDensity.scale,
-            displayFont = JetBrainsMonoFont,
-            bodyFont = JetBrainsMonoFont,
-            monoFont = JetBrainsMonoFont
-        )
-
-        DesignLanguage.LCARS -> LinkpointDesignTokens(
-            language = DesignLanguage.LCARS,
-            isLight = false,
-            canvasVoid = Color(0xFF000000),
-            surfaceChrome = Color(0xFF050508).copy(alpha = (opacity + 0.05f).coerceAtMost(0.99f)),
-            surfaceFloater = Color(0xFF08080E).copy(alpha = (opacity + 0.06f).coerceAtMost(0.99f)),
-            surfaceElevated = Color(0xFF141422),
-            borderHairline = accent1,
-            borderSpecular = Color(0xFFFFCC66),
-            accentPrimary = accent1, // Apricot / user accent
-            accentSecondary = Color(0xFFCC99CC), // Classic LCARS Lilac
-            accentTertiary = Color(0xFF9999FF), // Classic LCARS Periwinkle
-            statusOnline = Color(0xFF66CC99),
-            statusWarning = Color(0xFFFFCC66),
-            statusError = Color(0xFFCC5555),
-            textPrimary = Color(0xFFFFF3E0),
-            textSecondary = Color(0xFFFFCC99),
-            textMuted = Color(0xFFA388AA),
-            onAccent = Color(0xFF000000),
-            cornerRadius = 24.dp,
-            buttonRadius = 99.dp, // Signature LCARS capsule pills
-            borderWidth = 2.dp,
-            panelOpacity = opacity,
-            densityScale = designState.uiDensity.scale,
-            displayFont = SpaceGroteskFont,
-            bodyFont = SpaceGroteskFont,
-            monoFont = JetBrainsMonoFont
-        )
-
-        DesignLanguage.METRO -> if (light) {
-            LinkpointDesignTokens(
-                language = DesignLanguage.METRO,
-                isLight = true,
-                canvasVoid = Color(0xFFF2F2F2),
-                surfaceChrome = Color(0xFFFFFFFF).copy(alpha = (opacity + 0.04f).coerceAtMost(1f)),
-                surfaceFloater = Color(0xFFFAFAFA).copy(alpha = (opacity + 0.06f).coerceAtMost(1f)),
-                surfaceElevated = Color(0xFFE6E6E6),
-                borderHairline = Color(0xFFD0D0D0),
-                borderSpecular = accent1,
-                accentPrimary = accent1,
-                accentSecondary = accent2,
-                accentTertiary = accent3,
-                statusOnline = Color(0xFF107C10),
-                statusWarning = Color(0xFFD83B01),
-                statusError = Color(0xFFE81123),
-                textPrimary = Color(0xFF111111),
-                textSecondary = Color(0xFF444444),
-                textMuted = Color(0xFF767676),
-                onAccent = Color(0xFFFFFFFF),
-                cornerRadius = 0.dp, // Pure sharp Metro edges
-                buttonRadius = 0.dp,
-                borderWidth = 2.dp,
-                panelOpacity = opacity,
-                densityScale = designState.uiDensity.scale,
-                displayFont = SpaceGroteskFont,
-                bodyFont = PlusJakartaSansFont,
-                monoFont = JetBrainsMonoFont
-            )
-        } else {
-            LinkpointDesignTokens(
-                language = DesignLanguage.METRO,
-                isLight = false,
-                canvasVoid = Color(0xFF0A0A0A),
-                surfaceChrome = Color(0xFF111111).copy(alpha = (opacity + 0.04f).coerceAtMost(0.99f)),
-                surfaceFloater = Color(0xFF161616).copy(alpha = (opacity + 0.06f).coerceAtMost(0.99f)),
-                surfaceElevated = Color(0xFF222222),
-                borderHairline = Color(0xFF333333),
-                borderSpecular = accent1,
-                accentPrimary = accent1,
-                accentSecondary = accent2,
-                accentTertiary = accent3,
-                statusOnline = Color(0xFF107C10),
-                statusWarning = Color(0xFFF09609),
-                statusError = Color(0xFFE81123),
-                textPrimary = Color(0xFFFFFFFF),
-                textSecondary = Color(0xFFC8C8C8),
-                textMuted = Color(0xFF8A8A8A),
-                onAccent = Color(0xFFFFFFFF),
-                cornerRadius = 0.dp,
-                buttonRadius = 0.dp,
-                borderWidth = 2.dp,
-                panelOpacity = opacity,
-                densityScale = designState.uiDensity.scale,
-                displayFont = SpaceGroteskFont,
-                bodyFont = PlusJakartaSansFont,
-                monoFont = JetBrainsMonoFont
-            )
-        }
+    // CleverFerret's revised LCARS split-frame always sits on a pure #000000 black field.
+    val isLcarsBlackField = designState.designLanguage == DesignLanguage.LCARS
+    val effectiveLight = if (isLcarsBlackField) {
+        false
+    } else if (explicitPalette != null) {
+        palette.isLight
+    } else {
+        designState.useLightPosture && designState.designLanguage.supportsLightPosture
     }
+
+    val canvasVoid = when {
+        isLcarsBlackField -> LcarsBlackField
+        else -> palette.bg
+    }
+    val rawFloaterBase = when {
+        isLcarsBlackField -> LcarsBlackField
+        designState.designLanguage == DesignLanguage.RULE_AND_RAIL -> palette.bg
+        else -> palette.surf
+    }
+    val surfaceChrome = if (isLcarsBlackField) {
+        LcarsBlackField
+    } else {
+        palette.surf.copy(alpha = (opacity + 0.04f).coerceAtMost(1f))
+    }
+    val surfaceFloater = if (isLcarsBlackField) {
+        LcarsBlackField
+    } else {
+        rawFloaterBase.copy(alpha = (opacity + 0.06f).coerceAtMost(1f))
+    }
+    val surfaceElevated = if (isLcarsBlackField) {
+        Color(0xFF101018)
+    } else {
+        palette.surf2
+    }
+
+    // Composite surface over canvasVoid so WCAG contrast holds at user's chosen panelOpacity.
+    val effectiveFloaterBg = LinkpointContrast.compositeOver(surfaceFloater, canvasVoid)
+
+    val textPrimaryOnFloater = LinkpointContrast.ensureMinContrast(
+        fg = if (isLcarsBlackField && palette.isLight) Color(0xFFFFF3E0) else palette.ink,
+        bg = effectiveFloaterBg,
+        minRatio = LinkpointContrast.WCAG_AA_NORMAL_TEXT
+    )
+    val textPrimary = LinkpointContrast.ensureMinContrast(
+        fg = textPrimaryOnFloater,
+        bg = canvasVoid,
+        minRatio = LinkpointContrast.WCAG_AA_NORMAL_TEXT
+    )
+
+    val textSecondary = LinkpointContrast.ensureMinContrast(
+        fg = if (isLcarsBlackField && palette.isLight) Color(0xFFFFCC99) else palette.ink2,
+        bg = effectiveFloaterBg,
+        minRatio = LinkpointContrast.WCAG_AA_NORMAL_TEXT
+    )
+
+    val textMuted = LinkpointContrast.ensureMinContrast(
+        fg = palette.ink2.copy(alpha = 0.78f),
+        bg = effectiveFloaterBg,
+        minRatio = LinkpointContrast.WCAG_AA_LARGE_TEXT
+    )
+
+    val accentPrimary = LinkpointContrast.ensureMinContrast(
+        fg = rawAccent1,
+        bg = effectiveFloaterBg,
+        minRatio = LinkpointContrast.WCAG_AA_UI_COMPONENT
+    )
+    val accentSecondary = LinkpointContrast.ensureMinContrast(
+        fg = rawAccent2,
+        bg = effectiveFloaterBg,
+        minRatio = LinkpointContrast.WCAG_AA_UI_COMPONENT
+    )
+    val accentTertiary = LinkpointContrast.ensureMinContrast(
+        fg = rawAccent3,
+        bg = effectiveFloaterBg,
+        minRatio = LinkpointContrast.WCAG_AA_UI_COMPONENT
+    )
+
+    val rawOnAccentCandidate = if (usePaletteAccents) palette.onPri else {
+        if (effectiveLight) Color.White else Color(0xFF06101A)
+    }
+    val onAccent = LinkpointContrast.ensureMinContrast(
+        fg = rawOnAccentCandidate,
+        bg = accentPrimary,
+        minRatio = LinkpointContrast.WCAG_AA_NORMAL_TEXT
+    )
+
+    val statusOnline = LinkpointContrast.ensureMinContrast(palette.ok, effectiveFloaterBg, 3.0)
+    val statusWarning = LinkpointContrast.ensureMinContrast(palette.warn, effectiveFloaterBg, 3.0)
+    val statusError = LinkpointContrast.ensureMinContrast(palette.err, effectiveFloaterBg, 3.0)
+
+    val borderHairline = when (designState.designLanguage) {
+        DesignLanguage.LCARS -> accentPrimary
+        DesignLanguage.TERMINAL -> accentPrimary.copy(alpha = 0.6f)
+        DesignLanguage.RULE_AND_RAIL -> accentPrimary.copy(alpha = 0.72f)
+        DesignLanguage.PRESS -> LinkpointContrast.ensureMinContrast(palette.outlineVariant, effectiveFloaterBg, 2.2)
+        else -> palette.outlineVariant
+    }
+
+    val borderSpecular = when (designState.designLanguage) {
+        DesignLanguage.LCARS -> accentSecondary
+        DesignLanguage.RULE_AND_RAIL -> accentPrimary
+        DesignLanguage.PRESS -> textPrimary.copy(alpha = 0.45f)
+        else -> if (effectiveLight) Color.White else accentPrimary.copy(alpha = 0.65f)
+    }
+
+    val (cornerRadius, buttonRadius, borderWidth) = when (designState.designLanguage) {
+        DesignLanguage.POLISHED -> Triple(16.dp, 12.dp, 1.dp)
+        DesignLanguage.TERMINAL -> Triple(2.dp, 2.dp, 1.25.dp)
+        DesignLanguage.LCARS -> Triple(24.dp, 99.dp, 2.dp)
+        DesignLanguage.METRO -> Triple(0.dp, 0.dp, 2.dp)
+        DesignLanguage.RULE_AND_RAIL -> Triple(0.dp, 0.dp, 1.dp)
+        DesignLanguage.PRESS -> Triple(3.dp, 2.dp, 1.dp)
+    }
+
+    val (displayFont, bodyFont) = when (designState.designLanguage) {
+        DesignLanguage.TERMINAL -> JetBrainsMonoFont to JetBrainsMonoFont
+        DesignLanguage.LCARS -> SpaceGroteskFont to SpaceGroteskFont
+        DesignLanguage.PRESS -> SpaceGroteskFont to EditorialSerifFont
+        DesignLanguage.RULE_AND_RAIL -> SpaceGroteskFont to PlusJakartaSansFont
+        DesignLanguage.METRO -> SpaceGroteskFont to PlusJakartaSansFont
+        DesignLanguage.POLISHED -> SpaceGroteskFont to PlusJakartaSansFont
+    }
+
+    return LinkpointDesignTokens(
+        language = designState.designLanguage,
+        kthemeId = palette.id,
+        isLight = effectiveLight,
+        canvasVoid = canvasVoid,
+        surfaceChrome = surfaceChrome,
+        surfaceFloater = surfaceFloater,
+        surfaceElevated = surfaceElevated,
+        borderHairline = borderHairline,
+        borderSpecular = borderSpecular,
+        accentPrimary = accentPrimary,
+        accentSecondary = accentSecondary,
+        accentTertiary = accentTertiary,
+        statusOnline = statusOnline,
+        statusWarning = statusWarning,
+        statusError = statusError,
+        textPrimary = textPrimary,
+        textSecondary = textSecondary,
+        textMuted = textMuted,
+        onAccent = onAccent,
+        cornerRadius = cornerRadius,
+        buttonRadius = buttonRadius,
+        borderWidth = borderWidth,
+        panelOpacity = opacity,
+        densityScale = designState.uiDensity.scale,
+        displayFont = displayFont,
+        bodyFont = bodyFont,
+        monoFont = JetBrainsMonoFont
+    )
 }
 
 @Composable
@@ -304,48 +298,59 @@ fun LinkpointTheme(
         )
     }
 
+    val s = tokens.densityScale
+    val headerTracking = when (tokens.language) {
+        DesignLanguage.RULE_AND_RAIL -> 2.2.sp
+        DesignLanguage.LCARS -> 1.2.sp
+        DesignLanguage.PRESS -> 0.4.sp
+        else -> 0.sp
+    }
+    val bodyLineHeightMultiplier = if (tokens.language == DesignLanguage.PRESS) 1.52f else 1.38f
+
     val typography = Typography(
         headlineMedium = TextStyle(
             fontFamily = tokens.displayFont,
-            fontWeight = FontWeight.Bold,
-            fontSize = 24.sp,
-            lineHeight = 30.sp
+            fontWeight = if (tokens.language == DesignLanguage.METRO) FontWeight.Light else FontWeight.Bold,
+            fontSize = (22 * s).sp,
+            lineHeight = (28 * s).sp,
+            letterSpacing = headerTracking
         ),
         titleLarge = TextStyle(
             fontFamily = tokens.displayFont,
             fontWeight = FontWeight.SemiBold,
-            fontSize = 18.sp,
-            lineHeight = 24.sp
+            fontSize = (18 * s).sp,
+            lineHeight = (24 * s).sp,
+            letterSpacing = headerTracking
         ),
         titleMedium = TextStyle(
             fontFamily = tokens.displayFont,
             fontWeight = FontWeight.SemiBold,
-            fontSize = 15.sp,
-            lineHeight = 20.sp
+            fontSize = (15 * s).sp,
+            lineHeight = (20 * s).sp
+        ),
+        bodyLarge = TextStyle(
+            fontFamily = tokens.bodyFont,
+            fontWeight = FontWeight.Normal,
+            fontSize = (14 * s).sp,
+            lineHeight = (14 * s * bodyLineHeightMultiplier).sp
         ),
         bodyMedium = TextStyle(
             fontFamily = tokens.bodyFont,
             fontWeight = FontWeight.Normal,
-            fontSize = 14.sp,
-            lineHeight = 20.sp
+            fontSize = (13 * s).sp,
+            lineHeight = (13 * s * bodyLineHeightMultiplier).sp
         ),
-        bodySmall = TextStyle(
-            fontFamily = tokens.bodyFont,
-            fontWeight = FontWeight.Normal,
-            fontSize = 12.sp,
-            lineHeight = 16.sp
-        ),
-        labelMedium = TextStyle(
-            fontFamily = tokens.monoFont,
-            fontWeight = FontWeight.Medium,
-            fontSize = 12.sp,
-            lineHeight = 16.sp
+        labelLarge = TextStyle(
+            fontFamily = tokens.displayFont,
+            fontWeight = FontWeight.SemiBold,
+            fontSize = (13 * s).sp,
+            lineHeight = (16 * s).sp
         ),
         labelSmall = TextStyle(
             fontFamily = tokens.monoFont,
             fontWeight = FontWeight.Medium,
-            fontSize = 10.sp,
-            lineHeight = 14.sp
+            fontSize = (11 * s).sp,
+            lineHeight = (14 * s).sp
         )
     )
 
@@ -356,4 +361,10 @@ fun LinkpointTheme(
             content = content
         )
     }
+}
+
+object LinkpointTheme {
+    val tokens: LinkpointDesignTokens
+        @Composable
+        get() = LocalLinkpointDesign.current
 }

@@ -34,6 +34,7 @@ class PreferencesRepository(private val context: Context) {
     private object Keys {
         val DESIGN_LANGUAGE = stringPreferencesKey("design_language")
         val ACCENT_PRESET = stringPreferencesKey("accent_preset")
+        val KTHEME_ID = stringPreferencesKey("ktheme_id")
         val LIGHT_POSTURE = booleanPreferencesKey("light_posture")
         val DOCK_POSITION = stringPreferencesKey("dock_position")
         val TELEMETRY_POSITION = stringPreferencesKey("telemetry_position")
@@ -64,6 +65,7 @@ class PreferencesRepository(private val context: Context) {
         PersonalDesignState(
             designLanguage = enumOrDefault(prefs[Keys.DESIGN_LANGUAGE], DesignLanguage.POLISHED),
             accentPreset = enumOrDefault(prefs[Keys.ACCENT_PRESET], AccentPreset.AZURE_CYAN),
+            kthemeId = prefs[Keys.KTHEME_ID] ?: "",
             useLightPosture = prefs[Keys.LIGHT_POSTURE] ?: false,
             dockPosition = enumOrDefault(prefs[Keys.DOCK_POSITION], DockPosition.RIGHT),
             telemetryPosition = enumOrDefault(prefs[Keys.TELEMETRY_POSITION], TelemetryPosition.TOP),
@@ -88,6 +90,7 @@ class PreferencesRepository(private val context: Context) {
         context.linkpointDataStore.edit { prefs ->
             prefs[Keys.DESIGN_LANGUAGE] = state.designLanguage.name
             prefs[Keys.ACCENT_PRESET] = state.accentPreset.name
+            prefs[Keys.KTHEME_ID] = state.kthemeId
             prefs[Keys.LIGHT_POSTURE] = state.useLightPosture
             prefs[Keys.DOCK_POSITION] = state.dockPosition.name
             prefs[Keys.TELEMETRY_POSITION] = state.telemetryPosition.name
@@ -115,7 +118,8 @@ class PreferencesRepository(private val context: Context) {
             state.joystickScale.toString(),
             state.panelOpacity.toString(),
             state.uiDensity.name,
-            state.hudGlobalScale.toString()
+            state.hudGlobalScale.toString(),
+            state.kthemeId
         ).joinToString("|")
         context.linkpointDataStore.edit { it[Keys.CUSTOM_PRESET_BLOB] = serialized }
     }
@@ -136,7 +140,8 @@ class PreferencesRepository(private val context: Context) {
                     joystickScale = parts[6].toFloatOrNull() ?: fallback.joystickScale,
                     panelOpacity = parts[7].toFloatOrNull() ?: fallback.panelOpacity,
                     uiDensity = enumOrDefault(parts[8], fallback.uiDensity),
-                    hudGlobalScale = parts[9].toFloatOrNull() ?: fallback.hudGlobalScale
+                    hudGlobalScale = parts[9].toFloatOrNull() ?: fallback.hudGlobalScale,
+                    kthemeId = parts.getOrElse(10) { fallback.kthemeId }
                 )
             }
         }

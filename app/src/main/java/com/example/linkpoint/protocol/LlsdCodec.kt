@@ -45,6 +45,32 @@ sealed class LlsdValue {
         else -> default
     }
 
+    fun asLong(default: Long = 0L): Long = when (this) {
+        is Binary -> {
+            if (bytes.isEmpty()) {
+                default
+            } else {
+                var result = 0L
+                for (i in 0 until minOf(8, bytes.size)) {
+                    result = (result shl 8) or (bytes[i].toLong() and 0xFFL)
+                }
+                result
+            }
+        }
+        is IntVal -> value.toLong()
+        is Real -> value.toLong()
+        is Str -> {
+            val trimmed = value.trim()
+            if (trimmed.startsWith("0x", ignoreCase = true)) {
+                trimmed.substring(2).toULongOrNull(16)?.toLong() ?: default
+            } else {
+                trimmed.toLongOrNull() ?: trimmed.toULongOrNull()?.toLong() ?: default
+            }
+        }
+        is Bool -> if (value) 1L else 0L
+        else -> default
+    }
+
     fun asDouble(default: Double = 0.0): Double = when (this) {
         is Real -> value
         is IntVal -> value.toDouble()
@@ -165,6 +191,11 @@ sealed class LlsdValue {
 
 object LlsdCodec {
     private val ZERO_UUID = UUID(0L, 0L)
+
+    fun u64ToBinary(value: Long): LlsdValue.Binary {
+        val bytes = ByteBuffer.allocate(8).order(ByteOrder.BIG_ENDIAN).putLong(value).array()
+        return LlsdValue.Binary(bytes)
+    }
 
     fun toXml(value: LlsdValue): String {
         val sb = StringBuilder(256)

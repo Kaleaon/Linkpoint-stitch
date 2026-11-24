@@ -1,5 +1,13 @@
 package com.example.linkpoint.protocol
 
+import com.example.linkpoint.management.Ais3OutfitProtocol
+import com.example.linkpoint.management.Ais3OutfitSaveResult
+import com.example.linkpoint.management.GroupMembershipInfo
+import com.example.linkpoint.management.LindenNotecardCodec
+import com.example.linkpoint.management.NotecardCapProtocol
+import com.example.linkpoint.management.NotecardUploadResult
+import com.example.linkpoint.management.OutfitSavePlan
+import com.example.linkpoint.management.WorldManagementPackets
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -39,6 +47,7 @@ sealed class CapsEvent {
     data class ParcelProperties(val parcelName: String, val parcelDesc: String) : CapsEvent()
     data class ScriptDialog(val objectName: String, val message: String, val buttons: List<String>, val channel: Int) : CapsEvent()
     data class AttachmentsUpdated(val updates: List<CapsAttachmentTransform>) : CapsEvent()
+    data class AgentGroupDataUpdate(val agentId: UUID?, val groups: List<GroupMembershipInfo>) : CapsEvent()
     data class GenericNotice(val title: String, val message: String) : CapsEvent()
     data class HealthChanged(
         val status: LayerHealthStatus,
@@ -100,8 +109,11 @@ class CapabilityManager(
 
     companion object {
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
-        private val REQUESTED_CAPS = listOf(
+        val REQUESTED_CAPS = listOf(
             "EventQueueGet",
+            "InventoryAPIv3",
+            "LibraryAPIv3",
+            "IncrementCOFVersion",
             "FetchInventoryDescendents2",
             "FetchInventory2",
             "ViewerAsset",
@@ -114,9 +126,16 @@ class CapabilityManager(
             "UpdateAvatarAppearance",
             "AttachmentResources",
             "UpdateAgentInformation",
+            "GroupAPIv1",
+            "GroupMemberData",
             "ChatSessionRequest",
             "MapLayer",
-            "EnvironmentSettings"
+            "EnvironmentSettings",
+            "SimulatorFeatures",
+            "UpdateNotecardAgentInventory",
+            "UpdateNotecardTaskInventory",
+            "CopyInventoryFromNotecard",
+            "ParcelPropertiesUpdate"
         )
 
         /**
@@ -495,9 +514,7 @@ class CapabilityManager(
                                 val parsed = LlsdCodec.parseXml(resp.body?.string().orEmpty())
                                 val idVal = parsed["id"]
                                 if (idVal is LlsdValue.IntVal) ackId = idVal.value
-                                parsed["events"].asList().forEach { evt ->
-                                    runCatching { dispatchCapsEvent(evt["message"].asString(), evt["body"]) }
-                                }
+                                dispatchEventQueuePayload(parsed)
                             }
                             resp.code == 502 || resp.code == 504 -> {
                                 // Normal SL/OpenSim EventQueueGet long-poll timeout (no events within 30s)
@@ -553,8 +570,31 @@ class CapabilityManager(
         }
     }
 
+    internal fun dispatchEventQueuePayload(parsed: LlsdValue) {
+        parsed["events"].asList().forEach { evt ->
+            runCatching { dispatchCapsEvent(evt["message"].asString(), evt["body"]) }
+        }
+    }
+
+    internal fun dispatchEventQueuePayloadForTesting(xml: String) {
+        val parsed = LlsdCodec.parseXml(xml)
+        dispatchEventQueuePayload(parsed)
+    }
+
     private fun dispatchCapsEvent(message: String, body: LlsdValue) {
         when (message) {
+            "AgentGroupDataUpdate" -> {
+                val agentDataNode = body["AgentData"]
+                val agentBlock = when (agentDataNode) {
+                    is LlsdValue.ArrayVal -> agentDataNode.items.firstOrNull()
+                    is LlsdValue.MapVal -> agentDataNode
+                    else -> null
+                }
+                val agentId = agentBlock?.let { firstUuid(it, "AgentID", "agent_id") }
+                    ?: firstUuid(body, "AgentID", "agent_id")
+                val groups = WorldManagementPackets.parseAgentGroupDataUpdateLlsd(body)
+                _capsEvents.tryEmit(CapsEvent.AgentGroupDataUpdate(agentId = agentId, groups = groups))
+            }
             "TeleportFinish" -> {
                 val info = body["Info"].asList().firstOrNull() ?: return
                 val seed = info["SeedCapability"].asString()
@@ -704,6 +744,234 @@ class CapabilityManager(
             }
             emptyList()
         }
+
+    /**
+     * Two-stage Second Life `UpdateNotecardAgentInventory` (or `UpdateNotecardTaskInventory`)
+     * Seed CAP upload:
+     * 1. POST LLSD XML `{ item_id: <uuid> }` to capability URL to obtain `uploader` URL.
+     * 2. POST `Linden text version 2` payload (`application/vnd.ll.notecard`) to `uploader` URL
+     *    and parse `{ state: "complete", new_asset: <uuid> }`.
+     */
+    suspend fun updateNotecardAgentInventory(
+        itemId: UUID,
+        bodyText: String,
+        taskId: UUID? = null
+    ): NotecardUploadResult = withContext(Dispatchers.IO) {
+        val capName = if (taskId == null) {
+            NotecardCapProtocol.CAP_UPDATE_NOTECARD_AGENT
+        } else {
+            NotecardCapProtocol.CAP_UPDATE_NOTECARD_TASK
+        }
+        val capUrl = capabilities[capName]
+            ?: return@withContext NotecardUploadResult(
+                success = false,
+                newAssetId = null,
+                statusMessage = "Capability $capName not negotiated on region"
+            )
+
+        try {
+            val initXml = NotecardCapProtocol.buildRequestXml(itemId = itemId, taskId = taskId)
+            val initReq = Request.Builder()
+                .url(capUrl)
+                .header("Accept", "application/llsd+xml")
+                .post(initXml.toRequestBody(LLSD_XML_MEDIA))
+                .build()
+
+            val uploaderUrl = httpClient.newCall(initReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return@withContext NotecardUploadResult(
+                        success = false,
+                        newAssetId = null,
+                        statusMessage = "Notecard uploader init HTTP ${resp.code}"
+                    )
+                }
+                val xml = resp.body?.string().orEmpty()
+                NotecardCapProtocol.parseUploaderUrl(xml, lastSeedUrl.ifBlank { capUrl })
+            } ?: return@withContext NotecardUploadResult(
+                success = false,
+                newAssetId = null,
+                statusMessage = "Missing uploader URL in $capName reply"
+            )
+
+            val notecardBytes = LindenNotecardCodec.encode(bodyText)
+            val uploadMedia = LindenNotecardCodec.MIME_TYPE.toMediaType()
+            val uploadReq = Request.Builder()
+                .url(uploaderUrl)
+                .header("Accept", "application/llsd+xml")
+                .post(notecardBytes.toRequestBody(uploadMedia))
+                .build()
+
+            httpClient.newCall(uploadReq).execute().use { uploadResp ->
+                if (!uploadResp.isSuccessful) {
+                    return@withContext NotecardUploadResult(
+                        success = false,
+                        newAssetId = null,
+                        statusMessage = "Notecard asset upload HTTP ${uploadResp.code}"
+                    )
+                }
+                NotecardCapProtocol.parseUploadReply(uploadResp.body?.string().orEmpty())
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val classified = NetworkResilience.classifyException(ProtocolLayer.CAPS_SEED, capName, e)
+            _capsEvents.tryEmit(
+                CapsEvent.CapsError(
+                    classified.layer,
+                    classified.category,
+                    classified.userMessage,
+                    classified.technicalDetail
+                )
+            )
+            NotecardUploadResult(
+                success = false,
+                newAssetId = null,
+                statusMessage = classified.userMessage
+            )
+        }
+    }
+
+    /**
+     * Increments the simulator Current Outfit Folder (COF) version via `IncrementCOFVersion`
+     * HTTP GET capability (`indra/newview/llappearancemgr.cpp`).
+     */
+    suspend fun incrementCofVersion(): Pair<Boolean, Int?> = withContext(Dispatchers.IO) {
+        val capUrl = capabilities[Ais3OutfitProtocol.CAP_INCREMENT_COF_VERSION]
+            ?: return@withContext false to null
+        val req = Request.Builder()
+            .url(capUrl)
+            .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+            .header("Accept", "application/llsd+xml, text/xml")
+            .get()
+            .build()
+        try {
+            httpClient.newCall(req).execute().use { resp ->
+                if (!resp.isSuccessful) return@withContext false to null
+                val raw = resp.body?.string().orEmpty()
+                val parsed = runCatching { LlsdCodec.parseXml(raw) }.getOrNull()
+                val ver = parsed?.let { Ais3OutfitProtocol.parseCofVersion(it) }
+                true to ver
+            }
+        } catch (e: CancellationException) {
+            throw e
+        } catch (_: Exception) {
+            false to null
+        }
+    }
+
+    /**
+     * Saves an outfit and updates Current Outfit Folder (`FT_CURRENT_OUTFIT`) symbolic links
+     * via Second Life AISv3 (`InventoryAPIv3` + `IncrementCOFVersion` per `llaisapi.cpp`).
+     */
+    suspend fun saveOutfitViaAis3(plan: OutfitSavePlan): Ais3OutfitSaveResult = withContext(Dispatchers.IO) {
+        val aisBase = capabilities[Ais3OutfitProtocol.CAP_INVENTORY_API_V3]?.trimEnd('/')
+            ?: return@withContext Ais3OutfitSaveResult(
+                success = false,
+                usedAis3 = false,
+                outfitFolderId = plan.outfitFolderId,
+                statusMessage = "Capability ${Ais3OutfitProtocol.CAP_INVENTORY_API_V3} not negotiated"
+            )
+
+        try {
+            val createCatUrl = "$aisBase/category/${plan.parentMyOutfitsId}?tid=${UUID.randomUUID()}"
+            val createCatXml = Ais3OutfitProtocol.buildCreateOutfitCategoryXml(plan)
+            val createCatReq = Request.Builder()
+                .url(createCatUrl)
+                .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                .header("Accept", "application/llsd+xml")
+                .post(createCatXml.toRequestBody(LLSD_XML_MEDIA))
+                .build()
+
+            var resolvedOutfitId = plan.outfitFolderId
+            val createdLinks = mutableListOf<UUID>()
+
+            httpClient.newCall(createCatReq).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    return@withContext Ais3OutfitSaveResult(
+                        success = false,
+                        usedAis3 = false,
+                        outfitFolderId = plan.outfitFolderId,
+                        statusMessage = "AISv3 category creation HTTP ${resp.code}"
+                    )
+                }
+                val parsed = runCatching { LlsdCodec.parseXml(resp.body?.string().orEmpty()) }.getOrNull()
+                if (parsed != null) {
+                    Ais3OutfitProtocol.parseEmbeddedCategoryId(parsed)?.let { resolvedOutfitId = it }
+                    createdLinks += Ais3OutfitProtocol.parseEmbeddedLinkIds(parsed)
+                }
+            }
+
+            val cofId = plan.currentOutfitFolderId
+            if (cofId != null) {
+                val cofLinks = plan.linksToCreate.filter { it.targetFolderId == cofId }
+                if (cofLinks.isNotEmpty()) {
+                    val cofUrl = "$aisBase/category/$cofId?tid=${UUID.randomUUID()}"
+                    val cofXml = Ais3OutfitProtocol.buildCreateLinksXml(
+                        links = cofLinks,
+                        outfitFolderIdOverride = resolvedOutfitId
+                    )
+                    val cofReq = Request.Builder()
+                        .url(cofUrl)
+                        .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                        .header("Accept", "application/llsd+xml")
+                        .post(cofXml.toRequestBody(LLSD_XML_MEDIA))
+                        .build()
+
+                    httpClient.newCall(cofReq).execute().use { cofResp ->
+                        if (!cofResp.isSuccessful) {
+                            return@withContext Ais3OutfitSaveResult(
+                                success = false,
+                                usedAis3 = false,
+                                outfitFolderId = resolvedOutfitId,
+                                statusMessage = "AISv3 COF link update HTTP ${cofResp.code}"
+                            )
+                        }
+                        val parsed = runCatching { LlsdCodec.parseXml(cofResp.body?.string().orEmpty()) }.getOrNull()
+                        if (parsed != null) {
+                            createdLinks += Ais3OutfitProtocol.parseEmbeddedLinkIds(parsed)
+                        }
+                    }
+                }
+            }
+
+            val (cofInc, cofVer) = if (hasCapability(Ais3OutfitProtocol.CAP_INCREMENT_COF_VERSION)) {
+                incrementCofVersion()
+            } else {
+                false to null
+            }
+
+            val verSuffix = cofVer?.let { " • COF v$it" }.orEmpty()
+            Ais3OutfitSaveResult(
+                success = true,
+                usedAis3 = true,
+                outfitFolderId = resolvedOutfitId,
+                createdLinkIds = createdLinks,
+                cofVersion = cofVer,
+                cofVersionIncremented = cofInc,
+                statusMessage = "Saved outfit '${plan.outfitName}' via AISv3$verSuffix"
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            val classified = NetworkResilience.classifyException(
+                ProtocolLayer.CAPS_SEED,
+                Ais3OutfitProtocol.CAP_INVENTORY_API_V3,
+                e
+            )
+            Ais3OutfitSaveResult(
+                success = false,
+                usedAis3 = false,
+                outfitFolderId = plan.outfitFolderId,
+                statusMessage = classified.userMessage
+            )
+        }
+    }
+
+    fun hasCapability(name: String): Boolean = capabilities.containsKey(name)
+
+    fun registerCapabilityUrl(name: String, url: String) {
+        capabilities[name] = url
+    }
 
     fun getCapabilityUrl(name: String): String? = capabilities[name]
 
