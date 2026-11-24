@@ -1,5 +1,12 @@
 package com.example.linkpoint.scene
 
+import com.example.linkpoint.render.BlendedJointPose
+import com.example.linkpoint.render.FlexibleParams
+import com.example.linkpoint.render.LightParams
+import com.example.linkpoint.render.PartDataConfig
+import com.example.linkpoint.render.PbrMaterialChannelTransforms
+import com.example.linkpoint.render.PlayingAvatarAnimation
+import com.example.linkpoint.render.SculptParams
 import java.util.UUID
 import kotlin.math.cos
 import kotlin.math.sin
@@ -34,6 +41,12 @@ data class Quat(val x: Float = 0f, val y: Float = 0f, val z: Float = 0f, val w: 
         z = w * o.z + x * o.y - y * o.x + z * o.w,
         w = w * o.w - x * o.x - y * o.y - z * o.z
     )
+
+    /**
+     * Second Life `LLQuaternion::operator*` row-vector multiplication (`other * this` in Hamilton order):
+     * applies rotation `this` first, followed by `other`.
+     */
+    fun multiplyLinden(other: Quat): Quat = other * this
 
     fun rotate(v: Vec3): Vec3 {
         val len = sqrt(x * x + y * y + z * z + w * w)
@@ -247,9 +260,20 @@ data class SceneObject(
     val isCapsTransform: Boolean = false,
     val parentAttachmentOffset: Vec3? = null,
     val parentAttachmentRotation: Quat? = null,
-    val hudButtons: List<HudFaceButton> = emptyList()
+    val hudButtons: List<HudFaceButton> = emptyList(),
+    val crc: Int = 0,
+    val updateFlags: Int = 0,
+    val itemId: UUID? = null,
+    val renderMaterialIds: Map<Int, UUID> = emptyMap(),
+    val partData: PartDataConfig? = null,
+    val flexibleParams: FlexibleParams? = null,
+    val lightParams: LightParams? = null,
+    val sculptParams: SculptParams? = null,
+    val pbrChannelTransforms: PbrMaterialChannelTransforms = PbrMaterialChannelTransforms.IDENTITY
 ) {
     val isHudAttachment: Boolean get() = attachmentPoint in 31..38
+    val isSculptedPrim: Boolean get() = sculptParams?.isSculptedPrim == true
+    val isFlexiblePrim: Boolean get() = flexibleParams != null
     val isAvatarBodyAttachment: Boolean get() =
         (parentId != 0 || attachedAvatarId != null) && attachmentPoint in 1..56 && attachmentPoint !in 31..38
 }
@@ -286,7 +310,9 @@ data class AvatarEntity(
     val profileImageId: UUID? = null,
     val partnerId: UUID? = null,
     val isOnline: Boolean = true,
-    val profileLoaded: Boolean = false
+    val profileLoaded: Boolean = false,
+    val playingAnimations: List<PlayingAvatarAnimation> = emptyList(),
+    val jointPoses: Map<String, BlendedJointPose> = emptyMap()
 )
 
 /**

@@ -25,11 +25,19 @@ object LludpPackets {
     const val MSG_LAYER_DATA: Int = 11
     const val MSG_OBJECT_UPDATE: Int = 12
     const val MSG_OBJECT_UPDATE_COMPRESSED: Int = 13
+    const val MSG_OBJECT_UPDATE_CACHED: Int = 14
     const val MSG_IMPROVED_TERSE_OBJECT_UPDATE: Int = 15
     const val MSG_KILL_OBJECT: Int = 16
+    const val MSG_AVATAR_ANIMATION: Int = 20
+    const val MSG_OBJECT_ANIMATION: Int = 30
 
     // Medium frequency message IDs (0xFF + 1 byte)
+    const val MSG_REQUEST_MULTIPLE_OBJECTS: Int = 0xFF03
     const val MSG_COARSE_LOCATION_UPDATE: Int = 0xFF06
+
+    // RequestMultipleObjects CacheMissType values (message_template.msg)
+    const val CACHE_MISS_TYPE_FULL: Int = 0
+    const val CACHE_MISS_TYPE_CRC: Int = 1
 
     // Low frequency message IDs (0xFFFF + 2 bytes)
     const val MSG_USE_CIRCUIT_CODE: Int = 0xFFFF0003.toInt()
@@ -87,6 +95,29 @@ object LludpPackets {
         val messageId: Int,
         val payload: ByteBuffer,
         val acks: List<Int>
+    )
+
+    data class CachedObjectCheckEntry(
+        val localId: Int,
+        val crc: Int,
+        val updateFlags: Int
+    )
+
+    data class DecodedObjectUpdateCached(
+        val regionHandle: Long,
+        val timeDilation: Int,
+        val objects: List<CachedObjectCheckEntry>
+    )
+
+    data class ObjectCacheMissRequest(
+        val localId: Int,
+        val cacheMissType: Int = CACHE_MISS_TYPE_FULL
+    )
+
+    data class DecodedRequestMultipleObjects(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val requests: List<ObjectCacheMissRequest>
     )
 
     data class ParsedRegionHandshake(
@@ -233,14 +264,15 @@ object LludpPackets {
         messageId: Int,
         body: ByteArray,
         acks: List<Int> = emptyList(),
-        useZeroCoding: Boolean = false
+        useZeroCoding: Boolean = false,
+        forceZeroCoding: Boolean = false
     ): ByteArray {
         val rawMsg = ByteArrayOutputStream(body.size + 4)
         when {
             (messageId and 0xFFFFFF00.toInt()) == 0 -> {
                 rawMsg.write(messageId and 0xFF)
             }
-            (messageId and 0xFFFF0000.toInt()) == 0x0000FF00 -> {
+            (messageId and 0xFFFFFF00.toInt()) == 0x0000FF00 -> {
                 rawMsg.write(0xFF)
                 rawMsg.write(messageId and 0xFF)
             }
@@ -253,8 +285,9 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        val shouldZeroCode = useZeroCoding || forceZeroCoding
+        val encoded = if (shouldZeroCode) zeroEncode(msgBytes) else msgBytes
+        val actuallyZeroCoded = forceZeroCoding || (useZeroCoding && encoded.size < msgBytes.size)
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0
@@ -605,6 +638,145 @@ object LludpPackets {
         putUuid(buf, sessionId)
         putUuid(buf, targetAvatarId)
         return buf.array()
+    }
+
+    /**
+     * Decodes `ObjectUpdateCached` (`High 14` = `0x0E`, `Trusted`, `Unencoded`):
+     * - `RegionData Single`: `RegionHandle` (U64 LE), `TimeDilation` (U16 LE)
+     * - `ObjectData Variable` (U8 count): `[ID (U32 LE), CRC (U32 LE), UpdateFlags (U32 LE)] * count`
+     */
+    fun parseObjectUpdateCached(buf: ByteBuffer): DecodedObjectUpdateCached? {
+        if (buf.remaining() < 11) return null
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        val regionHandle = buf.long
+        val timeDilation = buf.short.toInt() and 0xFFFF
+        val count = buf.get().toInt() and 0xFF
+        val entries = ArrayList<CachedObjectCheckEntry>(count)
+        repeat(count) {
+            if (buf.remaining() < 12) return null
+            val localId = buf.int
+            val crc = buf.int
+            val updateFlags = buf.int
+            entries.add(CachedObjectCheckEntry(localId = localId, crc = crc, updateFlags = updateFlags))
+        }
+        return DecodedObjectUpdateCached(
+            regionHandle = regionHandle,
+            timeDilation = timeDilation,
+            objects = entries
+        )
+    }
+
+    /**
+     * Builds an unencoded `ObjectUpdateCached` (`High 14` = `0x0E`) message body.
+     */
+    fun buildObjectUpdateCached(
+        regionHandle: Long,
+        timeDilation: Int,
+        objects: List<CachedObjectCheckEntry>
+    ): ByteArray {
+        val capped = objects.take(255)
+        val buf = ByteBuffer.allocate(8 + 2 + 1 + capped.size * 12).order(ByteOrder.LITTLE_ENDIAN)
+        buf.putLong(regionHandle)
+        buf.putShort((timeDilation and 0xFFFF).toShort())
+        buf.put(capped.size.toByte())
+        for (entry in capped) {
+            buf.putInt(entry.localId)
+            buf.putInt(entry.crc)
+            buf.putInt(entry.updateFlags)
+        }
+        return buf.array()
+    }
+
+    /**
+     * Frames an `Unencoded` (`FLAG_ZEROCODED` cleared) `ObjectUpdateCached` (`High 14` = `0x0E`) UDP packet
+     * per `indra/llmessage/message_template.msg`.
+     */
+    fun frameObjectUpdateCachedPacket(
+        sequenceNumber: Int,
+        regionHandle: Long,
+        timeDilation: Int,
+        objects: List<CachedObjectCheckEntry>,
+        acks: List<Int> = emptyList(),
+        reliable: Boolean = false
+    ): ByteArray {
+        val body = buildObjectUpdateCached(regionHandle, timeDilation, objects)
+        return framePacket(
+            sequenceNumber = sequenceNumber,
+            reliable = reliable,
+            messageId = MSG_OBJECT_UPDATE_CACHED,
+            body = body,
+            acks = acks,
+            useZeroCoding = false,
+            forceZeroCoding = false
+        )
+    }
+
+    /**
+     * Builds `RequestMultipleObjects` (`Medium 3` = `0xFF03`, `NotTrusted`, `Zerocoded`) message body:
+     * - `AgentData Single`: `AgentID` (16B UUID), `SessionID` (16B UUID)
+     * - `ObjectData Variable` (U8 count, max 255): `[CacheMissType (U8), ID (U32 LE)] * count`
+     */
+    fun buildRequestMultipleObjects(
+        agentId: UUID,
+        sessionId: UUID,
+        misses: List<ObjectCacheMissRequest>
+    ): ByteArray {
+        val capped = misses.take(255)
+        val buf = ByteBuffer.allocate(16 + 16 + 1 + capped.size * 5).order(ByteOrder.LITTLE_ENDIAN)
+        putUuid(buf, agentId)
+        putUuid(buf, sessionId)
+        buf.put(capped.size.toByte())
+        for (miss in capped) {
+            buf.put((miss.cacheMissType and 0xFF).toByte())
+            buf.putInt(miss.localId)
+        }
+        return buf.array()
+    }
+
+    /**
+     * Frames a complete reliable + `Zerocoded` (`FLAG_ZEROCODED = 0x80`) `RequestMultipleObjects` (`0xFF03`) UDP packet.
+     */
+    fun frameRequestMultipleObjectsPacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        misses: List<ObjectCacheMissRequest>,
+        acks: List<Int> = emptyList(),
+        reliable: Boolean = true
+    ): ByteArray {
+        val body = buildRequestMultipleObjects(agentId, sessionId, misses)
+        return framePacket(
+            sequenceNumber = sequenceNumber,
+            reliable = reliable,
+            messageId = MSG_REQUEST_MULTIPLE_OBJECTS,
+            body = body,
+            acks = acks,
+            useZeroCoding = true,
+            forceZeroCoding = true
+        )
+    }
+
+    /**
+     * Decodes a `RequestMultipleObjects` (`0xFF03`) payload (after `decodePacket` zero-decoding).
+     */
+    fun parseRequestMultipleObjects(buf: ByteBuffer): DecodedRequestMultipleObjects? {
+        if (buf.remaining() < 33) return null
+        buf.order(ByteOrder.LITTLE_ENDIAN)
+        val agentId = readUuid(buf)
+        val sessionId = readUuid(buf)
+        val count = buf.get().toInt() and 0xFF
+        val requests = ArrayList<ObjectCacheMissRequest>(count)
+        repeat(count) {
+            if (buf.remaining() < 5) return null
+            val missType = buf.get().toInt() and 0xFF
+            val localId = buf.int
+            requests.add(ObjectCacheMissRequest(localId = localId, cacheMissType = missType))
+        }
+        return DecodedRequestMultipleObjects(
+            agentId = agentId,
+            sessionId = sessionId,
+            requests = requests
+        )
     }
 
     // --- Binary Helpers ---

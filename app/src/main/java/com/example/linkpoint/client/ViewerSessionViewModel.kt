@@ -33,9 +33,12 @@ import com.example.linkpoint.protocol.LoginRequestParams
 import com.example.linkpoint.protocol.NetworkErrorCategory
 import com.example.linkpoint.protocol.NetworkResilience
 import com.example.linkpoint.protocol.SimEvent
+import com.example.linkpoint.protocol.SignaledAnimation
 import com.example.linkpoint.protocol.SlBinaryParsers
 import com.example.linkpoint.protocol.XmlRpcLoginClient
+import com.example.linkpoint.render.LindenAnimBinaryDecoder
 import com.example.linkpoint.render.LinkpointGlRenderer
+import com.example.linkpoint.render.PlayingAvatarAnimation
 import com.example.linkpoint.render.RenderSceneSnapshot
 import com.example.linkpoint.scene.AvatarEntity
 import com.example.linkpoint.scene.AvatarHudSlotState
@@ -126,6 +129,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     @Volatile private var lastUiPosSyncMs = 0L
     private val pressedMoveKeys = ConcurrentHashMap.newKeySet<Int>()
     private val requestedProfiles = ConcurrentHashMap.newKeySet<UUID>()
+    private val sessionStartNs = System.nanoTime()
     private var simLoopJob: Job? = null
 
     private data class LoginAttemptSpec(
@@ -219,12 +223,31 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         appendImMessage(evt.imSessionId, evt.fromAgentId, evt.fromName, evt.fromName, evt.message)
                     }
                     is SimEvent.ObjectUpdated -> {
-                        val obj = mergeIncomingObjectWithCaps(evt.sceneObject)
+                        var obj = mergeIncomingObjectWithCaps(evt.sceneObject)
+                        val cachedMat = obj.renderMaterialIds.values.firstNotNullOfOrNull { assetManager.getCachedGltfMaterial(it) }
+                        if (cachedMat != null && obj.pbrChannelTransforms === com.example.linkpoint.render.PbrMaterialChannelTransforms.IDENTITY) {
+                            obj = obj.copy(pbrChannelTransforms = cachedMat)
+                        }
                         // Prioritize any attachment root OR child prim (linkset children frequently carry rigged mesh bodies/heads/hair!)
                         val isAvatarPriority = obj.parentId != 0 || obj.isAvatarBodyAttachment || obj.isHudAttachment
-                        obj.meshAssetId?.let { assetManager.requestMesh(it, highPriority = isAvatarPriority) }
-                        obj.defaultTextureId?.let { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
-                        obj.faceTextures.values.forEach { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
+                        val distinctItemId = obj.itemId
+                        obj.meshAssetId?.let { assetManager.requestMesh(it, highPriority = isAvatarPriority, itemId = distinctItemId) }
+                        obj.defaultTextureId?.let { assetManager.requestTexture(it, highPriority = isAvatarPriority, itemId = distinctItemId) }
+                        obj.faceTextures.values.forEach { assetManager.requestTexture(it, highPriority = isAvatarPriority, itemId = distinctItemId) }
+                        obj.partData?.textureId?.let { assetManager.requestParticleTexture(it, itemId = distinctItemId) }
+                        obj.sculptParams?.takeIf { it.isSculptedPrim }?.sculptTextureId?.let {
+                            assetManager.requestSculptMap(it, highPriority = isAvatarPriority, itemId = distinctItemId)
+                        }
+                        obj.renderMaterialIds.values.forEach { matAssetId ->
+                            assetManager.requestGltfMaterial(matAssetId, itemId = distinctItemId)
+                        }
+                        listOfNotNull(
+                            obj.pbrChannelTransforms.baseColorTextureId,
+                            obj.pbrChannelTransforms.normalTextureId,
+                            obj.pbrChannelTransforms.metallicRoughnessTextureId,
+                            obj.pbrChannelTransforms.occlusionTextureId,
+                            obj.pbrChannelTransforms.emissiveTextureId
+                        ).distinct().forEach { assetManager.requestTexture(it, highPriority = isAvatarPriority, itemId = distinctItemId) }
 
                         allSceneObjects[obj.localId] = obj
                         pushSceneSnapshot()
@@ -455,6 +478,18 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         )
                         pushSceneSnapshot()
                     }
+                    is SimEvent.AvatarAnimationReceived -> {
+                        evt.animations.forEach { assetManager.requestAnimation(it.animId) }
+                        val targetAv = avatars[evt.senderId]
+                            ?: avatars.values.firstOrNull { av -> allSceneObjects[av.localId]?.uuid == evt.senderId }
+                        if (targetAv != null) {
+                            val nowSec = sessionElapsedSec()
+                            val updatedPlaying = reconcileSignaledAnimations(targetAv.playingAnimations, evt.animations, nowSec)
+                            avatars[targetAv.agentId] = targetAv.copy(playingAnimations = updatedPlaying)
+                            recomputeAvatarAnimations(targetAv.agentId, nowSec)
+                            pushSceneSnapshot()
+                        }
+                    }
                     is SimEvent.UuidNamesResolved -> {
                         evt.names.forEach { (id, name) ->
                             knownNames[id] = name
@@ -477,6 +512,11 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             refreshNearbyRadar()
                         }
                         pushSceneSnapshot()
+                    }
+                    is SimEvent.ObjectCacheMissRequested -> {
+                        appendDiagnostic(
+                            "[LLUDP] ObjectUpdateCached miss -> RequestMultipleObjects (0xFF03) for ${evt.misses.size} prim(s)"
+                        )
                     }
                     is SimEvent.ObjectPropertiesReceived -> {
                         allSceneObjects.values.firstOrNull { it.uuid == evt.objectId }?.let { existing ->
@@ -604,6 +644,37 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     is AssetStreamEvent.TextureReady -> {
                         renderer.putStreamedTexture(evt.textureId, evt.bitmap)
                         _state.update { it.copy(textureRevision = it.textureRevision + 1) }
+                    }
+                    is AssetStreamEvent.AnimationReady -> {
+                        val nowSec = sessionElapsedSec()
+                        var changed = false
+                        for (agentId in avatars.keys.toList()) {
+                            val av = avatars[agentId] ?: continue
+                            if (av.playingAnimations.any { it.animId == evt.animId }) {
+                                if (recomputeAvatarAnimations(agentId, nowSec)) changed = true
+                            }
+                        }
+                        if (changed) pushSceneSnapshot()
+                    }
+                    is AssetStreamEvent.GltfMaterialReady -> {
+                        var changed = false
+                        for ((localId, obj) in allSceneObjects.entries.toList()) {
+                            if (obj.renderMaterialIds.values.contains(evt.materialId)) {
+                                val isPrio = obj.parentId != 0 || obj.isAvatarBodyAttachment || obj.isHudAttachment
+                                listOfNotNull(
+                                    evt.material.baseColorTextureId,
+                                    evt.material.normalTextureId,
+                                    evt.material.metallicRoughnessTextureId,
+                                    evt.material.occlusionTextureId,
+                                    evt.material.emissiveTextureId
+                                ).distinct().forEach {
+                                    assetManager.requestTexture(it, highPriority = isPrio, itemId = obj.itemId)
+                                }
+                                allSceneObjects[localId] = obj.copy(pbrChannelTransforms = evt.material)
+                                changed = true
+                            }
+                        }
+                        if (changed) pushSceneSnapshot()
                     }
                     is AssetStreamEvent.DisplayNamesResolved -> {
                         evt.names.forEach { (id, name) ->
@@ -1550,6 +1621,20 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         }
                         if (tick % 60 == 0) refreshNearbyRadar()
                     }
+
+                    if (tick % 2 == 0 && avatars.values.any { it.playingAnimations.isNotEmpty() }) {
+                        val nowSec = sessionElapsedSec()
+                        var animUpdated = false
+                        for (agentId in avatars.keys.toList()) {
+                            val av = avatars[agentId] ?: continue
+                            if (av.playingAnimations.isNotEmpty()) {
+                                if (recomputeAvatarAnimations(agentId, nowSec)) animUpdated = true
+                            }
+                        }
+                        if (animUpdated && !moved) {
+                            pushSceneSnapshot(syncUiState = false)
+                        }
+                    }
                 }
                 tick++
                 delay(16)
@@ -2014,7 +2099,15 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     _state.update { s ->
                         val existingIds = s.inventoryEntries.map { it.id }.toSet()
                         val newNodes = fetched.filterNot { it.itemId in existingIds }.map {
-                            InventoryEntry(it.itemId, it.parentId, it.name, false, it.assetType)
+                            InventoryEntry(
+                                id = it.itemId,
+                                parentId = it.parentId,
+                                name = it.name,
+                                isFolder = false,
+                                assetType = it.assetType,
+                                assetId = it.assetId,
+                                inventoryType = it.inventoryType
+                            )
                         }
                         s.copy(inventoryEntries = s.inventoryEntries + newNodes)
                     }
@@ -2035,12 +2128,13 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
 
         // Reflect HUD attachment immediately in the Pass-2 OpenGL HUD layer
         if (slot in 31..38) {
-            val existingHud = manualHudAttachments.values.firstOrNull { it.uuid == itemId }
+            val existingHud = manualHudAttachments.values.firstOrNull { it.itemId == itemId || it.uuid == itemId }
             if (nextWorn && existingHud == null) {
                 val id = 9100 + slot
                 manualHudAttachments[id] = SceneObject(
                     localId = id,
-                    uuid = itemId,
+                    uuid = UUID.nameUUIDFromBytes("hud-object:$itemId".toByteArray()),
+                    itemId = itemId,
                     name = entry.name,
                     description = "Attached from Inventory to Slot $slot",
                     attachmentPoint = slot,
@@ -2162,6 +2256,67 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     private fun isPlausibleJointLocalOffset(pos: Vec3): Boolean =
         kotlin.math.abs(pos.x) <= 16f && kotlin.math.abs(pos.y) <= 16f && kotlin.math.abs(pos.z) <= 16f
 
+    private fun sessionElapsedSec(): Float =
+        ((System.nanoTime() - sessionStartNs) / 1_000_000_000.0).toFloat()
+
+    private fun reconcileSignaledAnimations(
+        existing: List<PlayingAvatarAnimation>,
+        signaled: List<SignaledAnimation>,
+        nowSec: Float
+    ): List<PlayingAvatarAnimation> {
+        val next = ArrayList<PlayingAvatarAnimation>(signaled.size + existing.size)
+        val matchedExistingIndices = HashSet<Int>()
+        for (sig in signaled) {
+            val idx = existing.indexOfFirst {
+                it.animId == sig.animId && it.sequenceId == sig.sequenceId && it.stoppedAtSec == null
+            }.takeIf { it >= 0 } ?: existing.indexOfFirst {
+                it.animId == sig.animId && it.stoppedAtSec == null
+            }
+            if (idx >= 0) {
+                matchedExistingIndices.add(idx)
+                next.add(existing[idx].copy(sequenceId = sig.sequenceId, stoppedAtSec = null))
+            } else {
+                next.add(
+                    PlayingAvatarAnimation(
+                        animId = sig.animId,
+                        sequenceId = sig.sequenceId,
+                        startedAtSec = nowSec
+                    )
+                )
+            }
+        }
+        existing.forEachIndexed { idx, prev ->
+            if (!matchedExistingIndices.contains(idx)) {
+                if (prev.stoppedAtSec == null) {
+                    next.add(prev.copy(stoppedAtSec = nowSec))
+                } else if (nowSec - prev.stoppedAtSec < 3.0f) {
+                    next.add(prev)
+                }
+            }
+        }
+        return next
+    }
+
+    private fun recomputeAvatarAnimations(agentId: UUID, nowSec: Float): Boolean {
+        val av = avatars[agentId] ?: return false
+        if (av.playingAnimations.isEmpty()) {
+            if (av.jointPoses.isEmpty()) return false
+            avatars[agentId] = av.copy(jointPoses = emptyMap())
+            return true
+        }
+        val animAssets = assetManager.snapshotAnimations()
+        val pruned = av.playingAnimations.filter { playing ->
+            val stopped = playing.stoppedAtSec ?: return@filter true
+            val asset = animAssets[playing.animId]
+            val maxEaseOut = (asset?.easeOutTime ?: 0.5f).coerceAtLeast(0.05f) + 0.05f
+            nowSec - stopped <= maxEaseOut
+        }
+        val poses = LindenAnimBinaryDecoder.blendAnimations(pruned, animAssets, nowSec)
+        if (pruned == av.playingAnimations && poses == av.jointPoses) return false
+        avatars[agentId] = av.copy(playingAnimations = pruned, jointPoses = poses)
+        return true
+    }
+
     private fun mergeIncomingObjectWithCaps(incoming: SceneObject): SceneObject {
         val caps = capsAttachmentOverridesByUuid[incoming.uuid]
             ?: capsAttachmentOverridesByLocalId[incoming.localId]
@@ -2202,6 +2357,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             position = resolvedPos,
             rotation = resolvedRot,
             scale = caps.scale ?: base.scale,
+            itemId = caps.itemId ?: base.itemId,
             meshAssetId = caps.meshAssetId ?: base.meshAssetId,
             isMesh = base.isMesh || caps.meshAssetId != null,
             attachmentPoint = resolvedAttachPoint,
@@ -2215,19 +2371,24 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         for (upd in updates) {
             upd.objectId?.let { capsAttachmentOverridesByUuid[it] = upd }
             if (upd.localId != 0) capsAttachmentOverridesByLocalId[upd.localId] = upd
-            upd.meshAssetId?.let { assetManager.requestMesh(it, highPriority = true) }
+            upd.meshAssetId?.let { assetManager.requestMesh(it, highPriority = true, itemId = upd.itemId) }
+            upd.sculptTextureId?.let { assetManager.requestSculptMap(it, highPriority = true, itemId = upd.itemId) }
+            upd.particleTextureId?.let { assetManager.requestParticleTexture(it, itemId = upd.itemId) }
+            upd.animAssetId?.let { assetManager.requestAnimation(it, itemId = upd.itemId) }
 
             val existing = (if (upd.localId != 0) allSceneObjects[upd.localId] else null)
                 ?: upd.objectId?.let { id -> allSceneObjects.values.firstOrNull { it.uuid == id } }
+                ?: upd.itemId?.let { iid -> allSceneObjects.values.firstOrNull { it.itemId == iid } }
 
             if (existing != null) {
                 allSceneObjects[existing.localId] = applyCapsToSceneObject(existing, upd, preferIncomingLocalOffsets = false)
             } else {
                 val targetAgentId = upd.agentId ?: selfAgentId
                 val targetAvatarLocalId = avatars[targetAgentId]?.localId ?: 0
+                val identitySeed = upd.objectId ?: upd.itemId
                 val effectiveLocalId = when {
                     upd.localId != 0 -> upd.localId
-                    upd.objectId != null -> -((upd.objectId.hashCode() and 0x3FFFFFFF) + 1)
+                    identitySeed != null -> -((identitySeed.hashCode() and 0x3FFFFFFF) + 1)
                     else -> continue
                 }
                 val effectiveParentId = if (upd.parentId != 0) upd.parentId else targetAvatarLocalId
@@ -2235,6 +2396,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 val obj = SceneObject(
                     localId = effectiveLocalId,
                     uuid = upd.objectId ?: UUID.randomUUID(),
+                    itemId = upd.itemId,
                     parentId = effectiveParentId,
                     name = upd.name?.takeIf { it.isNotBlank() } ?: SlBinaryParsers.attachmentPointName(pointId),
                     position = upd.positionOffset ?: Vec3(0f, 0f, 0f),
