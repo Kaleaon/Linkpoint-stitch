@@ -1,5 +1,6 @@
 package com.example.linkpoint.store
 
+import com.example.linkpoint.audio.AudioVoiceState
 import com.example.linkpoint.cache.GridConfigEntity
 import com.example.linkpoint.cache.LandmarkCacheEntity
 import com.example.linkpoint.cache.SavedAccountEntity
@@ -170,8 +171,11 @@ data class ViewerState(
     val expandedFolderIds: Set<UUID> = emptySet(),
     val mapRegions: List<MapRegionTile> = emptyList(),
     val scriptDialog: ScriptDialogPrompt? = null,
-    val toastMessage: String? = null
+    val toastMessage: String? = null,
+    val audioVoice: AudioVoiceState = AudioVoiceState()
 )
+
+typealias ViewerUiState = ViewerState
 
 /**
  * Computes the normalized unobstructed HudSafeRect [0..1] for OpenGL Avatar Attachment HUDs (slots 31..38)

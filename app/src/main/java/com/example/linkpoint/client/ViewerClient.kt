@@ -1,6 +1,8 @@
 package com.example.linkpoint.client
 
 import android.graphics.Bitmap
+import com.example.linkpoint.audio.AudioCategory
+import com.example.linkpoint.audio.SlVoiceWebRtcProtocol
 import com.example.linkpoint.cache.SavedAccountEntity
 import com.example.linkpoint.designsystem.AccentPreset
 import com.example.linkpoint.designsystem.DesignLanguage
@@ -113,4 +115,15 @@ interface ViewerClient {
     fun saveAsCustomPreset()
     fun loadCustomPreset()
     fun resetDesignToDefault()
+
+    // Phase 6: WebRTC Voice, Parcel Streams & Per-Category Audio Mixer
+    fun toggleAudioMixer() {}
+    fun toggleVoiceChannel() {}
+    fun toggleMicMuted() {}
+    fun setEarLocation(location: SlVoiceWebRtcProtocol.EarLocation) {}
+    fun toggleParcelMusicPlayback() {}
+    fun toggleMasterMute() {}
+    fun setAudioCategoryVolume(category: AudioCategory, volume: Float) {}
+    fun setVoiceParticipantVolume(agentId: UUID, volume: Float) {}
+    fun toggleVoiceParticipantMute(agentId: UUID) {}
 }
