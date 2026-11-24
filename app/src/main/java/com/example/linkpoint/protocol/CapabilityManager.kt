@@ -36,12 +36,17 @@ data class CapsAttachmentTransform(
 
 sealed class CapsEvent {
     data class TeleportFinish(val simIp: String, val simPort: Int, val seedCap: String, val regionHandle: Long) : CapsEvent()
+    data class SimulatorFeaturesUpdated(
+        val features: com.example.linkpoint.audio.SlVoiceWebRtcProtocol.SimulatorVoiceFeatures,
+        val rawFeatures: LlsdValue.MapVal
+    ) : CapsEvent()
     data class ParcelProperties(
         val parcelName: String,
         val parcelDesc: String,
         val localId: Int = 0,
         val musicUrl: String = "",
-        val mediaUrl: String = ""
+        val mediaUrl: String = "",
+        val sequenceId: Int = 0
     ) : CapsEvent()
     data class ParcelVoiceInfoUpdate(
         val info: com.example.linkpoint.audio.SlVoiceWebRtcProtocol.ParcelVoiceInfo
@@ -106,16 +111,19 @@ class CapabilityManager(
     private val capabilities = ConcurrentHashMap<String, String>()
     private var eventQueueJob: Job? = null
     @Volatile private var lastSeedUrl: String = ""
+    @Volatile private var cachedSimulatorFeatures: LlsdValue.MapVal? = null
 
     companion object {
+        const val CAP_SIMULATOR_FEATURES = "SimulatorFeatures"
         const val CAP_PROVISION_VOICE_ACCOUNT = "ProvisionVoiceAccountRequest"
         const val CAP_PARCEL_VOICE_INFO = "ParcelVoiceInfoRequest"
         const val CAP_VOICE_SIGNALING = "VoiceSignalingRequest"
         const val CAP_SL_VOICE_WEBRTC = "SLVoiceWebRTC"
 
         private val LLSD_XML_MEDIA = "application/llsd+xml; charset=utf-8".toMediaType()
-        private val REQUESTED_CAPS = listOf(
+        val REQUESTED_CAPS: List<String> = listOf(
             "EventQueueGet",
+            CAP_SIMULATOR_FEATURES,
             "FetchInventoryDescendents2",
             "FetchInventory2",
             "ViewerAsset",
@@ -136,6 +144,64 @@ class CapabilityManager(
             CAP_VOICE_SIGNALING,
             CAP_SL_VOICE_WEBRTC
         )
+
+        /**
+         * Parses an `EventQueueGet` LLSD `ParcelProperties` event body (`ParcelData` array/map or flat map),
+         * extracting `LocalID`, `SequenceID`, `Name`, `Desc`, `MusicURL`, and `MediaURL` (supporting LLSD
+         * `string`, `uri`, and UTF-8 `binary` representations).
+         */
+        fun parseCapsParcelProperties(body: LlsdValue): CapsEvent.ParcelProperties? {
+            val parcelNode = when (val pd = body["ParcelData"]) {
+                is LlsdValue.ArrayVal -> pd.items.firstOrNull() as? LlsdValue.MapVal
+                is LlsdValue.MapVal -> pd
+                else -> body as? LlsdValue.MapVal
+            } ?: return null
+
+            val recognizedKeys = setOf(
+                "LocalID", "local_id",
+                "Name", "name", "parcel_name",
+                "Desc", "desc",
+                "MusicURL", "music_url",
+                "MediaURL", "media_url",
+                "SequenceID", "sequence_id"
+            )
+            if (parcelNode.entries.keys.none { it in recognizedKeys }) return null
+
+            fun extractText(vararg keys: String): String {
+                for (key in keys) {
+                    val v = parcelNode.entries[key] ?: continue
+                    val raw = when (v) {
+                        is LlsdValue.Str -> v.value
+                        is LlsdValue.Uri -> v.value
+                        is LlsdValue.Binary -> {
+                            val n = v.bytes.indexOf(0.toByte()).let { if (it >= 0) it else v.bytes.size }
+                            String(v.bytes, 0, n, Charsets.UTF_8)
+                        }
+                        is LlsdValue.Undef -> continue
+                        else -> v.asString()
+                    }
+                    return raw.trim()
+                }
+                return ""
+            }
+
+            fun extractSignedInt(default: Int = 0, vararg keys: String): Int {
+                for (key in keys) {
+                    val v = parcelNode.entries[key] ?: continue
+                    if (v !is LlsdValue.Undef) return v.asInt(default)
+                }
+                return default
+            }
+
+            return CapsEvent.ParcelProperties(
+                parcelName = extractText("Name", "name", "parcel_name"),
+                parcelDesc = extractText("Desc", "desc", "description"),
+                localId = extractSignedInt(0, "LocalID", "local_id"),
+                musicUrl = extractText("MusicURL", "music_url"),
+                mediaUrl = extractText("MediaURL", "media_url"),
+                sequenceId = extractSignedInt(0, "SequenceID", "sequence_id")
+            )
+        }
 
         /**
          * Parses Second Life / OpenSimulator CAPS LLSD attachment payloads (EventQueueGet or HTTP CAPS)
@@ -269,6 +335,7 @@ class CapabilityManager(
         onAttemptStatus: suspend (attempt: Int, maxAttempts: Int, detail: String) -> Unit = { _, _, _ -> }
     ): CapsNegotiationResult = withContext(Dispatchers.IO) {
         capabilities.clear()
+        cachedSimulatorFeatures = null
         lastSeedUrl = seedUrl.trim()
         val diagnostics = mutableListOf<String>()
 
@@ -317,6 +384,9 @@ class CapabilityManager(
         val eqUrl = capabilities["EventQueueGet"]
         if (eqUrl != null) {
             startEventQueuePolling(eqUrl)
+        }
+        if (capabilities.containsKey(CAP_SIMULATOR_FEATURES)) {
+            fetchSimulatorFeatures()
         }
 
         if (capabilities.isNotEmpty()) {
@@ -585,24 +655,18 @@ class CapabilityManager(
                     _capsEvents.tryEmit(CapsEvent.TeleportFinish(ip, port, seed, 0L))
                 }
             }
+            "SimulatorFeatures" -> {
+                val map = body as? LlsdValue.MapVal ?: return
+                cachedSimulatorFeatures = map
+                val features = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.parseSimulatorVoiceFeatures(
+                    simulatorFeatures = map,
+                    availableCapabilities = capabilities.keys
+                )
+                _capsEvents.tryEmit(CapsEvent.SimulatorFeaturesUpdated(features, map))
+            }
             "ParcelProperties" -> {
-                val parcelData = body["ParcelData"].asList().firstOrNull() ?: return
-                val name = parcelData["Name"].asString()
-                val desc = parcelData["Desc"].asString()
-                val localId = parcelData["LocalID"].asInt(0)
-                val musicUrl = parcelData["MusicURL"].asString()
-                val mediaUrl = parcelData["MediaURL"].asString()
-                if (name.isNotBlank() || musicUrl.isNotBlank() || mediaUrl.isNotBlank() || localId != 0) {
-                    _capsEvents.tryEmit(
-                        CapsEvent.ParcelProperties(
-                            parcelName = name,
-                            parcelDesc = desc,
-                            localId = localId,
-                            musicUrl = musicUrl,
-                            mediaUrl = mediaUrl
-                        )
-                    )
-                }
+                val parsed = parseCapsParcelProperties(body) ?: return
+                _capsEvents.tryEmit(parsed)
             }
             "ParcelVoiceInfoRequest",
             "ParcelVoiceInfoUpdate" -> {
@@ -741,10 +805,80 @@ class CapabilityManager(
             emptyList()
         }
 
+    internal fun dispatchCapsEventForTesting(message: String, body: LlsdValue) {
+        dispatchCapsEvent(message, body)
+    }
+
+    internal fun dispatchEventQueuePayloadForTesting(llsd: LlsdValue) {
+        llsd["events"].asList().forEach { evt ->
+            dispatchCapsEvent(evt["message"].asString(), evt["body"])
+        }
+    }
+
     fun getCapabilityUrl(name: String): String? = capabilities[name]
 
     fun setCapabilityUrlForTesting(name: String, url: String) {
         capabilities[name] = url
+    }
+
+    fun setSimulatorFeaturesForTesting(features: LlsdValue.MapVal?) {
+        cachedSimulatorFeatures = features
+    }
+
+    /**
+     * Fetches and parses an LLSD XML capability resource via HTTP GET (e.g. `SimulatorFeatures`).
+     */
+    suspend fun getLlsdCapability(capName: String): LlsdValue? =
+        withContext(Dispatchers.IO) {
+            val url = capabilities[capName] ?: return@withContext null
+            val req = Request.Builder()
+                .url(url)
+                .header("User-Agent", XmlRpcLoginClient.VIEWER_USER_AGENT)
+                .header("Accept", "application/llsd+xml, text/xml")
+                .get()
+                .build()
+            try {
+                httpClient.newCall(req).execute().use { resp ->
+                    if (!resp.isSuccessful) return@withContext null
+                    val raw = resp.body?.string().orEmpty()
+                    if (raw.isBlank()) LlsdValue.MapVal(emptyMap()) else LlsdCodec.parseXml(raw)
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (_: Exception) {
+                null
+            }
+        }
+
+    /**
+     * Queries the region's `SimulatorFeatures` capability (`GET`) and caches the parsed
+     * `VoiceServerType` (`"webrtc"` primary since viewer 7.1.9 vs. legacy `"vivox"`).
+     */
+    suspend fun fetchSimulatorFeatures(): com.example.linkpoint.audio.SlVoiceWebRtcProtocol.SimulatorVoiceFeatures? {
+        val response = getLlsdCapability(CAP_SIMULATOR_FEATURES) as? LlsdValue.MapVal ?: return null
+        cachedSimulatorFeatures = response
+        val features = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.parseSimulatorVoiceFeatures(
+            simulatorFeatures = response,
+            availableCapabilities = capabilities.keys
+        )
+        _capsEvents.tryEmit(CapsEvent.SimulatorFeaturesUpdated(features, response))
+        return features
+    }
+
+    /**
+     * Resolves the region's active [com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceProvider]
+     * strictly from `SimulatorFeatures` (fetching `SimulatorFeatures` on demand if negotiated).
+     */
+    suspend fun resolveRegionVoiceProvider(
+        forceRefresh: Boolean = false
+    ): com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceProvider {
+        if ((forceRefresh || cachedSimulatorFeatures == null) && capabilities.containsKey(CAP_SIMULATOR_FEATURES)) {
+            fetchSimulatorFeatures()
+        }
+        return com.example.linkpoint.audio.SlVoiceWebRtcProtocol.parseSimulatorVoiceFeatures(
+            simulatorFeatures = cachedSimulatorFeatures,
+            availableCapabilities = capabilities.keys
+        ).voiceProvider
     }
 
     /**
@@ -774,14 +908,92 @@ class CapabilityManager(
         }
 
     /**
+     * Strictly branches voice initialization on region `SimulatorFeatures["VoiceServerType"]`:
+     * - `VoiceProvider.WEBRTC` (`"webrtc"`): creates the SDP offer, munges Opus 48 kHz stereo `fmtp`,
+     *   and negotiates WebRTC via `ProvisionVoiceAccountRequest` — never touching legacy Vivox.
+     * - `VoiceProvider.VIVOX` (`"vivox"`): delegates strictly to `onLegacyVivoxSelected` (if provided)
+     *   and NEVER generates a WebRTC SDP offer or posts `voice_server_type = "webrtc"`.
+     * - `VoiceProvider.NONE`: initializes neither stack.
+     */
+    suspend fun initializeVoiceSession(
+        channelRequest: com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceChannelRequest,
+        offerSdpProvider: () -> String,
+        mungeOpusFmtp: Boolean = true,
+        onLegacyVivoxSelected: (suspend (com.example.linkpoint.audio.SlVoiceWebRtcProtocol.ParcelVoiceInfo?) -> com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VivoxLegacyAccountInfo?)? = null
+    ): com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceInitializationResult {
+        return when (val provider = resolveRegionVoiceProvider()) {
+            com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceProvider.WEBRTC -> {
+                val parcelVoice = if (capabilities.containsKey(CAP_PARCEL_VOICE_INFO)) {
+                    requestParcelVoiceInfo()
+                } else null
+                val effectiveChannel = if (
+                    channelRequest is com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceChannelRequest.Local &&
+                    channelRequest.parcelLocalId == null &&
+                    parcelVoice != null &&
+                    parcelVoice.localId != 0
+                ) {
+                    com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(parcelVoice.localId)
+                } else {
+                    channelRequest
+                }
+                val provisioned = requestProvisionVoiceAccount(
+                    channelRequest = effectiveChannel,
+                    offerSdp = offerSdpProvider(),
+                    mungeOpusFmtp = mungeOpusFmtp
+                )
+                if (provisioned != null) {
+                    com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceInitializationResult.WebRtcInitialized(
+                        provision = provisioned,
+                        parcelVoiceInfo = parcelVoice
+                    )
+                } else {
+                    com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceInitializationResult.DisabledOrUnsupported(
+                        provider = provider,
+                        reason = "WebRTC ProvisionVoiceAccountRequest failed"
+                    )
+                }
+            }
+            com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceProvider.VIVOX -> {
+                val vivoxAccount = onLegacyVivoxSelected?.invoke(null)
+                com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceInitializationResult.LegacyVivoxNegotiated(
+                    accountInfo = vivoxAccount
+                )
+            }
+            com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceProvider.NONE -> {
+                com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceInitializationResult.DisabledOrUnsupported(
+                    provider = provider,
+                    reason = "Region SimulatorFeatures does not enable voice"
+                )
+            }
+        }
+    }
+
+    /**
+     * Provisions a legacy Vivox account (`VoiceServerType == "vivox"`) ONLY when the region's
+     * `SimulatorFeatures` resolved to `VoiceProvider.VIVOX` (never called on WebRTC regions).
+     */
+    suspend fun requestLegacyVivoxProvisionAccount(): com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VivoxLegacyAccountInfo? {
+        if (resolveRegionVoiceProvider() != com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceProvider.VIVOX) {
+            return null
+        }
+        val response = postLlsdCapability(CAP_PROVISION_VOICE_ACCOUNT, LlsdValue.MapVal(emptyMap()))
+            ?: return null
+        return com.example.linkpoint.audio.SlVoiceWebRtcProtocol.parseVivoxLegacyProvisionResponse(response)
+    }
+
+    /**
      * Negotiates a Second Life WebRTC voice session via `ProvisionVoiceAccountRequest`
      * (or `SLVoiceWebRTC` if advertised by the simulator), munging the Opus SDP fmtp line.
+     * Strictly gated on `resolveRegionVoiceProvider() == VoiceProvider.WEBRTC`.
      */
     suspend fun requestProvisionVoiceAccount(
         channelRequest: com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceChannelRequest,
         offerSdp: String,
         mungeOpusFmtp: Boolean = true
     ): com.example.linkpoint.audio.SlVoiceWebRtcProtocol.ProvisionVoiceResponse? {
+        if (resolveRegionVoiceProvider() != com.example.linkpoint.audio.SlVoiceWebRtcProtocol.VoiceProvider.WEBRTC) {
+            return null
+        }
         val body = com.example.linkpoint.audio.SlVoiceWebRtcProtocol.buildProvisionVoiceOfferRequest(
             channelRequest = channelRequest,
             offerSdp = offerSdp,
@@ -859,6 +1071,7 @@ class CapabilityManager(
     fun shutdown() {
         eventQueueJob?.cancel()
         capabilities.clear()
+        cachedSimulatorFeatures = null
         lastSeedUrl = ""
     }
 }

@@ -497,4 +497,396 @@ class Phase6VoiceAndAudioProtocolTest {
         engine.setCategoryVolume(AudioCategory.MEDIA_MUSIC, 0.4f)
         assertEquals(0.20f, streamPlayer.currentVolume, 0.001f)
     }
+
+    @Test
+    fun `enforces strict Unencoded framing for 0x1D and 0xFF0D_0xFF0F while keeping ParcelProperties 0x17 Zerocoded`() {
+        // Exact message_template.msg frequency IDs
+        assertEquals(0x17, LludpPackets.MSG_PARCEL_PROPERTIES)
+        assertEquals(0x1D, LludpPackets.MSG_SOUND_TRIGGER)
+        assertEquals(0xFF0D, LludpPackets.MSG_ATTACHED_SOUND)
+        assertEquals(0xFF0E, LludpPackets.MSG_ATTACHED_SOUND_GAIN_CHANGE)
+        assertEquals(0xFF0F, LludpPackets.MSG_PRELOAD_SOUND)
+
+        val zeroUuid = UUID(0L, 0L)
+
+        // Zero-heavy payloads that would shrink dramatically if zero-coded
+        val triggerFramed = LludpPackets.framePacket(
+            sequenceNumber = 101,
+            reliable = false,
+            messageId = LludpPackets.MSG_SOUND_TRIGGER,
+            body = LludpPackets.buildSoundTrigger(
+                soundId = zeroUuid,
+                ownerId = zeroUuid,
+                objectId = zeroUuid,
+                parentId = zeroUuid,
+                handle = 0L,
+                position = Vec3(0f, 0f, 0f),
+                gain = 0f
+            ),
+            useZeroCoding = true // Must be ignored because 0x1D is strictly Unencoded
+        )
+        assertEquals("SoundTrigger (0x1D) must never set FLAG_ZEROCODED", 0, triggerFramed[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        assertEquals("SoundTrigger must use 1-byte High 29 (0x1D) header", 0x1D, triggerFramed[6].toInt() and 0xFF)
+        assertEquals("SoundTrigger wire length must be 6 + 1 + 88 = 95 unencoded bytes", 95, triggerFramed.size)
+
+        val attachedFramed = LludpPackets.framePacket(
+            sequenceNumber = 102,
+            reliable = false,
+            messageId = LludpPackets.MSG_ATTACHED_SOUND,
+            body = LludpPackets.buildAttachedSound(
+                soundId = zeroUuid,
+                objectId = zeroUuid,
+                ownerId = zeroUuid,
+                gain = 0f,
+                flags = 0
+            ),
+            useZeroCoding = true // Must be ignored because 0xFF0D is strictly Unencoded
+        )
+        assertEquals("AttachedSound (0xFF0D) must never set FLAG_ZEROCODED", 0, attachedFramed[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        assertEquals(0xFF, attachedFramed[6].toInt() and 0xFF)
+        assertEquals(0x0D, attachedFramed[7].toInt() and 0xFF)
+        assertEquals("AttachedSound wire length must be 6 + 2 + 53 = 61 unencoded bytes", 61, attachedFramed.size)
+
+        val gainFramed = LludpPackets.framePacket(
+            sequenceNumber = 103,
+            reliable = false,
+            messageId = LludpPackets.MSG_ATTACHED_SOUND_GAIN_CHANGE,
+            body = LludpPackets.buildAttachedSoundGainChange(objectId = zeroUuid, gain = 0f),
+            useZeroCoding = true // Must be ignored because 0xFF0E is strictly Unencoded
+        )
+        assertEquals("AttachedSoundGainChange (0xFF0E) must never set FLAG_ZEROCODED", 0, gainFramed[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        assertEquals(0xFF, gainFramed[6].toInt() and 0xFF)
+        assertEquals(0x0E, gainFramed[7].toInt() and 0xFF)
+        assertEquals("AttachedSoundGainChange wire length must be 6 + 2 + 20 = 28 unencoded bytes", 28, gainFramed.size)
+
+        val preloadFramed = LludpPackets.framePacket(
+            sequenceNumber = 104,
+            reliable = false,
+            messageId = LludpPackets.MSG_PRELOAD_SOUND,
+            body = LludpPackets.buildPreloadSound(
+                listOf(LludpPackets.ParsedPreloadSoundEntry(zeroUuid, zeroUuid, zeroUuid))
+            ),
+            useZeroCoding = true // Must be ignored because 0xFF0F is strictly Unencoded
+        )
+        assertEquals("PreloadSound (0xFF0F) must never set FLAG_ZEROCODED", 0, preloadFramed[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        assertEquals(0xFF, preloadFramed[6].toInt() and 0xFF)
+        assertEquals(0x0F, preloadFramed[7].toInt() and 0xFF)
+        assertEquals("PreloadSound wire length must be 6 + 2 + 49 = 57 unencoded bytes", 57, preloadFramed.size)
+
+        // Verify all 4 unencoded sound packets decode cleanly when unencoded, and are rejected if illegally marked FLAG_ZEROCODED
+        for (pkt in listOf(triggerFramed, attachedFramed, gainFramed, preloadFramed)) {
+            assertNotNull(LludpPackets.decodePacket(pkt, pkt.size))
+            val illegallyZeroCoded = pkt.copyOf().also { it[0] = (it[0].toInt() or LludpPackets.FLAG_ZEROCODED).toByte() }
+            assertNull("Decoder must reject FLAG_ZEROCODED on Unencoded sound messages", LludpPackets.decodePacket(illegallyZeroCoded, illegallyZeroCoded.size))
+        }
+
+        // Contrast with ParcelProperties (High 23 = 0x17, Zerocoded): must zero-code zero-heavy payload
+        val parcelBody = LludpPackets.buildParcelProperties(
+            localId = 55,
+            name = "OpenSim Harbor",
+            musicUrl = "http://opensim.example:8000/stream.ogg",
+            mediaUrl = "http://opensim.example:8000/video.webm"
+        )
+        val parcelFramed = LludpPackets.framePacket(
+            sequenceNumber = 105,
+            reliable = true,
+            messageId = LludpPackets.MSG_PARCEL_PROPERTIES,
+            body = parcelBody,
+            useZeroCoding = true
+        )
+        assertTrue("ParcelProperties (0x17) must set FLAG_ZEROCODED", (parcelFramed[0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0)
+        assertTrue("Zerocoded ParcelProperties must compress zero runs", parcelFramed.size < 6 + 1 + parcelBody.size)
+        val decodedParcel = LludpPackets.decodePacket(parcelFramed, parcelFramed.size)
+        assertNotNull(decodedParcel)
+        assertEquals(0x17, decodedParcel!!.messageId)
+    }
+
+    @Test
+    fun `parses ParcelProperties over both EventQueueGet LLSD and UDP High 23 OpenSim fallback`() = runBlocking {
+        val streamPlayer = InMemoryParcelStreamPlayer()
+        val audioEngine = SlAudioEngine(parcelStreamPlayer = streamPlayer)
+        val capsMgr = CapabilityManager()
+        val udpEngine = LludpCircuitEngine()
+
+        // 1. Primary Agni plane: EventQueueGet LLSD `ParcelProperties` event (since UDP is UDPDeprecated on Agni)
+        val eqPayload = LlsdValue.MapVal(
+            mapOf(
+                "id" to LlsdValue.IntVal(7),
+                "events" to LlsdValue.ArrayVal(
+                    listOf(
+                        LlsdValue.MapVal(
+                            mapOf(
+                                "message" to LlsdValue.Str("ParcelProperties"),
+                                "body" to LlsdValue.MapVal(
+                                    mapOf(
+                                        "ParcelData" to LlsdValue.ArrayVal(
+                                            listOf(
+                                                LlsdValue.MapVal(
+                                                    mapOf(
+                                                        "LocalID" to LlsdValue.IntVal(412),
+                                                        "SequenceID" to LlsdValue.IntVal(2),
+                                                        "Name" to LlsdValue.Str("Agni Amphitheater"),
+                                                        "Desc" to LlsdValue.Str("Main Grid CAPS parcel"),
+                                                        "MusicURL" to LlsdValue.Uri("https://agni-streams.secondlife.io/live.ogg"),
+                                                        "MediaURL" to LlsdValue.Uri("https://agni-media.secondlife.io/stage.mp4")
+                                                    )
+                                                )
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+
+        val capsEventDeferred = async {
+            capsMgr.capsEvents.take(1).toList().single() as com.example.linkpoint.protocol.CapsEvent.ParcelProperties
+        }
+        kotlinx.coroutines.yield()
+        capsMgr.dispatchEventQueuePayloadForTesting(eqPayload)
+
+        val capsParcel = kotlinx.coroutines.withTimeout(5_000L) { capsEventDeferred.await() }
+        assertEquals(412, capsParcel.localId)
+        assertEquals(2, capsParcel.sequenceId)
+        assertEquals("Agni Amphitheater", capsParcel.parcelName)
+        assertEquals("https://agni-streams.secondlife.io/live.ogg", capsParcel.musicUrl)
+        assertEquals("https://agni-media.secondlife.io/stage.mp4", capsParcel.mediaUrl)
+
+        audioEngine.onParcelProperties(
+            localId = capsParcel.localId,
+            name = capsParcel.parcelName,
+            musicUrl = capsParcel.musicUrl,
+            mediaUrl = capsParcel.mediaUrl,
+            sequenceId = capsParcel.sequenceId
+        )
+        assertTrue(audioEngine.toggleParcelMusicPlayback())
+        assertEquals("https://agni-streams.secondlife.io/live.ogg", streamPlayer.currentUrl)
+        assertEquals("https://agni-media.secondlife.io/stage.mp4", audioEngine.state.value.parcelMediaUrl)
+
+        // 2. OpenSim fallback plane: UDP High 23 (0x17, Zerocoded) `ParcelProperties`
+        val udpPacket = LludpPackets.framePacket(
+            sequenceNumber = 88,
+            reliable = true,
+            messageId = LludpPackets.MSG_PARCEL_PROPERTIES,
+            body = LludpPackets.buildParcelProperties(
+                localId = 518,
+                name = "OSGrid Marina",
+                desc = "OpenSimulator UDP parcel",
+                musicUrl = "http://osgrid-radio.example:8020/marina.mp3",
+                mediaUrl = "http://osgrid-media.example:8020/board.html",
+                sequenceId = 3
+            ),
+            useZeroCoding = true
+        )
+        assertTrue((udpPacket[0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0)
+
+        val udpEventDeferred = async {
+            udpEngine.events.take(1).toList().single() as SimEvent.ParcelPropertiesReceived
+        }
+        kotlinx.coroutines.yield()
+        udpEngine.dispatchRawPacketForTesting(udpPacket)
+
+        val udpParcel = kotlinx.coroutines.withTimeout(5_000L) { udpEventDeferred.await() }.parcel
+        assertEquals(518, udpParcel.localId)
+        assertEquals(3, udpParcel.sequenceId)
+        assertEquals("OSGrid Marina", udpParcel.name)
+        assertEquals("http://osgrid-radio.example:8020/marina.mp3", udpParcel.musicUrl)
+        assertEquals("http://osgrid-media.example:8020/board.html", udpParcel.mediaUrl)
+
+        audioEngine.onParcelProperties(
+            localId = udpParcel.localId,
+            name = udpParcel.name,
+            musicUrl = udpParcel.musicUrl,
+            mediaUrl = udpParcel.mediaUrl,
+            sequenceId = udpParcel.sequenceId
+        )
+        assertEquals(518, audioEngine.state.value.parcelLocalId)
+        assertEquals("OSGrid Marina", audioEngine.state.value.parcelName)
+        assertEquals("http://osgrid-radio.example:8020/marina.mp3", streamPlayer.currentUrl)
+        assertEquals("http://osgrid-media.example:8020/board.html", audioEngine.state.value.parcelMediaUrl)
+
+        // Out-of-order stale SequenceID (1 < 3) and remote-selected parcel (SequenceID == -1) must not clobber active parcel
+        audioEngine.onParcelProperties(localId = 999, name = "Stale Parcel", musicUrl = "http://stale/1.ogg", sequenceId = 1)
+        audioEngine.onParcelProperties(localId = 998, name = "Inspected Parcel", musicUrl = "http://remote/2.ogg", sequenceId = -1)
+        assertEquals(518, audioEngine.state.value.parcelLocalId)
+        assertEquals("OSGrid Marina", audioEngine.state.value.parcelName)
+        assertEquals("http://osgrid-radio.example:8020/marina.mp3", streamPlayer.currentUrl)
+
+        capsMgr.shutdown()
+    }
+
+    @Test
+    fun `requests SimulatorFeatures in REQUESTED_CAPS and gates WebRTC vs legacy Vivox voice initialization strictly`() = runBlocking {
+        // 1. Verify CapabilityManager.REQUESTED_CAPS includes SimulatorFeatures alongside all voice caps
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("SimulatorFeatures"))
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("ProvisionVoiceAccountRequest"))
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("ParcelVoiceInfoRequest"))
+        assertTrue(CapabilityManager.REQUESTED_CAPS.contains("VoiceSignalingRequest"))
+
+        var activeVoiceServerType = "webrtc"
+        val httpTrace = ArrayList<Pair<String, String>>() // method+path to raw request body
+
+        val mockHttp = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val buf = Buffer()
+                req.body?.writeTo(buf)
+                val bodyText = buf.readUtf8()
+                httpTrace += "${req.method} ${req.url.encodedPath}" to bodyText
+
+                val respLlsd: LlsdValue = when (req.url.encodedPath) {
+                    "/cap/seed" -> LlsdValue.MapVal(
+                        mapOf(
+                            "SimulatorFeatures" to LlsdValue.Uri("https://sim.secondlife.io/cap/sim-features"),
+                            "ProvisionVoiceAccountRequest" to LlsdValue.Uri("https://sim.secondlife.io/cap/provision-voice"),
+                            "ParcelVoiceInfoRequest" to LlsdValue.Uri("https://sim.secondlife.io/cap/parcel-voice"),
+                            "VoiceSignalingRequest" to LlsdValue.Uri("https://sim.secondlife.io/cap/voice-signaling")
+                        )
+                    )
+                    "/cap/sim-features" -> LlsdValue.MapVal(
+                        mapOf(
+                            "VoiceServerType" to LlsdValue.Str(activeVoiceServerType),
+                            "MeshRezEnabled" to LlsdValue.Bool(true)
+                        )
+                    )
+                    "/cap/parcel-voice" -> LlsdValue.MapVal(
+                        mapOf(
+                            "region_name" to LlsdValue.Str("Ahern"),
+                            "local_id" to LlsdValue.IntVal(88),
+                            "voice_credentials" to LlsdValue.MapVal(
+                                mapOf("channel_uri" to LlsdValue.Str("webrtc://ahern-88"))
+                            )
+                        )
+                    )
+                    "/cap/provision-voice" -> {
+                        val parsedReq = if (bodyText.isNotBlank()) LlsdCodec.parseXml(bodyText) else LlsdValue.MapVal(emptyMap())
+                        if (parsedReq["voice_server_type"].asString() == "webrtc") {
+                            LlsdValue.MapVal(
+                                mapOf(
+                                    "viewer_session" to LlsdValue.Str("webrtc-sess-88"),
+                                    "jsep" to LlsdValue.MapVal(
+                                        mapOf(
+                                            "type" to LlsdValue.Str("answer"),
+                                            "sdp" to LlsdValue.Str("v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n")
+                                        )
+                                    )
+                                )
+                            )
+                        } else {
+                            LlsdValue.MapVal(
+                                mapOf(
+                                    "username" to LlsdValue.Str("x_vivox_agent"),
+                                    "password" to LlsdValue.Str("legacy_pw"),
+                                    "voice_sip_uri_hostname" to LlsdValue.Str("bhr.vivox.com"),
+                                    "voice_account_server_name" to LlsdValue.Str("https://www.bhr.vivox.com/api2/")
+                                )
+                            )
+                        }
+                    }
+                    else -> LlsdValue.MapVal(mapOf("status" to LlsdValue.Str("ok")))
+                }
+
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(LlsdCodec.toXml(respLlsd).toResponseBody("application/llsd+xml".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        // Case A: Region SimulatorFeatures advertises VoiceServerType = "webrtc" (viewer 7.1.9+ primary)
+        val webrtcCaps = CapabilityManager(httpClient = mockHttp, seedHttpClient = mockHttp)
+        val seedResult = webrtcCaps.requestSeedCapabilities("https://sim.secondlife.io/cap/seed")
+        assertEquals(4, seedResult.capabilities.size)
+
+        val seedPostXml = httpTrace.first { it.first == "POST /cap/seed" }.second
+        val requestedList = LlsdCodec.parseXml(seedPostXml).asList().map { it.asString() }
+        assertTrue(requestedList.contains("SimulatorFeatures"))
+        assertTrue(requestedList.contains("ProvisionVoiceAccountRequest"))
+        assertTrue(requestedList.contains("ParcelVoiceInfoRequest"))
+        assertTrue(requestedList.contains("VoiceSignalingRequest"))
+
+        assertEquals(SlVoiceWebRtcProtocol.VoiceProvider.WEBRTC, webrtcCaps.resolveRegionVoiceProvider())
+        assertNull("Legacy Vivox provisioner must be blocked on a WebRTC region", webrtcCaps.requestLegacyVivoxProvisionAccount())
+
+        var webrtcOfferCalls = 0
+        var vivoxFallbackCalls = 0
+        val webrtcInit = webrtcCaps.initializeVoiceSession(
+            channelRequest = SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(),
+            offerSdpProvider = {
+                webrtcOfferCalls++
+                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000\r\n"
+            },
+            onLegacyVivoxSelected = {
+                vivoxFallbackCalls++
+                webrtcCaps.requestLegacyVivoxProvisionAccount()
+            }
+        )
+        assertTrue(webrtcInit is SlVoiceWebRtcProtocol.VoiceInitializationResult.WebRtcInitialized)
+        assertEquals("webrtc-sess-88", (webrtcInit as SlVoiceWebRtcProtocol.VoiceInitializationResult.WebRtcInitialized).provision.viewerSession)
+        assertEquals(88, webrtcInit.parcelVoiceInfo?.localId)
+        assertEquals("WebRTC offer must be generated exactly once", 1, webrtcOfferCalls)
+        assertEquals("Legacy Vivox stack must NEVER be initialized on a WebRTC region", 0, vivoxFallbackCalls)
+        webrtcCaps.shutdown()
+
+        // Case B: Region SimulatorFeatures advertises VoiceServerType = "vivox" (legacy region)
+        httpTrace.clear()
+        activeVoiceServerType = "vivox"
+        val vivoxCaps = CapabilityManager(httpClient = mockHttp, seedHttpClient = mockHttp)
+        vivoxCaps.requestSeedCapabilities("https://sim.secondlife.io/cap/seed")
+        assertEquals(SlVoiceWebRtcProtocol.VoiceProvider.VIVOX, vivoxCaps.resolveRegionVoiceProvider())
+
+        // Direct WebRTC ProvisionVoiceAccountRequest call must be strictly blocked
+        assertNull(
+            "WebRTC ProvisionVoiceAccountRequest must never fire when SimulatorFeatures selects vivox",
+            vivoxCaps.requestProvisionVoiceAccount(
+                channelRequest = SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(88),
+                offerSdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            )
+        )
+        assertFalse(httpTrace.any { it.first == "POST /cap/provision-voice" })
+
+        webrtcOfferCalls = 0
+        vivoxFallbackCalls = 0
+        val vivoxInit = vivoxCaps.initializeVoiceSession(
+            channelRequest = SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(88),
+            offerSdpProvider = {
+                webrtcOfferCalls++
+                "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n"
+            },
+            onLegacyVivoxSelected = {
+                vivoxFallbackCalls++
+                vivoxCaps.requestLegacyVivoxProvisionAccount()
+            }
+        )
+        assertTrue(vivoxInit is SlVoiceWebRtcProtocol.VoiceInitializationResult.LegacyVivoxNegotiated)
+        assertEquals("WebRTC offer must NEVER be generated on a Vivox region", 0, webrtcOfferCalls)
+        assertEquals("Legacy Vivox callback must run strictly once", 1, vivoxFallbackCalls)
+        assertEquals("x_vivox_agent", (vivoxInit as SlVoiceWebRtcProtocol.VoiceInitializationResult.LegacyVivoxNegotiated).accountInfo?.accountName)
+        vivoxCaps.shutdown()
+
+        // Case C: Region SimulatorFeatures disables voice (`VoiceServerType = "none"`) -> neither stack initializes
+        httpTrace.clear()
+        activeVoiceServerType = "none"
+        val disabledCaps = CapabilityManager(httpClient = mockHttp, seedHttpClient = mockHttp)
+        disabledCaps.requestSeedCapabilities("https://sim.secondlife.io/cap/seed")
+        assertEquals(SlVoiceWebRtcProtocol.VoiceProvider.NONE, disabledCaps.resolveRegionVoiceProvider())
+
+        webrtcOfferCalls = 0
+        vivoxFallbackCalls = 0
+        val disabledInit = disabledCaps.initializeVoiceSession(
+            channelRequest = SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(),
+            offerSdpProvider = { webrtcOfferCalls++; "" },
+            onLegacyVivoxSelected = { vivoxFallbackCalls++; null }
+        )
+        assertTrue(disabledInit is SlVoiceWebRtcProtocol.VoiceInitializationResult.DisabledOrUnsupported)
+        assertEquals(0, webrtcOfferCalls)
+        assertEquals(0, vivoxFallbackCalls)
+        disabledCaps.shutdown()
+    }
 }

@@ -68,6 +68,7 @@ data class ActiveSpatialSound(
  */
 data class AudioVoiceState(
     val isMixerOpen: Boolean = false,
+    val voiceProvider: SlVoiceWebRtcProtocol.VoiceProvider = SlVoiceWebRtcProtocol.VoiceProvider.WEBRTC,
     val voiceConnected: Boolean = false,
     val voiceConnecting: Boolean = false,
     val voiceChannelName: String = "Spatial Local Voice",
@@ -330,6 +331,7 @@ class SlAudioEngine(
     private val spatialThrottler = SlVoiceWebRtcProtocol.SlDataSpatialThrottler()
 
     private var isMixerOpen = false
+    private var voiceProvider: SlVoiceWebRtcProtocol.VoiceProvider = SlVoiceWebRtcProtocol.VoiceProvider.WEBRTC
     private var voiceConnected = false
     private var voiceConnecting = false
     private var voiceChannelName = "Spatial Local Voice"
@@ -338,6 +340,7 @@ class SlAudioEngine(
     private var micMuted = true
 
     private var parcelLocalId = 0
+    private var lastParcelSequenceId = 0
     private var parcelName = ""
     private var parcelMusicUrl = ""
     private var parcelMediaUrl = ""
@@ -656,9 +659,17 @@ class SlAudioEngine(
         localId: Int,
         name: String,
         musicUrl: String,
-        mediaUrl: String = ""
+        mediaUrl: String = "",
+        sequenceId: Int = 0
     ) {
         synchronized(lock) {
+            // SequenceID == -1 denotes a user-inspected remote parcel rather than the agent's current parcel
+            if (sequenceId == -1) return
+            if (sequenceId > 0) {
+                if (sequenceId < lastParcelSequenceId) return
+                lastParcelSequenceId = sequenceId
+            }
+
             val trimmedMusic = musicUrl.trim()
             val trimmedMedia = mediaUrl.trim()
             val musicChanged = trimmedMusic != parcelMusicUrl
@@ -774,6 +785,25 @@ class SlAudioEngine(
     // ---------------------------------------------------------------------------
     // WebRTC Voice Channel, Mic & Per-Participant Controls
     // ---------------------------------------------------------------------------
+
+    fun onSimulatorVoiceFeatures(features: SlVoiceWebRtcProtocol.SimulatorVoiceFeatures) {
+        var leaveFrame: String? = null
+        synchronized(lock) {
+            voiceProvider = features.voiceProvider
+            if (features.voiceProvider != SlVoiceWebRtcProtocol.VoiceProvider.WEBRTC) {
+                if (voiceConnected) {
+                    leaveFrame = SlVoiceWebRtcProtocol.encodeLeave()
+                }
+                voiceConnecting = false
+                voiceConnected = false
+                viewerSessionId = ""
+                micMuted = true
+                spatialThrottler.reset()
+            }
+            publishStateLocked()
+        }
+        leaveFrame?.let { emitSlData(it) }
+    }
 
     fun setVoiceConnecting(connecting: Boolean) {
         synchronized(lock) {
@@ -1021,11 +1051,13 @@ class SlAudioEngine(
     fun resetSession() {
         synchronized(lock) {
             parcelStreamPlayer.stop()
+            voiceProvider = SlVoiceWebRtcProtocol.VoiceProvider.WEBRTC
             voiceConnected = false
             voiceConnecting = false
             viewerSessionId = ""
             micMuted = true
             parcelLocalId = 0
+            lastParcelSequenceId = 0
             parcelName = ""
             parcelMusicUrl = ""
             parcelMediaUrl = ""
@@ -1206,6 +1238,7 @@ class SlAudioEngine(
 
         _state.value = AudioVoiceState(
             isMixerOpen = isMixerOpen,
+            voiceProvider = voiceProvider,
             voiceConnected = voiceConnected,
             voiceConnecting = voiceConnecting,
             voiceChannelName = voiceChannelName,

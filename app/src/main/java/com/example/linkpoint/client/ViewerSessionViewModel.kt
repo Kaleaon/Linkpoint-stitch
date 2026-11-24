@@ -490,14 +490,15 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         pushSceneSnapshot()
                     }
                     is SimEvent.ParcelPropertiesReceived -> {
-                        if (evt.parcel.name.isNotBlank()) {
+                        if (evt.parcel.sequenceId != -1 && evt.parcel.name.isNotBlank()) {
                             _state.update { it.copy(parcelName = evt.parcel.name) }
                         }
                         audioEngine.onParcelProperties(
                             localId = evt.parcel.localId,
                             name = evt.parcel.name,
                             musicUrl = evt.parcel.musicUrl,
-                            mediaUrl = evt.parcel.mediaUrl
+                            mediaUrl = evt.parcel.mediaUrl,
+                            sequenceId = evt.parcel.sequenceId
                         )
                     }
                     is SimEvent.SoundTriggered -> {
@@ -598,15 +599,24 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         viewModelScope.launch {
             capabilityManager.capsEvents.collect { evt ->
                 when (evt) {
+                    is CapsEvent.SimulatorFeaturesUpdated -> {
+                        audioEngine.onSimulatorVoiceFeatures(evt.features)
+                        appendDiagnostic(
+                            "[CAPS] SimulatorFeatures VoiceServerType=" +
+                                "${evt.features.rawVoiceServerType.ifBlank { evt.features.voiceProvider.serverType }} " +
+                                "-> provider=${evt.features.voiceProvider}"
+                        )
+                    }
                     is CapsEvent.ParcelProperties -> {
-                        if (evt.parcelName.isNotBlank()) {
+                        if (evt.sequenceId != -1 && evt.parcelName.isNotBlank()) {
                             _state.update { it.copy(parcelName = evt.parcelName) }
                         }
                         audioEngine.onParcelProperties(
                             localId = evt.localId,
                             name = evt.parcelName,
                             musicUrl = evt.musicUrl,
-                            mediaUrl = evt.mediaUrl
+                            mediaUrl = evt.mediaUrl,
+                            sequenceId = evt.sequenceId
                         )
                     }
                     is CapsEvent.ParcelVoiceInfoUpdate -> {
@@ -1134,6 +1144,13 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             lastRegionGridX = (response.regionX / 256).coerceAtLeast(0)
             lastRegionGridY = (response.regionY / 256).coerceAtLeast(0)
             audioEngine.resetSession()
+            val resolvedVoiceProvider = capabilityManager.resolveRegionVoiceProvider()
+            audioEngine.onSimulatorVoiceFeatures(
+                SlVoiceWebRtcProtocol.SimulatorVoiceFeatures(
+                    voiceProvider = resolvedVoiceProvider,
+                    rawVoiceServerType = resolvedVoiceProvider.serverType
+                )
+            )
             lludpEngine.connect(response)
             if (capsResult.capabilities.containsKey("AttachmentResources")) {
                 viewModelScope.launch { capabilityManager.fetchAttachmentResources() }
@@ -2592,41 +2609,47 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             is ConnectionState.Connected -> {
                 audioEngine.setVoiceConnecting(true)
                 viewModelScope.launch {
-                    val parcelVoice = capabilityManager.requestParcelVoiceInfo()
-                    val localId = parcelVoice?.localId?.takeIf { it != 0 }
-                        ?: current.parcelLocalId.takeIf { it != 0 }
-                    val channelReq = if (parcelVoice != null && parcelVoice.channelUri.isNotBlank() && parcelVoice.channelCredentials.isNotBlank()) {
-                        SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(parcelLocalId = localId)
-                    } else {
-                        SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(parcelLocalId = localId)
-                    }
-                    val offerTemplate = buildString {
-                        append("v=0\r\n")
-                        append("o=- 1 2 IN IP4 127.0.0.1\r\n")
-                        append("s=-\r\n")
-                        append("t=0 0\r\n")
-                        append("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n")
-                        append("a=rtpmap:111 opus/48000/2\r\n")
-                        append("a=fmtp:111 minptime=10;useinbandfec=1\r\n")
-                        append("m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n")
-                    }
-                    val provisioned = capabilityManager.requestProvisionVoiceAccount(
-                        channelRequest = channelReq,
-                        offerSdp = offerTemplate,
+                    val fallbackLocalId = current.parcelLocalId.takeIf { it != 0 }
+                    val initResult = capabilityManager.initializeVoiceSession(
+                        channelRequest = SlVoiceWebRtcProtocol.VoiceChannelRequest.Local(parcelLocalId = fallbackLocalId),
+                        offerSdpProvider = {
+                            buildString {
+                                append("v=0\r\n")
+                                append("o=- 1 2 IN IP4 127.0.0.1\r\n")
+                                append("s=-\r\n")
+                                append("t=0 0\r\n")
+                                append("m=audio 9 UDP/TLS/RTP/SAVPF 111\r\n")
+                                append("a=rtpmap:111 opus/48000/2\r\n")
+                                append("a=fmtp:111 minptime=10;useinbandfec=1\r\n")
+                                append("m=application 9 UDP/DTLS/SCTP webrtc-datachannel\r\n")
+                            }
+                        },
                         mungeOpusFmtp = true
                     )
-                    if (provisioned != null) {
-                        capabilityManager.sendVoiceSignalingCompleted(provisioned.viewerSession)
-                        audioEngine.onVoiceSessionConnected(
-                            viewerSession = provisioned.viewerSession,
-                            channelName = parcelVoice?.regionName?.ifBlank { null } ?: currentRegionName(),
-                            channelType = "local",
-                            primary = true
-                        )
-                        showToast("Connected to WebRTC spatial voice")
-                    } else {
-                        audioEngine.setVoiceConnecting(false)
-                        showToast("Voice capability unavailable in this region")
+                    when (initResult) {
+                        is SlVoiceWebRtcProtocol.VoiceInitializationResult.WebRtcInitialized -> {
+                            capabilityManager.sendVoiceSignalingCompleted(initResult.provision.viewerSession)
+                            audioEngine.onVoiceSessionConnected(
+                                viewerSession = initResult.provision.viewerSession,
+                                channelName = initResult.parcelVoiceInfo?.regionName?.ifBlank { null } ?: currentRegionName(),
+                                channelType = "local",
+                                primary = true
+                            )
+                            showToast("Connected to WebRTC spatial voice")
+                        }
+                        is SlVoiceWebRtcProtocol.VoiceInitializationResult.LegacyVivoxNegotiated -> {
+                            audioEngine.onSimulatorVoiceFeatures(
+                                SlVoiceWebRtcProtocol.SimulatorVoiceFeatures(
+                                    voiceProvider = SlVoiceWebRtcProtocol.VoiceProvider.VIVOX,
+                                    rawVoiceServerType = SlVoiceWebRtcProtocol.VOICE_SERVER_TYPE_VIVOX
+                                )
+                            )
+                            showToast("Region uses legacy Vivox voice (WebRTC unavailable here)")
+                        }
+                        is SlVoiceWebRtcProtocol.VoiceInitializationResult.DisabledOrUnsupported -> {
+                            audioEngine.setVoiceConnecting(false)
+                            showToast("Voice capability unavailable in this region")
+                        }
                     }
                 }
             }

@@ -18,6 +18,7 @@ import kotlin.math.roundToInt
 object SlVoiceWebRtcProtocol {
 
     const val VOICE_SERVER_TYPE = "webrtc"
+    const val VOICE_SERVER_TYPE_VIVOX = "vivox"
     const val SL_DATA_CHANNEL_LABEL = "SLData"
 
     /**
@@ -155,8 +156,133 @@ object SlVoiceWebRtcProtocol {
     }
 
     // ---------------------------------------------------------------------------
-    // Voice Capabilities LLSD Payloads & Parsers
+    // SimulatorFeatures Voice Provider Gating & Capabilities Payloads
     // ---------------------------------------------------------------------------
+
+    /**
+     * Region voice backend negotiated strictly from `SimulatorFeatures["VoiceServerType"]`.
+     * Official viewer 7.1.9+ uses `"webrtc"` as primary; `"vivox"` is the legacy `SLVoice` daemon.
+     * Both stacks must NEVER be initialized blindly or simultaneously.
+     */
+    enum class VoiceProvider(val serverType: String) {
+        WEBRTC(VOICE_SERVER_TYPE),
+        VIVOX(VOICE_SERVER_TYPE_VIVOX),
+        NONE("none")
+    }
+
+    data class SimulatorVoiceFeatures(
+        val voiceProvider: VoiceProvider,
+        val rawVoiceServerType: String,
+        val voiceEnabled: Boolean = voiceProvider != VoiceProvider.NONE
+    )
+
+    data class VivoxLegacyAccountInfo(
+        val accountName: String,
+        val password: String,
+        val voiceSipUriHostname: String,
+        val voiceAccountServerName: String
+    )
+
+    sealed class VoiceInitializationResult {
+        data class WebRtcInitialized(
+            val provision: ProvisionVoiceResponse,
+            val parcelVoiceInfo: ParcelVoiceInfo? = null
+        ) : VoiceInitializationResult()
+
+        data class LegacyVivoxNegotiated(
+            val accountInfo: VivoxLegacyAccountInfo? = null,
+            val parcelVoiceInfo: ParcelVoiceInfo? = null,
+            val reason: String = "Region SimulatorFeatures selected legacy Vivox voice; WebRTC stack skipped"
+        ) : VoiceInitializationResult()
+
+        data class DisabledOrUnsupported(
+            val provider: VoiceProvider,
+            val reason: String
+        ) : VoiceInitializationResult()
+    }
+
+    /**
+     * Resolves the active region's [VoiceProvider] strictly from `SimulatorFeatures` LLSD
+     * (`VoiceServerType` = `"webrtc"` vs `"vivox"`), falling back to capability inspection
+     * only when `VoiceServerType` is omitted by older simulators.
+     */
+    fun parseSimulatorVoiceFeatures(
+        simulatorFeatures: LlsdValue?,
+        availableCapabilities: Set<String> = emptySet()
+    ): SimulatorVoiceFeatures {
+        val featuresMap = simulatorFeatures as? LlsdValue.MapVal
+        if (featuresMap != null) {
+            val explicitEnabled = (featuresMap.entries["VoiceEnabled"] ?: featuresMap.entries["voice_enabled"])
+            if (explicitEnabled is LlsdValue.Bool && !explicitEnabled.value) {
+                return SimulatorVoiceFeatures(
+                    voiceProvider = VoiceProvider.NONE,
+                    rawVoiceServerType = "none",
+                    voiceEnabled = false
+                )
+            }
+
+            val voiceConfig = featuresMap.entries["VoiceConfig"] as? LlsdValue.MapVal
+            val rawServerType = sequenceOf(
+                featuresMap.entries["VoiceServerType"],
+                featuresMap.entries["voice_server_type"],
+                voiceConfig?.entries?.get("VoiceServerType"),
+                voiceConfig?.entries?.get("voice_server_type")
+            ).mapNotNull { node ->
+                (node as? LlsdValue.Str)?.value?.trim()?.takeIf { it.isNotEmpty() }
+            }.firstOrNull().orEmpty()
+
+            if (rawServerType.isNotEmpty()) {
+                val provider = when (rawServerType.lowercase(Locale.US)) {
+                    VOICE_SERVER_TYPE -> VoiceProvider.WEBRTC
+                    VOICE_SERVER_TYPE_VIVOX -> VoiceProvider.VIVOX
+                    "none", "disabled", "false" -> VoiceProvider.NONE
+                    else -> VoiceProvider.NONE
+                }
+                return SimulatorVoiceFeatures(
+                    voiceProvider = provider,
+                    rawVoiceServerType = rawServerType
+                )
+            }
+        }
+
+        // Fallback when SimulatorFeatures is absent or omits VoiceServerType (e.g. OpenSim / pre-7.1.9):
+        // VoiceSignalingRequest / SLVoiceWebRTC are exclusive to Second Life WebRTC; a bare
+        // ProvisionVoiceAccountRequest without WebRTC signaling belongs to legacy Vivox.
+        val fallbackProvider = when {
+            "VoiceSignalingRequest" in availableCapabilities || "SLVoiceWebRTC" in availableCapabilities -> {
+                VoiceProvider.WEBRTC
+            }
+            "ProvisionVoiceAccountRequest" in availableCapabilities -> {
+                VoiceProvider.VIVOX
+            }
+            else -> VoiceProvider.NONE
+        }
+        return SimulatorVoiceFeatures(
+            voiceProvider = fallbackProvider,
+            rawVoiceServerType = ""
+        )
+    }
+
+    /**
+     * Parses a legacy Vivox `ProvisionVoiceAccountRequest` response (`username`, `password`,
+     * `voice_sip_uri_hostname`, `voice_account_server_name`) without touching WebRTC JSEP.
+     */
+    fun parseVivoxLegacyProvisionResponse(llsd: LlsdValue): VivoxLegacyAccountInfo? {
+        val map = llsd as? LlsdValue.MapVal ?: return null
+        // Reject if response is actually a WebRTC JSEP payload
+        if (map.entries.containsKey("jsep")) return null
+        val username = map["username"].asString()
+        val password = map["password"].asString()
+        val sipHost = map["voice_sip_uri_hostname"].asString()
+        val accountServer = map["voice_account_server_name"].asString()
+        if (username.isBlank() && sipHost.isBlank() && accountServer.isBlank()) return null
+        return VivoxLegacyAccountInfo(
+            accountName = username,
+            password = password,
+            voiceSipUriHostname = sipHost,
+            voiceAccountServerName = accountServer
+        )
+    }
 
     sealed class VoiceChannelRequest {
         data class Local(val parcelLocalId: Int? = null) : VoiceChannelRequest()
@@ -270,16 +396,17 @@ object SlVoiceWebRtcProtocol {
                     iceServers += VoiceIceServer(urls = listOf(entry.value))
                 }
                 is LlsdValue.MapVal -> {
-                    val urls = when (val urlsNode = entry["urls"] ?: entry["url"]) {
+                    val urls = when (val urlsNode = entry.entries["urls"] ?: entry.entries["url"]) {
                         is LlsdValue.Str -> listOfNotNull(urlsNode.value.takeIf { it.isNotBlank() })
+                        is LlsdValue.Uri -> listOfNotNull(urlsNode.value.takeIf { it.isNotBlank() })
                         is LlsdValue.ArrayVal -> urlsNode.items.map { it.asString() }.filter { it.isNotBlank() }
                         else -> emptyList()
                     }
                     if (urls.isNotEmpty()) {
                         iceServers += VoiceIceServer(
                             urls = urls,
-                            username = entry["username"]?.asString()?.takeIf { it.isNotEmpty() },
-                            credential = entry["credential"]?.asString()?.takeIf { it.isNotEmpty() }
+                            username = entry.entries["username"]?.asString()?.takeIf { it.isNotEmpty() },
+                            credential = entry.entries["credential"]?.asString()?.takeIf { it.isNotEmpty() }
                         )
                     }
                 }
@@ -306,7 +433,7 @@ object SlVoiceWebRtcProtocol {
     fun parseParcelVoiceInfoResponse(llsd: LlsdValue): ParcelVoiceInfo? {
         if (llsd !is LlsdValue.MapVal) return null
         val regionName = llsd["region_name"].asString()
-        val localId = (llsd["local_id"] ?: llsd["parcel_local_id"]).asInt(0)
+        val localId = (llsd.entries["local_id"] ?: llsd.entries["parcel_local_id"])?.asInt(0) ?: 0
         val credsMap = llsd["voice_credentials"] as? LlsdValue.MapVal
         val channelUri = credsMap?.get("channel_uri")?.asString().orEmpty()
             .ifBlank { credsMap?.get("channel")?.asString().orEmpty() }

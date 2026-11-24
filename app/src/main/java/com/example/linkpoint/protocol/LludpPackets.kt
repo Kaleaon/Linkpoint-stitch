@@ -27,14 +27,33 @@ object LludpPackets {
     const val MSG_OBJECT_UPDATE_COMPRESSED: Int = 13
     const val MSG_IMPROVED_TERSE_OBJECT_UPDATE: Int = 15
     const val MSG_KILL_OBJECT: Int = 16
-    const val MSG_PARCEL_PROPERTIES: Int = 23
-    const val MSG_SOUND_TRIGGER: Int = 29
+    const val MSG_PARCEL_PROPERTIES: Int = 0x17          // High 23, Zerocoded (UDPDeprecated on Agni; OpenSim fallback)
+    const val MSG_SOUND_TRIGGER: Int = 0x1D              // High 29, Unencoded
 
     // Medium frequency message IDs (0xFF + 1 byte)
     const val MSG_COARSE_LOCATION_UPDATE: Int = 0xFF06
-    const val MSG_ATTACHED_SOUND: Int = 0xFF0D
-    const val MSG_ATTACHED_SOUND_GAIN_CHANGE: Int = 0xFF0E
-    const val MSG_PRELOAD_SOUND: Int = 0xFF0F
+    const val MSG_PARCEL_PROPERTIES_REQUEST: Int = 0xFF0B // Medium 11, Zerocoded
+    const val MSG_ATTACHED_SOUND: Int = 0xFF0D            // Medium 13, Unencoded
+    const val MSG_ATTACHED_SOUND_GAIN_CHANGE: Int = 0xFF0E // Medium 14, Unencoded
+    const val MSG_PRELOAD_SOUND: Int = 0xFF0F             // Medium 15, Unencoded
+
+    /**
+     * Sound UDP message IDs marked `Unencoded` in `indra/llmessage/message_template.msg`.
+     * These packets MUST NEVER be zero-coded (`FLAG_ZEROCODED` / `0x80` is strictly forbidden).
+     */
+    val UNENCODED_SOUND_MESSAGE_IDS: Set<Int> = setOf(
+        MSG_SOUND_TRIGGER,
+        MSG_ATTACHED_SOUND,
+        MSG_ATTACHED_SOUND_GAIN_CHANGE,
+        MSG_PRELOAD_SOUND
+    )
+
+    fun isStrictlyUnencodedMessage(messageId: Int): Boolean =
+        messageId in UNENCODED_SOUND_MESSAGE_IDS ||
+            messageId == MSG_START_PING_CHECK ||
+            messageId == MSG_COMPLETE_PING_CHECK ||
+            messageId == MSG_PACKET_ACK ||
+            messageId == MSG_LOGOUT_REQUEST
 
     // Canonical Second Life AttachedSound flags (llaudio/sound_ids.h)
     const val SOUND_PLAY: Int = 0x00
@@ -267,8 +286,9 @@ object LludpPackets {
         }
         rawMsg.write(body)
         val msgBytes = rawMsg.toByteArray()
-        val encoded = if (useZeroCoding) zeroEncode(msgBytes) else msgBytes
-        val actuallyZeroCoded = useZeroCoding && encoded.size < msgBytes.size
+        val allowZeroCoding = useZeroCoding && !isStrictlyUnencodedMessage(messageId)
+        val encoded = if (allowZeroCoding) zeroEncode(msgBytes) else msgBytes
+        val actuallyZeroCoded = allowZeroCoding && encoded.size < msgBytes.size
         val payloadBytes = if (actuallyZeroCoded) encoded else msgBytes
 
         var flags = 0
@@ -331,6 +351,10 @@ object LludpPackets {
             messageId = 0xFFFF0000.toInt() or (hi shl 8) or lo
             payloadOffset = 4
         } else {
+            return null
+        }
+
+        if ((flags and FLAG_ZEROCODED) != 0 && messageId in UNENCODED_SOUND_MESSAGE_IDS) {
             return null
         }
 
