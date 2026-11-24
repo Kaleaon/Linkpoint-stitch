@@ -345,7 +345,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                 fromName = evt.fromName,
                                 chatType = evt.chatType,
                                 message = evt.message,
-                                sourceType = evt.sourceType
+                                sourceType = evt.sourceType,
+                                audibleLevel = evt.audible
                             )
                         ) {
                             return@collect

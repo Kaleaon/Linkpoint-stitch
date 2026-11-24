@@ -27,6 +27,14 @@ object RlvConstants {
     const val CHAT_TYPE_OWNER: Int = 8
     const val CHAT_TYPE_DIRECT: Int = 9
 
+    /** Second Life ChatFromSimulator Audible values (`EChatAudible` in `llchat.h` / `ChatAudibleLevel` in LibreMetaverse). */
+    const val CHAT_AUDIBLE_NOT: Int = -1
+    const val CHAT_AUDIBLE_BARELY: Int = 0
+    const val CHAT_AUDIBLE_FULLY: Int = 1
+
+    /** Maximum UTF-8 payload bytes before NUL terminator in `ChatFromViewer` (`DB_CHAT_MSG_STR_LEN = 1023`). */
+    const val MAX_CHAT_FROM_VIEWER_BYTES: Int = 1023
+
     /** Canonical RLV / Firestorm RLVa version numbers and handshake reply strings (`MNNPPBB` = `2080000`). */
     const val RLV_VERSION: String = "2.8.0"
     const val RLVA_VERSION: String = "2.4.2"

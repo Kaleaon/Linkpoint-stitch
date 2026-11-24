@@ -160,8 +160,33 @@ class RlvEngineTest {
         assertTrue(host.channelReplies.isEmpty())
         assertFalse(host.lastSnapshot.sendChatRestricted)
 
-        // Non-@ llOwnerSay text must pass through to normal chat
+        // Non-@ llOwnerSay text and leading-whitespace " @..." text must pass through to normal chat (never RLV)
         assertFalse(ownerSay(collarId, "Collar ready for commands."))
+        assertFalse(ownerSay(collarId, " @version=4711,sendchat=n"))
+        assertTrue(RlvEngine.parseCommandLine(" @version=4711").isEmpty())
+
+        // Omitted sourceType (defaults fail-closed to SOURCE_TYPE_SYSTEM) and non-fully-audible packets must be ignored
+        assertFalse(
+            engine.onIncomingChat(
+                sourceId = collarId,
+                fromName = "Collar",
+                chatType = RlvConstants.CHAT_TYPE_OWNER,
+                message = "@sendchat=n"
+            )
+        )
+        for (inaudible in listOf(RlvConstants.CHAT_AUDIBLE_NOT, RlvConstants.CHAT_AUDIBLE_BARELY)) {
+            assertFalse(
+                engine.onIncomingChat(
+                    sourceId = collarId,
+                    fromName = "Collar",
+                    chatType = RlvConstants.CHAT_TYPE_OWNER,
+                    message = "@sendchat=n",
+                    sourceType = RlvConstants.SOURCE_TYPE_OBJECT,
+                    audibleLevel = inaudible
+                )
+            )
+        }
+        assertFalse(host.lastSnapshot.sendChatRestricted)
 
         // Valid object llOwnerSay (chatType == 8, sourceType == 2) starting with '@' IS intercepted and applied
         assertTrue(ownerSay(collarId, "@sendchat=n"))
@@ -211,7 +236,7 @@ class RlvEngineTest {
         ownerSay(
             collarId,
             "@getstatus=5000,getstatus:tp=5001,getstatus:tp;|=5002," +
-                "getstatus:TP=5003,getstatus:nomatch=5004,getstatus:;|=5005"
+                "getstatus:TP=5003,getstatus:nomatch=5004,getstatus:;|=5005,getstatus:tp; =5006"
         )
         assertEquals(5000 to "/tploc/tplm/sendchat", host.channelReplies[0])
         assertEquals(5001 to "/tploc/tplm", host.channelReplies[1])
@@ -219,6 +244,7 @@ class RlvEngineTest {
         assertEquals(5003 to "/tploc/tplm", host.channelReplies[3])
         assertEquals(5004 to "", host.channelReplies[4])
         assertEquals(5005 to "|tploc|tplm|sendchat", host.channelReplies[5])
+        assertEquals(5006 to " tploc tplm", host.channelReplies[6])
 
         // @getoutfit returns 15-char bitmask matching RlvConstants.OUTFIT_LAYERS
         // Worn: jacket(1), pants(2), shirt(3), shoes(4), skin(9), eyes(10), hair(11), shape(12)
@@ -460,14 +486,15 @@ class RlvEngineTest {
                         fromName = evt.fromName,
                         chatType = evt.chatType,
                         message = evt.message,
-                        sourceType = evt.sourceType
+                        sourceType = evt.sourceType,
+                        audibleLevel = evt.audible
                     )
                 }
             }
         }
 
         try {
-            // 1. Spoofed public/whisper/shout/region/agent ChatFromSimulator packets MUST NOT trigger replies or rules
+            // 1. Spoofed public/whisper/shout/region/agent/inaudible ChatFromSimulator packets MUST NOT trigger replies or rules
             for ((srcType, chType) in listOf(
                 RlvConstants.SOURCE_TYPE_OBJECT to RlvConstants.CHAT_TYPE_WHISPER,
                 RlvConstants.SOURCE_TYPE_OBJECT to RlvConstants.CHAT_TYPE_NORMAL,
@@ -485,6 +512,16 @@ class RlvEngineTest {
                 )
                 circuit.decodeAndDispatchForTesting(spoofed)
             }
+            val inaudibleOwnerSay = buildChatFromSimulatorDecodedPacket(
+                fromName = "MutedObject",
+                sourceId = collarId,
+                ownerId = trustedAvatarId,
+                sourceType = RlvConstants.SOURCE_TYPE_OBJECT,
+                chatType = RlvConstants.CHAT_TYPE_OWNER,
+                message = "@version=4711,tploc=n",
+                audible = RlvConstants.CHAT_AUDIBLE_NOT
+            )
+            circuit.decodeAndDispatchForTesting(inaudibleOwnerSay)
             assertTrue("Spoofed ChatFromSimulator packets must never emit ChatFromViewer replies", capturedWirePackets.isEmpty())
             assertEquals(0, wireEngine.getSnapshot().activeRuleCount)
 
@@ -548,7 +585,8 @@ class RlvEngineTest {
         ownerId: UUID,
         sourceType: Int,
         chatType: Int,
-        message: String
+        message: String,
+        audible: Int = RlvConstants.CHAT_AUDIBLE_FULLY
     ): LludpPackets.DecodedPacket {
         val nameBytes = (fromName + "\u0000").toByteArray(Charsets.UTF_8)
         val msgBytes = (message + "\u0000").toByteArray(Charsets.UTF_8)
@@ -560,7 +598,7 @@ class RlvEngineTest {
         LludpPackets.putUuid(body, ownerId)
         body.put(sourceType.toByte())
         body.put(chatType.toByte())
-        body.put(1.toByte()) // Audible
+        body.put(audible.toByte())
         body.putFloat(128f)
         body.putFloat(128f)
         body.putFloat(25f)

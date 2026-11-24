@@ -7,17 +7,18 @@ import java.util.UUID
  * and Behavioral Restriction Engine.
  *
  * ### Provenance & Open-Source Licensing
- * - **`LibreMetaverse.RLV` (BSD 3-Clause License, Sjofn LLC / LibreMetaverse contributors)**:
+ * - **`cinderblocks/libremetaverse` — `LibreMetaverse.RLV` (BSD 3-Clause License, Sjofn LLC / LibreMetaverse contributors)**:
  *   Cross-checked for canonical per-object rule tracking, `@version` / `@versionnew` / `@versionnum` /
- *   `@getstatus[:filter[;separator]]` positive-channel reply semantics, target-exception evaluation,
- *   and 15-layer `@getoutfit` / 41-slot `@getattach` bitmask ordering.
- * - **`react-linkpoint` / Linkpoint (MIT License)**:
+ *   `@versionnumbl` / `@getstatus[:filter[;separator]]` positive-channel reply semantics, `ChatAudibleLevel.Fully`
+ *   + `ChatSourceType.Object` + `ChatType.Owner` gating, target-exception evaluation, and 15-layer
+ *   `@getoutfit` / 41-slot `@getattach` bitmask ordering.
+ * - **`Kaleaon/react-linkpoint` / Linkpoint (MIT License)**:
  *   Adapted for the reactive [RlvUiSnapshot] state contract, mobile inspector controller grouping,
  *   and offline sandbox RLVa relay presets.
- * - **Public RLV / Firestorm Release-Branch RLVa Protocol Specification**:
+ * - **`FirestormViewer/phoenix-firestorm` Release-Branch RLVa Specification**:
  *   Interoperates with Marine Kelley's RLV (`v2.8.0`, `MNNPPBB = 2080000`) and Kitty Barnett's
- *   Firestorm release-branch RLVa (`RLVa 2.4.2`, `RestrainedLove viewer v...`) LSL wire conventions.
- *   Clean-room Kotlin implementation; zero LGPL viewer C++ source code is copied.
+ *   Firestorm release-branch RLVa (`RLVa 2.4.2`, `RestrainedLife viewer v...` / `RestrainedLove viewer v...`)
+ *   LSL wire conventions. Clean-room Kotlin implementation; zero LGPL viewer C++ source code is copied.
  *
  * ### Linden Lab Third-Party Viewer (TPV) Policy & Safety Invariants
  * - **Explicit User Opt-In (`initialEnabled = false`)**: RLVa is disabled by default until the user
@@ -25,9 +26,10 @@ import java.util.UUID
  *   off immediately purges all active restrictions and ignores subsequent `@` commands.
  * - **Anti-Spoofing `llOwnerSay` Gate**: Processes `ChatFromSimulator` messages **only** when
  *   `enabled == true`, `sourceType == SOURCE_TYPE_OBJECT (2)`, `chatType == CHAT_TYPE_OWNER (8)`
- *   (`llOwnerSay`), and the message starts with `@`. Public (`1`), whisper (`0`), shout (`2`),
- *   debug (`6`), `llRegionSayTo` (`7`), direct (`9`), and avatar (`sourceType == 1`) chat are strictly
- *   ignored so spoofed public `@` chat can never trigger restrictions or channel replies.
+ *   (`llOwnerSay`), `audibleLevel == CHAT_AUDIBLE_FULLY (1)`, and character `0` of the message is `@`.
+ *   Public (`1`), whisper (`0`), shout (`2`), debug (`6`), `llRegionSayTo` (`7`), direct (`9`),
+ *   inaudible (`<= 0`), IM, and avatar (`sourceType == 1`) chat are strictly ignored so spoofed
+ *   public `@` chat can never trigger restrictions or channel replies.
  * - **Positive-Channel-Only Replies (`channel > 0`)**: Handshake and status queries (`@version`,
  *   `@versionnew`, `@versionnum`, `@versionnumbl`, `@getstatus[:filter[;sep]]`, `@getstatusall`,
  *   `@getoutfit`, `@getattach`, and `@getsitid`) reply exclusively on positive `> 0` script channels
@@ -80,11 +82,13 @@ class RlvEngine(
         fromName: String,
         chatType: Int,
         message: String,
-        sourceType: Int = RlvConstants.SOURCE_TYPE_OBJECT
+        sourceType: Int = RlvConstants.SOURCE_TYPE_SYSTEM,
+        audibleLevel: Int = RlvConstants.CHAT_AUDIBLE_FULLY
     ): Boolean {
         if (!enabled) return false
         if (sourceType != RlvConstants.SOURCE_TYPE_OBJECT) return false
         if (chatType != RlvConstants.CHAT_TYPE_OWNER) return false
+        if (audibleLevel != RlvConstants.CHAT_AUDIBLE_FULLY) return false
         if (!message.startsWith("@")) return false
 
         val commands = parseCommandLine(message)
@@ -410,26 +414,27 @@ class RlvEngine(
          * Supports comma-separated commands (`@detach=n,sendchat=n,redirchat:324=add,@clear=tp`).
          */
         fun parseCommandLine(rawMessage: String): List<ParsedRlvCommand> {
-            val trimmed = rawMessage.trim()
-            if (!trimmed.startsWith("@")) return emptyList()
+            // Canonical RLV/RLVa requires '@' at index 0 (leading whitespace is normal chat, never RLV).
+            if (!rawMessage.startsWith("@")) return emptyList()
 
-            val body = trimmed.substring(1)
+            val body = rawMessage.substring(1)
             if (body.isBlank()) return emptyList()
 
             val result = mutableListOf<ParsedRlvCommand>()
             for (token in body.split(',')) {
-                var part = token.trim()
+                var part = token.trimStart()
                 if (part.startsWith("@")) {
-                    part = part.substring(1).trim()
+                    part = part.substring(1).trimStart()
                 }
-                if (part.isEmpty()) continue
+                if (part.isBlank()) continue
 
                 val eqIdx = part.indexOf('=')
                 if (eqIdx < 0) {
                     // Handle parameterless @clear or @clear:<filter> (and shorthand @cmd:force)
-                    val colonIdx = part.indexOf(':')
-                    val cmdName = (if (colonIdx >= 0) part.substring(0, colonIdx) else part).trim().lowercase()
-                    val opt = if (colonIdx >= 0) part.substring(colonIdx + 1).trim() else ""
+                    val trimmedPart = part.trimEnd()
+                    val colonIdx = trimmedPart.indexOf(':')
+                    val cmdName = (if (colonIdx >= 0) trimmedPart.substring(0, colonIdx) else trimmedPart).trim().lowercase()
+                    val opt = if (colonIdx >= 0) trimmedPart.substring(colonIdx + 1).trim() else ""
                     if (cmdName == "clear") {
                         result += ParsedRlvCommand(command = "clear", option = opt, param = "")
                     } else if (opt.equals("force", ignoreCase = true)) {
@@ -438,14 +443,14 @@ class RlvEngine(
                     continue
                 }
 
-                val lhs = part.substring(0, eqIdx).trim()
+                val rawLhs = part.substring(0, eqIdx)
                 val param = part.substring(eqIdx + 1).trim().lowercase()
-                if (lhs.isEmpty()) continue
+                if (rawLhs.isBlank()) continue
 
-                val colonIdx = lhs.indexOf(':')
-                val cmdName = (if (colonIdx >= 0) lhs.substring(0, colonIdx) else lhs).trim().lowercase()
+                val colonIdx = rawLhs.indexOf(':')
+                val cmdName = (if (colonIdx >= 0) rawLhs.substring(0, colonIdx) else rawLhs).trim().lowercase()
                 val opt = if (colonIdx >= 0) {
-                    val rawOpt = lhs.substring(colonIdx + 1)
+                    val rawOpt = rawLhs.substring(colonIdx + 1)
                     if (';' in rawOpt) rawOpt else rawOpt.trim()
                 } else {
                     ""
@@ -820,11 +825,11 @@ class RlvEngine(
     private fun parseFilterAndSeparator(option: String): Pair<String, String> {
         val semiIdx = option.indexOf(';')
         return if (semiIdx >= 0) {
-            val filter = option.substring(0, semiIdx).lowercase()
+            val filter = option.substring(0, semiIdx).trim().lowercase()
             val sep = option.substring(semiIdx + 1).ifEmpty { "/" }
             filter to sep
         } else {
-            option.lowercase() to "/"
+            option.trim().lowercase() to "/"
         }
     }
 
@@ -833,7 +838,8 @@ class RlvEngine(
         val matching = rules
             .map { it.toRuleString() }
             .filter { filter.isEmpty() || it.contains(filter) }
-        return if (matching.isEmpty()) "" else separator + matching.joinToString(separator)
+        if (matching.isEmpty()) return ""
+        return truncateUtf8Bytes(separator + matching.joinToString(separator), RlvConstants.MAX_CHAT_FROM_VIEWER_BYTES)
     }
 
     private fun formatStatusAllLocked(filter: String, separator: String): String {
@@ -844,7 +850,18 @@ class RlvEngine(
             .distinct()
             .filter { filter.isEmpty() || it.contains(filter) }
             .toList()
-        return if (matching.isEmpty()) "" else separator + matching.joinToString(separator)
+        if (matching.isEmpty()) return ""
+        return truncateUtf8Bytes(separator + matching.joinToString(separator), RlvConstants.MAX_CHAT_FROM_VIEWER_BYTES)
+    }
+
+    private fun truncateUtf8Bytes(text: String, maxBytes: Int): String {
+        val utf8 = text.toByteArray(Charsets.UTF_8)
+        if (utf8.size <= maxBytes) return text
+        var end = maxBytes
+        while (end > 0 && (utf8[end].toInt() and 0xC0) == 0x80) {
+            end--
+        }
+        return String(utf8, 0, end, Charsets.UTF_8)
     }
 
     private fun buildGetOutfitReply(option: String): String {

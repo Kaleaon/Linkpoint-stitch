@@ -47,7 +47,8 @@ sealed class SimEvent {
         val chatType: Int,
         val message: String,
         val position: Vec3,
-        val sourceType: Int = 0
+        val sourceType: Int = 0,
+        val audible: Int = 1
     ) : SimEvent()
 
     data class InstantMessageReceived(
@@ -519,16 +520,17 @@ class LludpCircuitEngine {
                     LludpPackets.readUuid(buf) // OwnerId
                     var sourceType = 0
                     var chatType = 1
+                    var audible = 1
                     if (buf.remaining() >= 3) {
                         sourceType = buf.get().toInt() and 0xFF
                         chatType = buf.get().toInt() and 0xFF
-                        buf.get() // Audible
+                        audible = buf.get().toInt() // Signed S8: -1 = Not, 0 = Barely, 1 = Fully
                     }
                     val pos = if (buf.remaining() >= 12) Vec3(buf.float, buf.float, buf.float) else Vec3(128f, 128f, 25f)
                     val msgLen = if (buf.remaining() >= 2) buf.short.toInt() and 0xFFFF else 0
                     val msg = LludpPackets.readCString(buf, msgLen)
-                    if (msg.isNotBlank()) {
-                        _events.tryEmit(SimEvent.ChatReceived(fromName, sourceId, chatType, msg, pos, sourceType))
+                    if (msg.isNotBlank() && audible > 0) {
+                        _events.tryEmit(SimEvent.ChatReceived(fromName, sourceId, chatType, msg, pos, sourceType, audible))
                     }
                 }
             }
