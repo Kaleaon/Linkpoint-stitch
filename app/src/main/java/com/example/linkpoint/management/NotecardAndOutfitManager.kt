@@ -1,5 +1,6 @@
 package com.example.linkpoint.management
 
+import com.example.linkpoint.protocol.CapabilityManager
 import com.example.linkpoint.protocol.LlsdCodec
 import com.example.linkpoint.protocol.LlsdValue
 import com.example.linkpoint.store.InventoryEntry
@@ -239,3 +240,145 @@ object OutfitFolderPlanner {
         )
     }
 }
+
+data class Ais3OutfitSaveResult(
+    val success: Boolean,
+    val usedAis3: Boolean,
+    val outfitFolderId: UUID,
+    val createdLinkIds: List<UUID> = emptyList(),
+    val cofVersion: Int? = null,
+    val cofVersionIncremented: Boolean = false,
+    val statusMessage: String
+)
+
+/**
+ * Second Life AISv3 (`InventoryAPIv3` + `IncrementCOFVersion`) protocol helpers per
+ * `indra/newview/llaisapi.cpp` and `llappearancemgr.cpp`.
+ */
+object Ais3OutfitProtocol {
+    const val CAP_INVENTORY_API_V3 = "InventoryAPIv3"
+    const val CAP_LIBRARY_API_V3 = "LibraryAPIv3"
+    const val CAP_INCREMENT_COF_VERSION = "IncrementCOFVersion"
+
+    fun buildCreateOutfitCategoryXml(plan: OutfitSavePlan): String {
+        val outfitLinks = plan.linksToCreate
+            .filter { it.targetFolderId == plan.outfitFolderId }
+            .map { linkToLlsdMap(it) }
+
+        val categoryMap = LinkedHashMap<String, LlsdValue>().apply {
+            put("folder_id", LlsdValue.Uuid(plan.outfitFolderId))
+            put("parent_id", LlsdValue.Uuid(plan.parentMyOutfitsId))
+            put("name", LlsdValue.Str(plan.outfitName))
+            put("type_default", LlsdValue.IntVal(OutfitInventoryConstants.FT_OUTFIT))
+            if (outfitLinks.isNotEmpty()) {
+                put("links", LlsdValue.ArrayVal(outfitLinks))
+            }
+        }
+        val root = LlsdValue.MapVal(
+            mapOf("categories" to LlsdValue.ArrayVal(listOf(LlsdValue.MapVal(categoryMap))))
+        )
+        return LlsdCodec.toXml(root)
+    }
+
+    fun buildCreateLinksXml(
+        links: List<OutfitLinkSpec>,
+        outfitFolderIdOverride: UUID? = null
+    ): String {
+        val linkNodes = links.map { spec ->
+            val effectiveTarget = if (
+                spec.assetType == OutfitInventoryConstants.AT_LINK_FOLDER &&
+                outfitFolderIdOverride != null
+            ) {
+                spec.copy(oldItemId = outfitFolderIdOverride)
+            } else {
+                spec
+            }
+            linkToLlsdMap(effectiveTarget)
+        }
+        return LlsdCodec.toXml(LlsdValue.MapVal(mapOf("links" to LlsdValue.ArrayVal(linkNodes))))
+    }
+
+    private fun linkToLlsdMap(link: OutfitLinkSpec): LlsdValue.MapVal = LlsdValue.MapVal(
+        linkedMapOf(
+            "linked_id" to LlsdValue.Uuid(link.oldItemId),
+            "type" to LlsdValue.IntVal(link.assetType),
+            "inv_type" to LlsdValue.IntVal(link.inventoryType),
+            "name" to LlsdValue.Str(link.name),
+            "desc" to LlsdValue.Str(link.description)
+        )
+    )
+
+    fun parseEmbeddedCategoryId(llsd: LlsdValue): UUID? {
+        val categories = llsd["_embedded"]["categories"]
+        when (categories) {
+            is LlsdValue.MapVal -> {
+                for ((key, node) in categories.entries) {
+                    (node["category_id"].asUuidOrNull() ?: node["folder_id"].asUuidOrNull())?.let { return it }
+                    runCatching { UUID.fromString(key) }.getOrNull()?.let { return it }
+                }
+            }
+            is LlsdValue.ArrayVal -> {
+                for (node in categories.items) {
+                    (node["category_id"].asUuidOrNull() ?: node["folder_id"].asUuidOrNull())?.let { return it }
+                }
+            }
+            else -> Unit
+        }
+        return llsd["category_id"].asUuidOrNull() ?: llsd["folder_id"].asUuidOrNull()
+    }
+
+    fun parseEmbeddedLinkIds(llsd: LlsdValue): List<UUID> {
+        val links = llsd["_embedded"]["links"]
+        val out = mutableListOf<UUID>()
+        when (links) {
+            is LlsdValue.MapVal -> {
+                for ((key, node) in links.entries) {
+                    val id = node["item_id"].asUuidOrNull()
+                        ?: runCatching { UUID.fromString(key) }.getOrNull()
+                    if (id != null) out += id
+                }
+            }
+            is LlsdValue.ArrayVal -> {
+                for (node in links.items) {
+                    node["item_id"].asUuidOrNull()?.let { out += it }
+                }
+            }
+            else -> Unit
+        }
+        return out
+    }
+
+    fun parseCofVersion(llsd: LlsdValue): Int? {
+        val v = llsd["cof_version"].takeIf { it !is LlsdValue.Undef }
+            ?: llsd["version"].takeIf { it !is LlsdValue.Undef }
+            ?: return null
+        return v.asInt(0).takeIf { it > 0 }
+    }
+}
+
+/**
+ * Coordinates outfit saving across Second Life (Agni AIS3 `InventoryAPIv3` + `IncrementCOFVersion`)
+ * and OpenSimulator (UDP `CreateInventoryFolder` + `LinkInventoryItem` fallback).
+ */
+object OutfitSaveCoordinator {
+    suspend fun executeSaveOutfit(
+        plan: OutfitSavePlan,
+        capabilityManager: CapabilityManager,
+        onUdpFallback: (OutfitSavePlan) -> Unit
+    ): Ais3OutfitSaveResult {
+        if (capabilityManager.hasCapability(Ais3OutfitProtocol.CAP_INVENTORY_API_V3)) {
+            val aisResult = capabilityManager.saveOutfitViaAis3(plan)
+            if (aisResult.success) {
+                return aisResult
+            }
+        }
+        onUdpFallback(plan)
+        return Ais3OutfitSaveResult(
+            success = true,
+            usedAis3 = false,
+            outfitFolderId = plan.outfitFolderId,
+            statusMessage = "Saved outfit '${plan.outfitName}' via OpenSim UDP fallback"
+        )
+    }
+}
+

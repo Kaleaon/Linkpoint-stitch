@@ -31,9 +31,12 @@ object WorldManagementPackets {
     const val MSG_DIR_PEOPLE_REPLY: Int = 0xFFFF0024.toInt()      // Low 36
     const val MSG_DIR_EVENTS_REPLY: Int = 0xFFFF0025.toInt()      // Low 37
     const val MSG_DIR_GROUPS_REPLY: Int = 0xFFFF0026.toInt()      // Low 38
-    const val MSG_PARCEL_INFO_REQUEST: Int = 0xFFFF0036.toInt()   // Low 54
-    const val MSG_PARCEL_INFO_REPLY: Int = 0xFFFF0037.toInt()     // Low 55
-    const val MSG_REQUEST_PAY_PRICE: Int = 0xFFFF00A1.toInt()     // Low 161
+    const val MSG_PARCEL_INFO_REQUEST: Int = 0xFFFF0036.toInt()   // Low 54 (Unencoded)
+    const val MSG_PARCEL_INFO_REPLY: Int = 0xFFFF0037.toInt()     // Low 55 (Zerocoded)
+    const val MSG_GROUP_NOTICES_LIST_REQUEST: Int = 0xFFFF003A.toInt() // Low 58 (Unencoded)
+    const val MSG_GROUP_NOTICES_LIST_REPLY: Int = 0xFFFF003B.toInt()   // Low 59 (Unencoded)
+    const val MSG_GROUP_NOTICE_REQUEST: Int = 0xFFFF003C.toInt()       // Low 60 (Unencoded)
+    const val MSG_REQUEST_PAY_PRICE: Int = 0xFFFF00A1.toInt()     // Low 161 (Unencoded)
     const val MSG_PAY_PRICE_REPLY: Int = 0xFFFF00A2.toInt()       // Low 162
     const val MSG_PARCEL_RETURN_OBJECTS: Int = 0xFFFF00C7.toInt() // Low 199
     const val MSG_PARCEL_BUY_PASS: Int = 0xFFFF00CE.toInt()       // Low 206
@@ -57,6 +60,68 @@ object WorldManagementPackets {
 
     const val IM_DIALOG_GROUP_NOTICE: Byte = 32
     const val IM_DIALOG_GROUP_NOTICE_REQUESTED: Byte = 37
+
+    /**
+     * Canonical `message_template.msg` encoding table (`Zerocoded` vs `Unencoded`).
+     * Messages in [ZERO_CODED_MESSAGE_IDS] set `FLAG_ZEROCODED (0x80)` in the LLUDP header;
+     * messages in [UNENCODED_MESSAGE_IDS] are transmitted unencoded (`(flags & 0x80) == 0`).
+     */
+    val ZERO_CODED_MESSAGE_IDS: Set<Int> = setOf(
+        MSG_PARCEL_PROPERTIES,
+        MSG_PARCEL_PROPERTIES_REQUEST,
+        MSG_DIR_FIND_QUERY,
+        MSG_DIR_PLACES_QUERY,
+        MSG_DIR_PLACES_REPLY,
+        MSG_DIR_PEOPLE_REPLY,
+        MSG_DIR_EVENTS_REPLY,
+        MSG_DIR_GROUPS_REPLY,
+        MSG_PARCEL_INFO_REPLY,
+        MSG_PARCEL_RETURN_OBJECTS,
+        MSG_MONEY_TRANSFER_REQUEST,
+        MSG_GROUP_PROFILE_REPLY,
+        MSG_ACTIVATE_GROUP,
+        MSG_GROUP_TITLES_REPLY,
+        MSG_AGENT_GROUP_DATA_UPDATE,
+        MSG_LINK_INVENTORY_ITEM
+    )
+
+    val UNENCODED_MESSAGE_IDS: Set<Int> = setOf(
+        MSG_PARCEL_INFO_REQUEST,
+        MSG_GROUP_NOTICES_LIST_REQUEST,
+        MSG_GROUP_NOTICES_LIST_REPLY,
+        MSG_GROUP_NOTICE_REQUEST,
+        MSG_REQUEST_PAY_PRICE,
+        MSG_PAY_PRICE_REPLY,
+        MSG_PARCEL_BUY_PASS,
+        MSG_MUTE_LIST_REQUEST,
+        MSG_UPDATE_MUTE_LIST_ENTRY,
+        MSG_REMOVE_MUTE_LIST_ENTRY,
+        MSG_CREATE_INVENTORY_FOLDER,
+        MSG_MUTE_LIST_UPDATE,
+        MSG_USE_CACHED_MUTE_LIST,
+        MSG_GROUP_PROFILE_REQUEST,
+        MSG_GROUP_ROLE_DATA_REQUEST,
+        MSG_GROUP_ROLE_DATA_REPLY,
+        MSG_GROUP_TITLES_REQUEST,
+        MSG_GROUP_TITLE_UPDATE
+    )
+
+    fun isZeroCoded(messageId: Int): Boolean = messageId in ZERO_CODED_MESSAGE_IDS
+
+    fun framePacket(
+        sequenceNumber: Int,
+        reliable: Boolean = true,
+        messageId: Int,
+        body: ByteArray,
+        acks: List<Int> = emptyList()
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = messageId,
+        body = body,
+        acks = acks,
+        useZeroCoding = isZeroCoded(messageId)
+    )
 
     // ── Parsed Wire Structures ──────────────────────────────────────────
 
@@ -91,6 +156,18 @@ object WorldManagementPackets {
         val sessionId: UUID,
         val groupId: UUID,
         val titleRoleId: UUID
+    )
+
+    data class ParsedGroupNoticesListRequest(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val groupId: UUID
+    )
+
+    data class ParsedGroupNoticeRequest(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val groupNoticeId: UUID
     )
 
     data class ParsedParcelReturnObjects(
@@ -502,6 +579,78 @@ object WorldManagementPackets {
         return groups
     }
 
+    /**
+     * Parses `AgentGroupDataUpdate` from `EventQueueGet` LLSD (`UDPDeprecated` on Agni),
+     * decoding 64-bit `GroupPowers` from 8-byte big-endian `<binary>` or integer/string nodes.
+     */
+    fun parseAgentGroupDataUpdateLlsd(body: com.example.linkpoint.protocol.LlsdValue): List<GroupMembershipInfo> {
+        val groupItems = body["GroupData"].asList()
+        if (groupItems.isEmpty()) return emptyList()
+        val groups = mutableListOf<GroupMembershipInfo>()
+        groupItems.forEach { entry ->
+            val groupId = (entry["GroupID"] as? com.example.linkpoint.protocol.LlsdValue.Uuid)?.value
+                ?: entry["GroupID"].asUuidOrNull()
+                ?: ZERO_UUID
+            if (groupId == ZERO_UUID) return@forEach
+            val groupName = entry["GroupName"].asString().trim()
+            if (groupName.isBlank()) return@forEach
+            val powers = entry["GroupPowers"].asLong(GroupPowers.GP_NOTICES_RECEIVE)
+            val acceptNotices = entry["AcceptNotices"].asBool(true)
+            val insigniaId = (entry["GroupInsigniaID"] as? com.example.linkpoint.protocol.LlsdValue.Uuid)?.value
+                ?: entry["GroupInsigniaID"].asUuidOrNull()
+                ?: ZERO_UUID
+            val contribution = entry["Contribution"].asInt(0)
+            val title = entry["GroupTitle"].asString().trim().ifBlank { "Member" }
+            groups += GroupMembershipInfo(
+                groupId = groupId,
+                name = groupName,
+                insigniaId = insigniaId,
+                powers = powers,
+                acceptNotices = acceptNotices,
+                contribution = contribution,
+                activeTitle = title
+            )
+        }
+        return groups
+    }
+
+    fun buildAgentGroupDataUpdateLlsd(
+        agentId: UUID,
+        groups: List<GroupMembershipInfo>
+    ): com.example.linkpoint.protocol.LlsdValue = com.example.linkpoint.protocol.LlsdValue.MapVal(
+        linkedMapOf(
+            "AgentData" to com.example.linkpoint.protocol.LlsdValue.ArrayVal(
+                listOf(
+                    com.example.linkpoint.protocol.LlsdValue.MapVal(
+                        mapOf("AgentID" to com.example.linkpoint.protocol.LlsdValue.Uuid(agentId))
+                    )
+                )
+            ),
+            "GroupData" to com.example.linkpoint.protocol.LlsdValue.ArrayVal(
+                groups.map { g ->
+                    com.example.linkpoint.protocol.LlsdValue.MapVal(
+                        linkedMapOf(
+                            "GroupID" to com.example.linkpoint.protocol.LlsdValue.Uuid(g.groupId),
+                            "GroupPowers" to com.example.linkpoint.protocol.LlsdCodec.u64ToBinary(g.powers),
+                            "AcceptNotices" to com.example.linkpoint.protocol.LlsdValue.Bool(g.acceptNotices),
+                            "GroupInsigniaID" to com.example.linkpoint.protocol.LlsdValue.Uuid(g.insigniaId),
+                            "Contribution" to com.example.linkpoint.protocol.LlsdValue.IntVal(g.contribution),
+                            "GroupName" to com.example.linkpoint.protocol.LlsdValue.Str(g.name),
+                            "GroupTitle" to com.example.linkpoint.protocol.LlsdValue.Str(g.activeTitle)
+                        )
+                    )
+                }
+            ),
+            "NewGroupData" to com.example.linkpoint.protocol.LlsdValue.ArrayVal(
+                groups.map {
+                    com.example.linkpoint.protocol.LlsdValue.MapVal(
+                        mapOf("ListInProfile" to com.example.linkpoint.protocol.LlsdValue.Bool(true))
+                    )
+                }
+            )
+        )
+    )
+
     fun buildActivateGroup(agentId: UUID, sessionId: UUID, groupId: UUID): ByteArray {
         val buf = leBuffer(48)
         LludpPackets.putUuid(buf, agentId)
@@ -728,6 +877,92 @@ object WorldManagementPackets {
             fromName = fromAgentName,
             message = formattedMessage,
             dialog = IM_DIALOG_GROUP_NOTICE
+        )
+    }
+
+    fun buildGroupNoticesListRequest(agentId: UUID, sessionId: UUID, groupId: UUID): ByteArray {
+        val buf = leBuffer(48)
+        LludpPackets.putUuid(buf, agentId)
+        LludpPackets.putUuid(buf, sessionId)
+        LludpPackets.putUuid(buf, groupId)
+        return buf.array()
+    }
+
+    fun parseGroupNoticesListRequest(buf: ByteBuffer): ParsedGroupNoticesListRequest? {
+        if (buf.remaining() < 48) return null
+        return ParsedGroupNoticesListRequest(
+            agentId = LludpPackets.readUuid(buf),
+            sessionId = LludpPackets.readUuid(buf),
+            groupId = LludpPackets.readUuid(buf)
+        )
+    }
+
+    fun buildGroupNoticesListReply(
+        agentId: UUID,
+        groupId: UUID,
+        notices: List<GroupNoticeRecord>
+    ): ByteArray {
+        val out = ByteArrayOutputStream()
+        writeUuidToStream(out, agentId)
+        writeUuidToStream(out, groupId)
+        out.write(notices.size.coerceAtMost(255))
+        notices.take(255).forEach { notice ->
+            val noticeId = runCatching { UUID.fromString(notice.id) }.getOrDefault(UUID.randomUUID())
+            writeUuidToStream(out, noticeId)
+            writeIntLe(out, notice.timestampEpochSec.toInt())
+            writeVar2ToStream(out, notice.senderName)
+            writeVar2ToStream(out, notice.subject)
+            out.write(if (notice.hasAttachment) 1 else 0)
+            out.write(notice.assetType and 0xFF)
+        }
+        return out.toByteArray()
+    }
+
+    fun parseGroupNoticesListReply(buf: ByteBuffer, groupName: String = ""): Pair<UUID, List<GroupNoticeRecord>> {
+        if (buf.remaining() < 33) return ZERO_UUID to emptyList()
+        LludpPackets.readUuid(buf) // AgentID
+        val groupId = LludpPackets.readUuid(buf)
+        val count = buf.get().toInt() and 0xFF
+        val notices = mutableListOf<GroupNoticeRecord>()
+        repeat(count) {
+            if (buf.remaining() < 26) return@repeat
+            val noticeId = LludpPackets.readUuid(buf)
+            val timestamp = buf.int.toLong() and 0xFFFFFFFFL
+            val fromName = readVar2(buf)
+            val subject = readVar2(buf)
+            if (buf.remaining() < 2) return@repeat
+            val hasAttachment = buf.get().toInt() != 0
+            val assetType = buf.get().toInt() and 0xFF
+            notices += GroupNoticeRecord(
+                id = noticeId.toString(),
+                groupId = groupId,
+                groupName = groupName,
+                subject = subject,
+                message = "",
+                senderName = fromName,
+                timestampLabel = if (timestamp > 0L) "${timestamp}s" else "Listed",
+                timestampEpochSec = timestamp,
+                hasAttachment = hasAttachment,
+                assetType = assetType
+            )
+        }
+        return groupId to notices
+    }
+
+    fun buildGroupNoticeRequest(agentId: UUID, sessionId: UUID, groupNoticeId: UUID): ByteArray {
+        val buf = leBuffer(48)
+        LludpPackets.putUuid(buf, agentId)
+        LludpPackets.putUuid(buf, sessionId)
+        LludpPackets.putUuid(buf, groupNoticeId)
+        return buf.array()
+    }
+
+    fun parseGroupNoticeRequest(buf: ByteBuffer): ParsedGroupNoticeRequest? {
+        if (buf.remaining() < 48) return null
+        return ParsedGroupNoticeRequest(
+            agentId = LludpPackets.readUuid(buf),
+            sessionId = LludpPackets.readUuid(buf),
+            groupNoticeId = LludpPackets.readUuid(buf)
         )
     }
 
@@ -1186,11 +1421,30 @@ object WorldManagementPackets {
         return ParsedRemoveMuteEntry(agentId, sessionId, muteId, muteName)
     }
 
+    fun buildMuteListUpdate(agentId: UUID, filename: String): ByteArray {
+        val fileBytes = toVar1Bytes(filename)
+        val buf = leBuffer(16 + 1 + fileBytes.size)
+        LludpPackets.putUuid(buf, agentId)
+        putVar1(buf, fileBytes)
+        return buf.array()
+    }
+
     fun parseMuteListUpdate(buf: ByteBuffer): Pair<UUID, String>? {
         if (buf.remaining() < 17) return null
         val agentId = LludpPackets.readUuid(buf)
         val filename = readVar1(buf)
         return agentId to filename
+    }
+
+    fun buildUseCachedMuteList(agentId: UUID): ByteArray {
+        val buf = leBuffer(16)
+        LludpPackets.putUuid(buf, agentId)
+        return buf.array()
+    }
+
+    fun parseUseCachedMuteList(buf: ByteBuffer): UUID? {
+        if (buf.remaining() < 16) return null
+        return LludpPackets.readUuid(buf)
     }
 
     /**

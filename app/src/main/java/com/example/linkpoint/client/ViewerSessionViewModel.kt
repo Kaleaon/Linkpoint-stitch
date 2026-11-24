@@ -35,6 +35,7 @@ import com.example.linkpoint.management.MuteFlags
 import com.example.linkpoint.management.MuteType
 import com.example.linkpoint.management.OutfitFolderPlanner
 import com.example.linkpoint.management.OutfitInventoryConstants
+import com.example.linkpoint.management.OutfitSaveCoordinator
 import com.example.linkpoint.management.ParcelFlags
 import com.example.linkpoint.management.ParcelManagementInfo
 import com.example.linkpoint.management.ParcelReturnType
@@ -143,6 +144,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     @Volatile private var jumpPulseTicks = 0
     @Volatile private var hasServerSelfPosition = false
     @Volatile private var lastServerSelfZ = 23f
+    @Volatile private var receivedEventQueueAgentGroups = false
     @Volatile private var lastUiSnapshotSyncMs = 0L
     @Volatile private var lastUiPosSyncMs = 0L
     private val pressedMoveKeys = ConcurrentHashMap.newKeySet<Int>()
@@ -606,18 +608,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         }
                     }
                     is SimEvent.AgentGroupsUpdated -> {
-                        mutateWorldManagement { wm ->
-                            val nextActive = wm.activeGroupId.takeIf { id -> evt.groups.any { it.groupId == id } }
-                                ?: evt.groups.firstOrNull()?.groupId
-                                ?: wm.activeGroupId
-                            val nextSelected = wm.selectedGroupId.takeIf { id -> evt.groups.any { it.groupId == id } }
-                                ?: nextActive
-                            wm.copy(
-                                groups = evt.groups,
-                                activeGroupId = nextActive,
-                                selectedGroupId = nextSelected,
-                                lastManagementStatus = "Synced ${evt.groups.size} group membership(s)"
-                            )
+                        // UDP Low 389 is UDPDeprecated on Agni; only use it as an OpenSim fallback
+                        // when EventQueueGet has not delivered authoritative AgentGroupDataUpdate.
+                        if (!receivedEventQueueAgentGroups) {
+                            applyAgentGroupMemberships(evt.groups, sourceLabel = "OpenSim UDP")
                         }
                     }
                     is SimEvent.GroupProfileReceived -> {
@@ -646,6 +640,21 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         mutateWorldManagement { wm ->
                             wm.copy(
                                 groupRoles = wm.groupRoles + (evt.groupId to evt.roles)
+                            )
+                        }
+                    }
+                    is SimEvent.GroupNoticesListReceived -> {
+                        mutateWorldManagement { wm ->
+                            val grpName = wm.groups.firstOrNull { it.groupId == evt.groupId }?.name ?: "Group"
+                            val enriched = evt.notices.map { n ->
+                                if (n.groupName.isBlank()) n.copy(groupName = grpName) else n
+                            }
+                            val merged = (enriched + wm.groupNotices.filterNot { existing ->
+                                enriched.any { it.id == existing.id }
+                            }).take(40)
+                            wm.copy(
+                                groupNotices = merged,
+                                lastManagementStatus = "Loaded ${enriched.size} group notice(s)"
                             )
                         }
                     }
@@ -731,6 +740,12 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     }
                     is CapsEvent.AttachmentsUpdated -> {
                         applyCapsAttachmentUpdates(evt.updates)
+                    }
+                    is CapsEvent.AgentGroupDataUpdate -> {
+                        if (evt.agentId == null || evt.agentId == selfAgentId || _state.value.connection !is ConnectionState.Connected) {
+                            receivedEventQueueAgentGroups = true
+                            applyAgentGroupMemberships(evt.groups, sourceLabel = "EventQueueGet")
+                        }
                     }
                     is CapsEvent.GenericNotice -> appendLocalChat(
                         ChatMessage(speaker = evt.title, text = evt.message, isSystem = true)
@@ -1009,6 +1024,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         overrideMfaHash: String
     ) {
         loginJob?.cancel()
+        receivedEventQueueAgentGroups = false
         loginJob = viewModelScope.launch {
             val grid = spec.grid
             val (resolvedFirst, resolvedLast) = XmlRpcLoginClient.resolveAvatarName(spec.firstName, spec.lastName)
@@ -1326,6 +1342,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         pressedMoveKeys.clear()
         verticalVelocityZ = 0f
         hasServerSelfPosition = false
+        receivedEventQueueAgentGroups = false
         LocalSandboxBuilder.buildDefaultAvatarHuds().forEach { manualHudAttachments[it.localId] = it }
 
         avatars.clear()
@@ -1420,6 +1437,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         requestedProfiles.clear()
         verticalVelocityZ = 0f
         textInputFocused = false
+        receivedEventQueueAgentGroups = false
         renderer.focusOverride = null
         _state.update { s ->
             s.copy(
@@ -2657,26 +2675,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             currentOutfitFolderId = cofId
         )
 
-        if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendCreateInventoryFolder(
-                folderId = plan.outfitFolderId,
-                parentId = plan.parentMyOutfitsId,
-                type = OutfitInventoryConstants.FT_OUTFIT,
-                name = plan.outfitName
-            )
-            plan.linksToCreate.forEachIndexed { idx, link ->
-                lludpEngine.sendLinkInventoryItem(
-                    callbackId = idx + 1,
-                    folderId = link.targetFolderId,
-                    oldItemId = link.oldItemId,
-                    assetType = link.assetType,
-                    invType = link.inventoryType,
-                    name = link.name,
-                    description = link.description
-                )
-            }
-        }
-
+        val isLive = _state.value.connection is ConnectionState.Connected
         val outfitFolderEntry = InventoryEntry(
             id = plan.outfitFolderId,
             parentId = plan.parentMyOutfitsId,
@@ -2711,6 +2710,44 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     lastManagementStatus = "Saved outfit '${plan.outfitName}' (${wornItems.size} AT_LINK items)"
                 )
             )
+        }
+
+        if (isLive) {
+            viewModelScope.launch {
+                val saveRes = OutfitSaveCoordinator.executeSaveOutfit(
+                    plan = plan,
+                    capabilityManager = capabilityManager,
+                    onUdpFallback = { fallbackPlan ->
+                        lludpEngine.sendCreateInventoryFolder(
+                            folderId = fallbackPlan.outfitFolderId,
+                            parentId = fallbackPlan.parentMyOutfitsId,
+                            type = OutfitInventoryConstants.FT_OUTFIT,
+                            name = fallbackPlan.outfitName
+                        )
+                        fallbackPlan.linksToCreate.forEachIndexed { idx, link ->
+                            lludpEngine.sendLinkInventoryItem(
+                                callbackId = idx + 1,
+                                folderId = link.targetFolderId,
+                                oldItemId = link.oldItemId,
+                                assetType = link.assetType,
+                                invType = link.inventoryType,
+                                name = link.name,
+                                description = link.description
+                            )
+                        }
+                    }
+                )
+                mutateWorldManagement { wm ->
+                    wm.copy(
+                        savedOutfits = wm.savedOutfits.map { o ->
+                            if (o.folderId == plan.outfitFolderId) {
+                                o.copy(folderId = saveRes.outfitFolderId)
+                            } else o
+                        },
+                        lastManagementStatus = saveRes.statusMessage
+                    )
+                }
+            }
         }
         showToast("Saved outfit: ${plan.outfitName} (${wornItems.size} items)")
     }
@@ -2804,6 +2841,39 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
             )
         }
         showToast("Paid L$$amount to $objectName")
+    }
+
+    private fun applyAgentGroupMemberships(groups: List<GroupMembershipInfo>, sourceLabel: String) {
+        if (groups.isEmpty()) return
+        mutateWorldManagement { wm ->
+            val mergedGroups = groups.map { incoming ->
+                if (incoming.activeTitle.isNotBlank()) {
+                    incoming
+                } else {
+                    val prevTitle = wm.groups.firstOrNull { it.groupId == incoming.groupId }?.activeTitle.orEmpty()
+                    incoming.copy(activeTitle = prevTitle)
+                }
+            }
+            val nextActive = wm.activeGroupId.takeIf { id -> mergedGroups.any { it.groupId == id } }
+                ?: mergedGroups.firstOrNull()?.groupId
+                ?: wm.activeGroupId
+            val nextSelected = wm.selectedGroupId.takeIf { id -> mergedGroups.any { it.groupId == id } }
+                ?: nextActive
+            wm.copy(
+                groups = mergedGroups,
+                activeGroupId = nextActive,
+                selectedGroupId = nextSelected,
+                lastManagementStatus = "Synced ${mergedGroups.size} group membership(s) ($sourceLabel)"
+            )
+        }
+    }
+
+    internal fun dispatchEventQueueXmlForTesting(xml: String) {
+        capabilityManager.dispatchEventQueuePayloadForTesting(xml)
+    }
+
+    internal fun dispatchUdpPacketForTesting(framedPacket: ByteArray) {
+        lludpEngine.decodeAndDispatchForTesting(framedPacket)
     }
 
     private fun mutateWorldManagement(transform: (WorldManagementState) -> WorldManagementState) {

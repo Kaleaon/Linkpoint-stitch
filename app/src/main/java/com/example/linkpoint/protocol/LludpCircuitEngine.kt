@@ -3,6 +3,7 @@ package com.example.linkpoint.protocol
 import com.example.linkpoint.management.DirectoryCategory
 import com.example.linkpoint.management.DirectorySearchResult
 import com.example.linkpoint.management.GroupMembershipInfo
+import com.example.linkpoint.management.GroupNoticeRecord
 import com.example.linkpoint.management.GroupProfileInfo
 import com.example.linkpoint.management.GroupRoleInfo
 import com.example.linkpoint.management.GroupTitleInfo
@@ -128,6 +129,7 @@ sealed class SimEvent {
     data class GroupProfileReceived(val profile: GroupProfileInfo) : SimEvent()
     data class GroupTitlesReceived(val groupId: UUID, val titles: List<GroupTitleInfo>) : SimEvent()
     data class GroupRolesReceived(val groupId: UUID, val roles: List<GroupRoleInfo>) : SimEvent()
+    data class GroupNoticesListReceived(val groupId: UUID, val notices: List<GroupNoticeRecord>) : SimEvent()
     data class ParcelInfoReceived(val parcel: ParcelManagementInfo) : SimEvent()
     data class ParcelPropertiesReceived(val parcel: ParcelManagementInfo) : SimEvent()
     data class MuteListSyncReceived(val filename: String, val cached: Boolean) : SimEvent()
@@ -458,6 +460,11 @@ class LludpCircuitEngine {
         }
     }
 
+    internal fun decodeAndDispatchForTesting(framedPacket: ByteArray) {
+        val decoded = LludpPackets.decodePacket(framedPacket, framedPacket.size) ?: return
+        handleDecodedPacket(decoded)
+    }
+
     private fun handleDecodedPacket(pkt: LludpPackets.DecodedPacket) {
         val buf = pkt.payload
         when (pkt.messageId) {
@@ -706,6 +713,12 @@ class LludpCircuitEngine {
                 val (groupId, roles) = WorldManagementPackets.parseGroupRoleDataReply(buf)
                 if (groupId != ZERO_UUID) {
                     _events.tryEmit(SimEvent.GroupRolesReceived(groupId, roles))
+                }
+            }
+            WorldManagementPackets.MSG_GROUP_NOTICES_LIST_REPLY -> {
+                val (groupId, notices) = WorldManagementPackets.parseGroupNoticesListReply(buf)
+                if (groupId != ZERO_UUID) {
+                    _events.tryEmit(SimEvent.GroupNoticesListReceived(groupId, notices))
                 }
             }
             WorldManagementPackets.MSG_PARCEL_INFO_REPLY -> {
@@ -1445,6 +1458,18 @@ class LludpCircuitEngine {
             WorldManagementPackets.buildGroupRoleDataRequest(agentId, sessionId, groupId),
             reliable = true
         )
+        send(
+            WorldManagementPackets.MSG_GROUP_NOTICES_LIST_REQUEST,
+            WorldManagementPackets.buildGroupNoticesListRequest(agentId, sessionId, groupId),
+            reliable = true,
+            zeroCode = false
+        )
+    }
+
+    fun sendGroupNoticeRequest(groupNoticeId: UUID) {
+        if (!running.get()) return
+        val body = WorldManagementPackets.buildGroupNoticeRequest(agentId, sessionId, groupNoticeId)
+        send(WorldManagementPackets.MSG_GROUP_NOTICE_REQUEST, body, reliable = true, zeroCode = false)
     }
 
     fun sendGroupTitleUpdate(groupId: UUID, titleRoleId: UUID) {
@@ -1590,12 +1615,22 @@ class LludpCircuitEngine {
         send(LludpPackets.MSG_PACKET_ACK, buf.array(), reliable = false)
     }
 
-    private fun send(messageId: Int, body: ByteArray, reliable: Boolean, zeroCode: Boolean = false) {
+    private fun send(
+        messageId: Int,
+        body: ByteArray,
+        reliable: Boolean,
+        zeroCode: Boolean = WorldManagementPackets.isZeroCoded(messageId)
+    ) {
         val framed = frameAndTrack(messageId, body, reliable, zeroCode)
         scope.launch { transmitRaw(framed) }
     }
 
-    private fun sendDirect(messageId: Int, body: ByteArray, reliable: Boolean, zeroCode: Boolean = false) {
+    private fun sendDirect(
+        messageId: Int,
+        body: ByteArray,
+        reliable: Boolean,
+        zeroCode: Boolean = WorldManagementPackets.isZeroCoded(messageId)
+    ) {
         val framed = frameAndTrack(messageId, body, reliable, zeroCode)
         transmitRaw(framed)
     }

@@ -143,7 +143,10 @@ data class GroupNoticeRecord(
     val subject: String,
     val message: String,
     val senderName: String,
-    val timestampLabel: String
+    val timestampLabel: String,
+    val timestampEpochSec: Long = 0L,
+    val hasAttachment: Boolean = false,
+    val assetType: Int = 0
 )
 
 /**

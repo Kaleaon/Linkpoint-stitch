@@ -14,9 +14,11 @@ import androidx.compose.ui.test.performTextReplacement
 import androidx.test.core.app.ApplicationProvider
 import com.example.linkpoint.client.ViewerSessionViewModel
 import com.example.linkpoint.designsystem.LinkpointTheme
+import com.example.linkpoint.management.Ais3OutfitProtocol
 import com.example.linkpoint.management.DirectoryCategory
 import com.example.linkpoint.management.DirectorySearchResult
 import com.example.linkpoint.management.GroupMembershipInfo
+import com.example.linkpoint.management.GroupNoticeRecord
 import com.example.linkpoint.management.GroupPowers
 import com.example.linkpoint.management.GroupProfileInfo
 import com.example.linkpoint.management.GroupRoleInfo
@@ -28,12 +30,15 @@ import com.example.linkpoint.management.MuteType
 import com.example.linkpoint.management.NotecardCapProtocol
 import com.example.linkpoint.management.OutfitFolderPlanner
 import com.example.linkpoint.management.OutfitInventoryConstants
+import com.example.linkpoint.management.OutfitSaveCoordinator
 import com.example.linkpoint.management.ParcelFlags
 import com.example.linkpoint.management.ParcelManagementInfo
 import com.example.linkpoint.management.ParcelReturnType
 import com.example.linkpoint.management.PayPriceInfo
 import com.example.linkpoint.management.WorldManagementPackets
 import com.example.linkpoint.protocol.CapabilityManager
+import com.example.linkpoint.protocol.LlsdCodec
+import com.example.linkpoint.protocol.LlsdValue
 import com.example.linkpoint.protocol.LludpPackets
 import com.example.linkpoint.store.InventoryEntry
 import com.example.linkpoint.ui.ObjectInspectorContent
@@ -83,7 +88,8 @@ class Phase10WorldManagementTest {
             queryFlags = DirectoryCategory.EVENTS.defaultFlags,
             queryStart = 0
         )
-        val framedFind = LludpPackets.framePacket(11, true, WorldManagementPackets.MSG_DIR_FIND_QUERY, findBytes)
+        val framedFind = WorldManagementPackets.framePacket(11, true, WorldManagementPackets.MSG_DIR_FIND_QUERY, findBytes)
+        assertTrue((framedFind[0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0)
         val decodedFindPkt = LludpPackets.decodePacket(framedFind, framedFind.size)!!
         assertEquals(WorldManagementPackets.MSG_DIR_FIND_QUERY, decodedFindPkt.messageId)
         val parsedFind = WorldManagementPackets.parseDirFindQuery(decodedFindPkt.payload)!!
@@ -578,5 +584,469 @@ class Phase10WorldManagementTest {
         liveState = vm.state.value
         composeRule.waitForIdle()
         assertEquals(balanceBeforePay - 25, liveState.lindenBalance)
+    }
+
+    @Test
+    fun `verifies CapabilityManager REQUESTED_CAPS includes AIS3, COF, Group, and Notecard caps`() {
+        val caps = CapabilityManager.REQUESTED_CAPS
+        assertTrue(caps.contains("InventoryAPIv3"))
+        assertTrue(caps.contains("LibraryAPIv3"))
+        assertTrue(caps.contains("IncrementCOFVersion"))
+        assertTrue(caps.contains("GroupAPIv1"))
+        assertTrue(caps.contains("GroupMemberData"))
+        assertTrue(caps.contains("UpdateNotecardAgentInventory"))
+    }
+
+    @Test
+    fun `verifies exact message_template IDs and Zerocoded vs Unencoded header flags across all Phase 10 UDP packets`() {
+        // Non-zero UUIDs ensure Zerocoded packets without natural 0x00 runs still set FLAG_ZEROCODED,
+        // while zero UUIDs ensure Unencoded packets with 0x00 runs NEVER set FLAG_ZEROCODED.
+        val denseUuidA = UUID(-0x0101010101010101L, -0x0202020202020202L)
+        val denseUuidB = UUID(-0x0303030303030303L, -0x0404040404040404L)
+        val denseUuidC = UUID(-0x0505050505050505L, -0x0606060606060606L)
+        val zeroUuid = UUID(0L, 0L)
+
+        // Exact Low message IDs per message_template.msg
+        assertEquals(0xFFFF001F.toInt(), WorldManagementPackets.MSG_DIR_FIND_QUERY)
+        assertEquals(0xFFFF0021.toInt(), WorldManagementPackets.MSG_DIR_PLACES_QUERY)
+        assertEquals(0xFFFF0023.toInt(), WorldManagementPackets.MSG_DIR_PLACES_REPLY)
+        assertEquals(0xFFFF0024.toInt(), WorldManagementPackets.MSG_DIR_PEOPLE_REPLY)
+        assertEquals(0xFFFF0025.toInt(), WorldManagementPackets.MSG_DIR_EVENTS_REPLY)
+        assertEquals(0xFFFF0026.toInt(), WorldManagementPackets.MSG_DIR_GROUPS_REPLY)
+        assertEquals(0xFFFF0036.toInt(), WorldManagementPackets.MSG_PARCEL_INFO_REQUEST)
+        assertEquals(0xFFFF0037.toInt(), WorldManagementPackets.MSG_PARCEL_INFO_REPLY)
+        assertEquals(0xFFFF003A.toInt(), WorldManagementPackets.MSG_GROUP_NOTICES_LIST_REQUEST)
+        assertEquals(0xFFFF003B.toInt(), WorldManagementPackets.MSG_GROUP_NOTICES_LIST_REPLY)
+        assertEquals(0xFFFF003C.toInt(), WorldManagementPackets.MSG_GROUP_NOTICE_REQUEST)
+        assertEquals(0xFFFF00A1.toInt(), WorldManagementPackets.MSG_REQUEST_PAY_PRICE)
+        assertEquals(0xFFFF00A2.toInt(), WorldManagementPackets.MSG_PAY_PRICE_REPLY)
+        assertEquals(0xFFFF00C7.toInt(), WorldManagementPackets.MSG_PARCEL_RETURN_OBJECTS)
+        assertEquals(0xFFFF00CE.toInt(), WorldManagementPackets.MSG_PARCEL_BUY_PASS)
+        assertEquals(0xFFFF0106.toInt(), WorldManagementPackets.MSG_MUTE_LIST_REQUEST)
+        assertEquals(0xFFFF0107.toInt(), WorldManagementPackets.MSG_UPDATE_MUTE_LIST_ENTRY)
+        assertEquals(0xFFFF0108.toInt(), WorldManagementPackets.MSG_REMOVE_MUTE_LIST_ENTRY)
+        assertEquals(0xFFFF0111.toInt(), WorldManagementPackets.MSG_CREATE_INVENTORY_FOLDER)
+        assertEquals(0xFFFF013E.toInt(), WorldManagementPackets.MSG_MUTE_LIST_UPDATE)
+        assertEquals(0xFFFF013F.toInt(), WorldManagementPackets.MSG_USE_CACHED_MUTE_LIST)
+        assertEquals(0xFFFF015F.toInt(), WorldManagementPackets.MSG_GROUP_PROFILE_REQUEST)
+        assertEquals(0xFFFF0170.toInt(), WorldManagementPackets.MSG_ACTIVATE_GROUP)
+        assertEquals(0xFFFF0177.toInt(), WorldManagementPackets.MSG_GROUP_TITLES_REQUEST)
+        assertEquals(0xFFFF0179.toInt(), WorldManagementPackets.MSG_GROUP_TITLE_UPDATE)
+        assertEquals(0xFFFF0185.toInt(), WorldManagementPackets.MSG_AGENT_GROUP_DATA_UPDATE)
+        assertEquals(0xFFFF01AA.toInt(), WorldManagementPackets.MSG_LINK_INVENTORY_ITEM)
+
+        val sampleParcel = ParcelManagementInfo(parcelId = denseUuidC, localId = 9, name = "Slip 9")
+        val sampleNoticeId = UUID.randomUUID()
+
+        val zeroCodedCases = listOf(
+            "DirFindQuery" to (WorldManagementPackets.MSG_DIR_FIND_QUERY to
+                WorldManagementPackets.buildDirFindQuery(denseUuidA, denseUuidB, denseUuidC, "Jazz", 1)),
+            "DirPlacesQuery" to (WorldManagementPackets.MSG_DIR_PLACES_QUERY to
+                WorldManagementPackets.buildDirPlacesQuery(denseUuidA, denseUuidB, denseUuidC, "Pier")),
+            "DirPlacesReply" to (WorldManagementPackets.MSG_DIR_PLACES_REPLY to
+                WorldManagementPackets.buildDirPlacesReply(denseUuidA, denseUuidC, emptyList())),
+            "DirPeopleReply" to (WorldManagementPackets.MSG_DIR_PEOPLE_REPLY to
+                WorldManagementPackets.buildDirPeopleReply(denseUuidA, denseUuidC, emptyList())),
+            "DirEventsReply" to (WorldManagementPackets.MSG_DIR_EVENTS_REPLY to
+                WorldManagementPackets.buildDirEventsReply(denseUuidA, denseUuidC, emptyList())),
+            "DirGroupsReply" to (WorldManagementPackets.MSG_DIR_GROUPS_REPLY to
+                WorldManagementPackets.buildDirGroupsReply(denseUuidA, denseUuidC, emptyList())),
+            "ParcelInfoReply" to (WorldManagementPackets.MSG_PARCEL_INFO_REPLY to
+                WorldManagementPackets.buildParcelInfoReply(denseUuidA, sampleParcel)),
+            "ParcelReturnObjects" to (WorldManagementPackets.MSG_PARCEL_RETURN_OBJECTS to
+                WorldManagementPackets.buildParcelReturnObjects(denseUuidA, denseUuidB, 9, ParcelReturnType.OTHER)),
+            "ActivateGroup" to (WorldManagementPackets.MSG_ACTIVATE_GROUP to
+                WorldManagementPackets.buildActivateGroup(denseUuidA, denseUuidB, denseUuidC)),
+            "AgentGroupDataUpdate" to (WorldManagementPackets.MSG_AGENT_GROUP_DATA_UPDATE to
+                WorldManagementPackets.buildAgentGroupDataUpdate(
+                    denseUuidA,
+                    listOf(GroupMembershipInfo(groupId = denseUuidC, name = "Pioneers", powers = GroupPowers.GP_NOTICES_SEND))
+                )),
+            "LinkInventoryItem" to (WorldManagementPackets.MSG_LINK_INVENTORY_ITEM to
+                WorldManagementPackets.buildLinkInventoryItem(
+                    agentId = denseUuidA,
+                    sessionId = denseUuidB,
+                    callbackId = 1,
+                    folderId = denseUuidC,
+                    oldItemId = denseUuidA,
+                    assetType = 24,
+                    invType = 18,
+                    name = "Coat",
+                    description = "Link"
+                ))
+        )
+
+        for ((label, spec) in zeroCodedCases) {
+            val (msgId, body) = spec
+            assertTrue("$label should be marked Zerocoded", WorldManagementPackets.isZeroCoded(msgId))
+            val framed = WorldManagementPackets.framePacket(42, reliable = true, messageId = msgId, body = body)
+            assertTrue(
+                "$label header must set FLAG_ZEROCODED (0x80)",
+                (framed[0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0
+            )
+            val decoded = LludpPackets.decodePacket(framed, framed.size)
+            assertNotNull("Failed to decode $label", decoded)
+            assertEquals("$label messageId mismatch", msgId, decoded!!.messageId)
+        }
+
+        val unencodedCases = listOf(
+            "ParcelInfoRequest" to (WorldManagementPackets.MSG_PARCEL_INFO_REQUEST to
+                WorldManagementPackets.buildParcelInfoRequest(zeroUuid, zeroUuid, zeroUuid)),
+            "ParcelBuyPass" to (WorldManagementPackets.MSG_PARCEL_BUY_PASS to
+                WorldManagementPackets.buildParcelBuyPass(zeroUuid, zeroUuid, 0)),
+            "GroupNoticesListRequest" to (WorldManagementPackets.MSG_GROUP_NOTICES_LIST_REQUEST to
+                WorldManagementPackets.buildGroupNoticesListRequest(zeroUuid, zeroUuid, denseUuidC)),
+            "GroupNoticesListReply" to (WorldManagementPackets.MSG_GROUP_NOTICES_LIST_REPLY to
+                WorldManagementPackets.buildGroupNoticesListReply(
+                    zeroUuid,
+                    denseUuidC,
+                    listOf(
+                        GroupNoticeRecord(
+                            id = sampleNoticeId.toString(),
+                            groupId = denseUuidC,
+                            groupName = "Pioneers",
+                            subject = "Weekly Build Jam",
+                            message = "",
+                            senderName = "Aria Vance",
+                            timestampLabel = "2025-01-01",
+                            timestampEpochSec = 1735689600L,
+                            hasAttachment = true,
+                            assetType = 7
+                        )
+                    )
+                )),
+            "GroupNoticeRequest" to (WorldManagementPackets.MSG_GROUP_NOTICE_REQUEST to
+                WorldManagementPackets.buildGroupNoticeRequest(zeroUuid, zeroUuid, sampleNoticeId)),
+            "RequestPayPrice" to (WorldManagementPackets.MSG_REQUEST_PAY_PRICE to
+                WorldManagementPackets.buildRequestPayPrice(zeroUuid)),
+            "PayPriceReply" to (WorldManagementPackets.MSG_PAY_PRICE_REPLY to
+                WorldManagementPackets.buildPayPriceReply(PayPriceInfo(zeroUuid, 0, listOf(0, 0, 0, 0)))),
+            "MuteListRequest" to (WorldManagementPackets.MSG_MUTE_LIST_REQUEST to
+                WorldManagementPackets.buildMuteListRequest(zeroUuid, zeroUuid, 0)),
+            "UpdateMuteListEntry" to (WorldManagementPackets.MSG_UPDATE_MUTE_LIST_ENTRY to
+                WorldManagementPackets.buildUpdateMuteListEntry(zeroUuid, zeroUuid, MuteEntry(zeroUuid, "Bot", MuteType.OBJECT, 0))),
+            "RemoveMuteListEntry" to (WorldManagementPackets.MSG_REMOVE_MUTE_LIST_ENTRY to
+                WorldManagementPackets.buildRemoveMuteListEntry(zeroUuid, zeroUuid, zeroUuid, "Bot")),
+            "CreateInventoryFolder" to (WorldManagementPackets.MSG_CREATE_INVENTORY_FOLDER to
+                WorldManagementPackets.buildCreateInventoryFolder(zeroUuid, zeroUuid, denseUuidA, denseUuidB, 47, "Look")),
+            "MuteListUpdate" to (WorldManagementPackets.MSG_MUTE_LIST_UPDATE to
+                WorldManagementPackets.buildMuteListUpdate(zeroUuid, "mute_0001.tmp")),
+            "UseCachedMuteList" to (WorldManagementPackets.MSG_USE_CACHED_MUTE_LIST to
+                WorldManagementPackets.buildUseCachedMuteList(zeroUuid)),
+            "GroupProfileRequest" to (WorldManagementPackets.MSG_GROUP_PROFILE_REQUEST to
+                WorldManagementPackets.buildGroupProfileRequest(zeroUuid, zeroUuid, denseUuidC)),
+            "GroupTitlesRequest" to (WorldManagementPackets.MSG_GROUP_TITLES_REQUEST to
+                WorldManagementPackets.buildGroupTitlesRequest(zeroUuid, zeroUuid, denseUuidC, zeroUuid)),
+            "GroupTitleUpdate" to (WorldManagementPackets.MSG_GROUP_TITLE_UPDATE to
+                WorldManagementPackets.buildGroupTitleUpdate(zeroUuid, zeroUuid, denseUuidC, zeroUuid))
+        )
+
+        for ((label, spec) in unencodedCases) {
+            val (msgId, body) = spec
+            assertFalse("$label should be marked Unencoded", WorldManagementPackets.isZeroCoded(msgId))
+            val framed = WorldManagementPackets.framePacket(43, reliable = true, messageId = msgId, body = body)
+            assertEquals(
+                "$label header must NOT set FLAG_ZEROCODED (0x80)",
+                0,
+                framed[0].toInt() and LludpPackets.FLAG_ZEROCODED
+            )
+            val decoded = LludpPackets.decodePacket(framed, framed.size)
+            assertNotNull("Failed to decode $label", decoded)
+            assertEquals("$label messageId mismatch", msgId, decoded!!.messageId)
+        }
+
+        // Verify round-trip decoding of GroupNoticesListRequest/Reply, GroupNoticeRequest, MuteListUpdate, UseCachedMuteList
+        val noticesListReq = WorldManagementPackets.parseGroupNoticesListRequest(
+            wrapLe(WorldManagementPackets.buildGroupNoticesListRequest(denseUuidA, denseUuidB, denseUuidC))
+        )!!
+        assertEquals(denseUuidC, noticesListReq.groupId)
+
+        val (noticeGrpId, parsedNotices) = WorldManagementPackets.parseGroupNoticesListReply(
+            wrapLe(unencodedCases.first { it.first == "GroupNoticesListReply" }.second.second)
+        )
+        assertEquals(denseUuidC, noticeGrpId)
+        assertEquals(1, parsedNotices.size)
+        assertEquals("Weekly Build Jam", parsedNotices.single().subject)
+        assertEquals("Aria Vance", parsedNotices.single().senderName)
+        assertTrue(parsedNotices.single().hasAttachment)
+        assertEquals(7, parsedNotices.single().assetType)
+
+        val noticeReq = WorldManagementPackets.parseGroupNoticeRequest(
+            wrapLe(WorldManagementPackets.buildGroupNoticeRequest(denseUuidA, denseUuidB, sampleNoticeId))
+        )!!
+        assertEquals(sampleNoticeId, noticeReq.groupNoticeId)
+
+        val muteUpd = WorldManagementPackets.parseMuteListUpdate(
+            wrapLe(WorldManagementPackets.buildMuteListUpdate(denseUuidA, "mute_0001.tmp"))
+        )!!
+        assertEquals("mute_0001.tmp", muteUpd.second)
+        assertEquals(denseUuidA, WorldManagementPackets.parseUseCachedMuteList(wrapLe(WorldManagementPackets.buildUseCachedMuteList(denseUuidA))))
+    }
+
+    @Test
+    fun `parses AgentGroupDataUpdate from EventQueueGet LLSD first with UDP Low 389 Zerocoded OpenSim fallback`() {
+        val vm = ViewerSessionViewModel(ApplicationProvider.getApplicationContext())
+        vm.enterLocalSandbox()
+        val selfId = vm.state.value.sceneSnapshot.avatars.first { it.isSelf }.agentId
+
+        val openSimGroupId = UUID.randomUUID()
+        val agniGroupId = UUID.randomUUID()
+        val staleUdpGroupId = UUID.randomUUID()
+
+        // 1. OpenSim fallback: before EventQueueGet delivers AgentGroupDataUpdate, UDP Low 389 (Zerocoded) updates groups
+        val udpFallbackBody = WorldManagementPackets.buildAgentGroupDataUpdate(
+            agentId = selfId,
+            groups = listOf(
+                GroupMembershipInfo(
+                    groupId = openSimGroupId,
+                    name = "OSGrid Builders",
+                    powers = GroupPowers.GP_NOTICES_RECEIVE,
+                    acceptNotices = true,
+                    contribution = 256
+                )
+            )
+        )
+        val framedUdpFallback = WorldManagementPackets.framePacket(
+            sequenceNumber = 77,
+            reliable = true,
+            messageId = WorldManagementPackets.MSG_AGENT_GROUP_DATA_UPDATE,
+            body = udpFallbackBody
+        )
+        assertTrue((framedUdpFallback[0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0)
+        vm.dispatchUdpPacketForTesting(framedUdpFallback)
+        composeRule.waitForIdle()
+
+        assertEquals(listOf("OSGrid Builders"), vm.state.value.worldManagement.groups.map { it.name })
+        assertTrue(vm.state.value.worldManagement.lastManagementStatus.contains("OpenSim UDP"))
+
+        // 2. Agni EventQueueGet: LLSD AgentGroupDataUpdate with 8-byte big-endian binary U64 GroupPowers (1L shl 42)
+        val agniPowers = GroupPowers.GP_NOTICES_SEND or GroupPowers.GP_NOTICES_RECEIVE or GroupPowers.GP_LAND_RETURN_NON_GROUP
+        val eqBodyNode = WorldManagementPackets.buildAgentGroupDataUpdateLlsd(
+            agentId = selfId,
+            groups = listOf(
+                GroupMembershipInfo(
+                    groupId = agniGroupId,
+                    name = "Agni Mainland Architects",
+                    powers = agniPowers,
+                    acceptNotices = true,
+                    contribution = 4096
+                )
+            )
+        )
+        val eqEnvelopeXml = LlsdCodec.toXml(
+            LlsdValue.MapVal(
+                mapOf(
+                    "id" to LlsdValue.IntVal(12),
+                    "events" to LlsdValue.ArrayVal(
+                        listOf(
+                            LlsdValue.MapVal(
+                                mapOf(
+                                    "message" to LlsdValue.Str("AgentGroupDataUpdate"),
+                                    "body" to eqBodyNode
+                                )
+                            )
+                        )
+                    )
+                )
+            )
+        )
+        vm.dispatchEventQueueXmlForTesting(eqEnvelopeXml)
+        composeRule.waitForIdle()
+
+        val syncedAgni = vm.state.value.worldManagement.groups.single()
+        assertEquals(agniGroupId, syncedAgni.groupId)
+        assertEquals("Agni Mainland Architects", syncedAgni.name)
+        assertEquals(agniPowers, syncedAgni.powers)
+        assertTrue(syncedAgni.canSendNotices)
+        assertTrue(vm.state.value.worldManagement.lastManagementStatus.contains("EventQueueGet"))
+
+        // 3. Stale/deprecated UDP Low 389 arriving AFTER EventQueueGet must NOT clobber EventQueueGet state
+        val staleUdpBody = WorldManagementPackets.buildAgentGroupDataUpdate(
+            agentId = selfId,
+            groups = listOf(GroupMembershipInfo(groupId = staleUdpGroupId, name = "Stale UDP Group", powers = 0L))
+        )
+        val framedStaleUdp = WorldManagementPackets.framePacket(
+            sequenceNumber = 78,
+            reliable = true,
+            messageId = WorldManagementPackets.MSG_AGENT_GROUP_DATA_UPDATE,
+            body = staleUdpBody
+        )
+        vm.dispatchUdpPacketForTesting(framedStaleUdp)
+        composeRule.waitForIdle()
+
+        assertEquals(listOf("Agni Mainland Architects"), vm.state.value.worldManagement.groups.map { it.name })
+    }
+
+    @Test
+    fun `prefers AIS3 InventoryAPIv3 and IncrementCOFVersion on Agni and falls back to UDP on OpenSim`() = runBlocking {
+        val myOutfitsId = UUID.randomUUID()
+        val cofId = UUID.randomUUID()
+        val jacketId = UUID.randomUUID()
+        val hudId = UUID.randomUUID()
+        val serverAssignedOutfitId = UUID.randomUUID()
+        val createdLink1 = UUID.randomUUID()
+        val createdLink2 = UUID.randomUUID()
+        val createdCofLink = UUID.randomUUID()
+
+        val plan = OutfitFolderPlanner.buildSaveOutfitPlan(
+            outfitName = "Agni Cruiser Fit",
+            wornItems = listOf(
+                InventoryEntry(jacketId, myOutfitsId, "Cruiser Jacket", false, OutfitInventoryConstants.AT_CLOTHING, isWorn = true),
+                InventoryEntry(hudId, myOutfitsId, "Cruiser HUD", false, OutfitInventoryConstants.AT_OBJECT, isWorn = true, attachmentPoint = 35)
+            ),
+            myOutfitsFolderId = myOutfitsId,
+            currentOutfitFolderId = cofId
+        )
+
+        // Case A: Agni with InventoryAPIv3 + IncrementCOFVersion
+        val agniRequests = mutableListOf<Triple<String, String, String>>()
+        val agniHttp = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                val req = chain.request()
+                val buf = Buffer()
+                req.body?.writeTo(buf)
+                val bodyUtf8 = buf.readUtf8()
+                agniRequests += Triple(req.method, req.url.encodedPath, bodyUtf8)
+
+                val replyXml = when {
+                    req.url.encodedPath.endsWith("/category/$myOutfitsId") -> {
+                        """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <llsd><map>
+                          <key>_embedded</key><map>
+                            <key>categories</key><map>
+                              <key>$serverAssignedOutfitId</key><map>
+                                <key>category_id</key><uuid>$serverAssignedOutfitId</uuid>
+                                <key>name</key><string>Agni Cruiser Fit</string>
+                              </map>
+                            </map>
+                            <key>links</key><map>
+                              <key>$createdLink1</key><map><key>item_id</key><uuid>$createdLink1</uuid></map>
+                              <key>$createdLink2</key><map><key>item_id</key><uuid>$createdLink2</uuid></map>
+                            </map>
+                          </map>
+                        </map></llsd>
+                        """.trimIndent()
+                    }
+                    req.url.encodedPath.endsWith("/category/$cofId") -> {
+                        """
+                        <?xml version="1.0" encoding="UTF-8"?>
+                        <llsd><map>
+                          <key>_embedded</key><map>
+                            <key>links</key><map>
+                              <key>$createdCofLink</key><map><key>item_id</key><uuid>$createdCofLink</uuid></map>
+                            </map>
+                          </map>
+                        </map></llsd>
+                        """.trimIndent()
+                    }
+                    req.url.encodedPath.endsWith("/cap/inc-cof") -> {
+                        """<?xml version="1.0" encoding="UTF-8"?><llsd><map><key>cof_version</key><integer>42</integer></map></llsd>"""
+                    }
+                    else -> """<?xml version="1.0"?><llsd><map/></llsd>"""
+                }
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .body(replyXml.toResponseBody("application/llsd+xml".toMediaType()))
+                    .build()
+            })
+            .build()
+
+        val agniCapMgr = CapabilityManager(httpClient = agniHttp, seedHttpClient = agniHttp)
+        agniCapMgr.registerCapabilityUrl(Ais3OutfitProtocol.CAP_INVENTORY_API_V3, "https://simhost.agni.lindenlab.com:12043/cap/ais")
+        agniCapMgr.registerCapabilityUrl(Ais3OutfitProtocol.CAP_INCREMENT_COF_VERSION, "https://simhost.agni.lindenlab.com:12043/cap/inc-cof")
+
+        var agniUdpFallbackInvoked = false
+        val agniRes = OutfitSaveCoordinator.executeSaveOutfit(
+            plan = plan,
+            capabilityManager = agniCapMgr,
+            onUdpFallback = { agniUdpFallbackInvoked = true }
+        )
+        assertTrue(agniRes.success)
+        assertTrue(agniRes.usedAis3)
+        assertFalse(agniUdpFallbackInvoked)
+        assertEquals(serverAssignedOutfitId, agniRes.outfitFolderId)
+        assertEquals(3, agniRes.createdLinkIds.size)
+        assertTrue(agniRes.cofVersionIncremented)
+        assertEquals(42, agniRes.cofVersion)
+        assertEquals(3, agniRequests.size)
+        assertEquals("POST", agniRequests[0].first)
+        assertTrue(agniRequests[0].third.contains("<integer>${OutfitInventoryConstants.FT_OUTFIT}</integer>"))
+        assertEquals("POST", agniRequests[1].first)
+        assertTrue("COF AT_LINK_FOLDER must point to server-assigned outfit folder ID", agniRequests[1].third.contains(serverAssignedOutfitId.toString()))
+        assertEquals("GET", agniRequests[2].first)
+
+        // Case B: OpenSim without InventoryAPIv3 -> UDP CreateInventoryFolder (Unencoded) + LinkInventoryItem (Zerocoded)
+        val openSimCapMgr = CapabilityManager()
+        val openSimUdpFrames = mutableListOf<ByteArray>()
+        val openSimRes = OutfitSaveCoordinator.executeSaveOutfit(
+            plan = plan,
+            capabilityManager = openSimCapMgr,
+            onUdpFallback = { fallbackPlan ->
+                openSimUdpFrames += WorldManagementPackets.framePacket(
+                    sequenceNumber = 1,
+                    reliable = true,
+                    messageId = WorldManagementPackets.MSG_CREATE_INVENTORY_FOLDER,
+                    body = WorldManagementPackets.buildCreateInventoryFolder(
+                        agentId = UUID.randomUUID(),
+                        sessionId = UUID.randomUUID(),
+                        folderId = fallbackPlan.outfitFolderId,
+                        parentId = fallbackPlan.parentMyOutfitsId,
+                        type = OutfitInventoryConstants.FT_OUTFIT,
+                        name = fallbackPlan.outfitName
+                    )
+                )
+                fallbackPlan.linksToCreate.forEachIndexed { idx, link ->
+                    openSimUdpFrames += WorldManagementPackets.framePacket(
+                        sequenceNumber = idx + 2,
+                        reliable = true,
+                        messageId = WorldManagementPackets.MSG_LINK_INVENTORY_ITEM,
+                        body = WorldManagementPackets.buildLinkInventoryItem(
+                            agentId = UUID.randomUUID(),
+                            sessionId = UUID.randomUUID(),
+                            callbackId = idx + 1,
+                            folderId = link.targetFolderId,
+                            oldItemId = link.oldItemId,
+                            assetType = link.assetType,
+                            invType = link.inventoryType,
+                            name = link.name,
+                            description = link.description
+                        )
+                    )
+                }
+            }
+        )
+        assertTrue(openSimRes.success)
+        assertFalse(openSimRes.usedAis3)
+        assertEquals(1 + plan.linksToCreate.size, openSimUdpFrames.size)
+        assertEquals(0, openSimUdpFrames.first()[0].toInt() and LludpPackets.FLAG_ZEROCODED)
+        assertTrue((openSimUdpFrames[1][0].toInt() and LludpPackets.FLAG_ZEROCODED) != 0)
+
+        // Case C: OpenSim returning HTTP 404 on InventoryAPIv3 -> clean fallback to UDP
+        val openSim404Http = OkHttpClient.Builder()
+            .addInterceptor(Interceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(404)
+                    .message("Not Found")
+                    .body("Not Found".toResponseBody("text/plain".toMediaType()))
+                    .build()
+            })
+            .build()
+        val openSim404CapMgr = CapabilityManager(httpClient = openSim404Http, seedHttpClient = openSim404Http)
+        openSim404CapMgr.registerCapabilityUrl(Ais3OutfitProtocol.CAP_INVENTORY_API_V3, "http://opensim.local:9000/CAPS/ais")
+        var fallbackOn404Invoked = false
+        val fallback404Res = OutfitSaveCoordinator.executeSaveOutfit(
+            plan = plan,
+            capabilityManager = openSim404CapMgr,
+            onUdpFallback = { fallbackOn404Invoked = true }
+        )
+        assertTrue(fallbackOn404Invoked)
+        assertTrue(fallback404Res.success)
+        assertFalse(fallback404Res.usedAis3)
     }
 }
