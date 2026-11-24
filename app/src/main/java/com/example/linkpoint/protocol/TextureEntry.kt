@@ -10,7 +10,9 @@ data class ParsedTextureEntry(
     val defaultTextureId: UUID? = null,
     val faceTextures: Map<Int, UUID> = emptyMap(),
     val defaultColor: ColorRgba = ColorRgba(0.84f, 0.86f, 0.90f, 1f),
-    val faceColors: Map<Int, ColorRgba> = emptyMap()
+    val faceColors: Map<Int, ColorRgba> = emptyMap(),
+    val defaultFullbright: Boolean = false,
+    val defaultGlow: Float = 0f
 ) {
     fun textureForFace(faceIndex: Int): UUID? = faceTextures[faceIndex] ?: defaultTextureId
     fun colorForFace(faceIndex: Int): ColorRgba = faceColors[faceIndex] ?: defaultColor
@@ -114,11 +116,53 @@ object SlBinaryParsers {
                 }
             }
 
+            var defaultFullbright = false
+            var defaultGlow = 0f
+            // Skip RepeatU (4B), RepeatV (4B), OffsetU (2B), OffsetV (2B), Rotation (2B) blocks when present
+            fun skipFieldBlock(valueBytes: Int): Boolean {
+                if (buf.remaining() < valueBytes) return false
+                buf.position(buf.position() + valueBytes)
+                while (buf.hasRemaining()) {
+                    val faceBits = readFaceBitfield(buf)
+                    if (faceBits == 0L) return true
+                    if (buf.remaining() < valueBytes) return false
+                    buf.position(buf.position() + valueBytes)
+                }
+                return true
+            }
+            if (skipFieldBlock(4) && skipFieldBlock(4) && skipFieldBlock(2) && skipFieldBlock(2) && skipFieldBlock(2)) {
+                // Material byte: bit 0x20 (TEM_FULLBRIGHT_MASK) indicates Fullbright
+                if (buf.remaining() >= 1) {
+                    val matByte = buf.get().toInt() and 0xFF
+                    defaultFullbright = (matByte and 0x20) != 0
+                    while (buf.hasRemaining()) {
+                        val faceBits = readFaceBitfield(buf)
+                        if (faceBits == 0L) break
+                        if (buf.remaining() < 1) break
+                        val fMat = buf.get().toInt() and 0xFF
+                        if ((fMat and 0x20) != 0) defaultFullbright = true
+                    }
+                    // Media byte block (1B) -> Glow byte block (1B, 0..255 -> 0f..1f)
+                    if (skipFieldBlock(1) && buf.remaining() >= 1) {
+                        defaultGlow = ((buf.get().toInt() and 0xFF) / 255f).coerceIn(0f, 1f)
+                        while (buf.hasRemaining()) {
+                            val faceBits = readFaceBitfield(buf)
+                            if (faceBits == 0L) break
+                            if (buf.remaining() < 1) break
+                            val fg = ((buf.get().toInt() and 0xFF) / 255f).coerceIn(0f, 1f)
+                            if (fg > defaultGlow) defaultGlow = fg
+                        }
+                    }
+                }
+            }
+
             ParsedTextureEntry(
                 defaultTextureId = defaultTex.takeIf { it != ZERO_UUID },
                 faceTextures = faceTextures,
                 defaultColor = defaultColor,
-                faceColors = faceColors
+                faceColors = faceColors,
+                defaultFullbright = defaultFullbright,
+                defaultGlow = defaultGlow
             )
         } catch (_: Exception) {
             ParsedTextureEntry()

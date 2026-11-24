@@ -240,7 +240,7 @@ object LludpPackets {
             (messageId and 0xFFFFFF00.toInt()) == 0 -> {
                 rawMsg.write(messageId and 0xFF)
             }
-            (messageId and 0xFFFF0000.toInt()) == 0x0000FF00 -> {
+            (messageId and 0xFFFFFF00.toInt()) == 0x0000FF00 -> {
                 rawMsg.write(0xFF)
                 rawMsg.write(messageId and 0xFF)
             }
@@ -631,6 +631,11 @@ object LludpPackets {
         buf.putFloat(v.x)
         buf.putFloat(v.y)
         buf.putFloat(v.z)
+    }
+
+    fun readVec3(buf: ByteBuffer): Vec3 {
+        if (buf.remaining() < 12) return Vec3()
+        return Vec3(buf.float, buf.float, buf.float)
     }
 
     /**

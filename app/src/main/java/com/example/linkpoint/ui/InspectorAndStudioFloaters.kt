@@ -72,100 +72,11 @@ fun ObjectInspectorContent(
     client: ViewerClient,
     onClose: () -> Unit
 ) {
-    val tokens = LocalLinkpointDesign.current
-    val clipboard = LocalClipboardManager.current
-    val obj = state.selectedObject
-
-    Column(modifier = Modifier.fillMaxWidth()) {
-        LinkpointFloaterHeader(
-            title = "Object Inspector",
-            subtitle = obj?.let { "LocalID #${it.localId} • ${it.shape.name}" } ?: "Tap any 3D prim in the viewport",
-            lcarsCode = "05-OBJ",
-            onClose = onClose
-        )
-
-        if (obj == null) {
-            Text(
-                text = "Tap any 3D primitive in the world viewport to inspect its UUID, shape parameters, coordinates, flags, or trigger scripted touch/sit actions.",
-                style = MaterialTheme.typography.bodySmall.copy(color = tokens.textMuted),
-                modifier = Modifier.padding(vertical = 12.dp)
-            )
-            return
-        }
-
-        val shape = RoundedCornerShape(tokens.buttonRadius.coerceAtMost(12.dp))
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .clip(shape)
-                .background(tokens.surfaceElevated.copy(alpha = 0.78f))
-                .border(1.dp, tokens.borderHairline, shape)
-                .padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(6.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = obj.name,
-                    style = MaterialTheme.typography.titleMedium.copy(color = tokens.textPrimary),
-                    modifier = Modifier.weight(1f)
-                )
-                IconButton(onClick = { clipboard.setText(AnnotatedString(obj.uuid.toString())) }) {
-                    Icon(Icons.Default.ContentCopy, contentDescription = "Copy Object UUID", tint = tokens.accentPrimary)
-                }
-            }
-            if (obj.description.isNotBlank()) {
-                Text(
-                    text = obj.description,
-                    style = MaterialTheme.typography.bodySmall.copy(color = tokens.textSecondary)
-                )
-            }
-            Text(
-                text = "UUID: ${obj.uuid}",
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = tokens.monoFont, color = tokens.textMuted)
-            )
-            Text(
-                text = "POS: <${"%.2f".format(obj.position.x)}, ${"%.2f".format(obj.position.y)}, ${"%.2f".format(obj.position.z)}>  •  SIZE: <${"%.2f".format(obj.scale.x)}, ${"%.2f".format(obj.scale.y)}, ${"%.2f".format(obj.scale.z)}>",
-                style = MaterialTheme.typography.labelSmall.copy(fontFamily = tokens.monoFont, color = tokens.accentSecondary)
-            )
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (obj.isScripted) LinkpointStatusChip("Scripted", tokens.accentTertiary)
-                if (obj.isFullbright) LinkpointStatusChip("Fullbright", tokens.accentPrimary)
-                if (obj.isPhantom) LinkpointStatusChip("Phantom", tokens.textSecondary)
-                if (obj.isHudAttachment) LinkpointStatusChip("HUD Slot ${obj.attachmentPoint}", tokens.statusOnline)
-            }
-        }
-
-        Spacer(Modifier.height(10.dp))
-
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            LinkpointActionButton(
-                text = "Touch",
-                icon = Icons.Default.TouchApp,
-                onClick = client::touchSelectedObject,
-                primary = true,
-                testTag = "inspector_touch_button",
-                modifier = Modifier.weight(1f)
-            )
-            LinkpointActionButton(
-                text = if (state.isSitting) "Stand" else "Sit",
-                icon = Icons.Default.Chair,
-                onClick = client::toggleSitOnSelected,
-                primary = false,
-                modifier = Modifier.weight(0.9f)
-            )
-            LinkpointActionButton(
-                text = "Focus",
-                icon = Icons.Default.CenterFocusStrong,
-                onClick = { client.focusCameraOn(obj.position) },
-                primary = false,
-                modifier = Modifier.weight(0.9f)
-            )
-        }
-    }
+    com.example.linkpoint.ui.floaters.PrimBuildEditorContent(
+        state = state,
+        client = client,
+        onClose = onClose
+    )
 }
 
 @Composable

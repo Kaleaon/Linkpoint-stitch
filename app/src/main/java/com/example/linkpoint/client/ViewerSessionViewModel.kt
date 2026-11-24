@@ -5,6 +5,8 @@ import android.graphics.Bitmap
 import android.view.KeyEvent
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.linkpoint.build.PrimBuildPackets
+import com.example.linkpoint.build.PrimTransformMath
 import com.example.linkpoint.cache.GridConfigEntity
 import com.example.linkpoint.cache.LandmarkCacheEntity
 import com.example.linkpoint.cache.LinkpointCacheRepository
@@ -227,6 +229,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         obj.faceTextures.values.forEach { assetManager.requestTexture(it, highPriority = isAvatarPriority) }
 
                         allSceneObjects[obj.localId] = obj
+                        val selId = _state.value.selectedObject?.localId
+                        if (selId != null && (selId == obj.localId || allSceneObjects[selId]?.parentId == obj.localId)) {
+                            syncSelectedObjectState(selId)
+                        }
                         pushSceneSnapshot()
                     }
                     is SimEvent.AvatarObjectUpdated -> {
@@ -369,6 +375,10 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                                     defaultTextureId = te?.defaultTextureId ?: existing.defaultTextureId,
                                     faceTextures = if (te != null && te.faceTextures.isNotEmpty()) te.faceTextures else existing.faceTextures
                                 )
+                                val selId = _state.value.selectedObject?.localId
+                                if (selId != null && (selId == evt.localId || allSceneObjects[selId]?.parentId == evt.localId)) {
+                                    syncSelectedObjectState(selId)
+                                }
                                 pushSceneSnapshot()
                             }
                         }
@@ -471,6 +481,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     is SimEvent.ObjectKilled -> {
                         allSceneObjects.remove(evt.localId)
                         manualHudAttachments.remove(evt.localId)
+                        if (_state.value.selectedObject?.localId == evt.localId || evt.localId in _state.value.buildSelectionIds) {
+                            syncSelectedObjectState(_state.value.selectedObject?.localId?.takeIf { it != evt.localId })
+                        }
                         val deadAv = avatars.values.firstOrNull { it.localId == evt.localId && !it.isSelf }
                         if (deadAv != null) {
                             avatars.remove(deadAv.agentId)
@@ -488,7 +501,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                             )
                             allSceneObjects[existing.localId] = updated
                             if (_state.value.selectedObject?.localId == existing.localId) {
-                                _state.update { it.copy(selectedObject = updated) }
+                                syncSelectedObjectState(existing.localId)
                             }
                             pushSceneSnapshot()
                         }
@@ -1175,12 +1188,14 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
         selfAvatarName = self.displayName
 
         val rootId = UUID.fromString("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        val objectsFolder = UUID.fromString("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee")
         val hudsFolder = UUID.fromString("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")
         val landmarksFolder = UUID.fromString("cccccccc-cccc-4ccc-8ccc-cccccccccccc")
         val outfitsFolder = UUID.fromString("dddddddd-dddd-4ddd-8ddd-dddddddddddd")
 
         val sandboxInventory = listOf(
             InventoryEntry(rootId, UUID(0L, 0L), "My Inventory (Local Sandbox)", true, 8),
+            InventoryEntry(objectsFolder, rootId, "Objects", true, 6),
             InventoryEntry(hudsFolder, rootId, "Avatar HUD Attachments", true, 6),
             InventoryEntry(landmarksFolder, rootId, "Landmarks", true, 3),
             InventoryEntry(outfitsFolder, rootId, "Outfits & Accessories", true, 5),
@@ -1207,7 +1222,7 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 isFlying = false,
                 isSitting = false,
                 inventoryEntries = sandboxInventory,
-                expandedFolderIds = setOf(rootId, hudsFolder, landmarksFolder),
+                expandedFolderIds = setOf(rootId, objectsFolder, hudsFolder, landmarksFolder),
                 mapRegions = sandboxMap,
                 localChat = listOf(
                     ChatMessage(
@@ -1217,7 +1232,9 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                     )
                 ),
                 activeFloater = null,
-                selectedObject = null
+                selectedObject = null,
+                editLinkedParts = false,
+                buildSelectionIds = emptyList()
             )
         }
         renderer.focusOverride = null
@@ -1246,6 +1263,8 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                 connection = ConnectionState.Disconnected,
                 activeFloater = null,
                 selectedObject = null,
+                editLinkedParts = false,
+                buildSelectionIds = emptyList(),
                 selectedAvatarId = null,
                 projectedNametags = emptyList(),
                 activeKeyboardHint = null,
@@ -1722,38 +1741,612 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
     }
 
     override fun onWorldObjectSelected(obj: SceneObject?) {
+        val resolved = obj?.let { resolveWorldSceneObject(it.localId) ?: it }
         _state.update { s ->
             s.copy(
-                selectedObject = obj,
-                activeFloater = if (obj != null) DockToolId.INSPECTOR else s.activeFloater
+                selectedObject = resolved,
+                activeFloater = if (resolved != null) DockToolId.INSPECTOR else s.activeFloater
             )
         }
-        if (obj != null && _state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendObjectSelect(obj.localId)
+        if (resolved != null && _state.value.connection is ConnectionState.Connected) {
+            lludpEngine.sendObjectSelect(resolved.localId)
         }
         pushSceneSnapshot()
     }
 
     override fun touchSelectedObject() {
-        val obj = _state.value.selectedObject ?: return
+        val sel = _state.value.selectedObject ?: return
+        val raw = allSceneObjects[sel.localId] ?: sel
         if (_state.value.connection is ConnectionState.Connected) {
-            lludpEngine.sendObjectTouch(obj.localId)
+            lludpEngine.sendObjectTouch(raw.localId)
         } else {
             // Cycle beacon glow color in local sandbox
             val palette = listOf(
-                ColorRgba(0.22f, 0.78f, 0.98f, obj.color.a),
-                ColorRgba(0.96f, 0.62f, 0.08f, obj.color.a),
-                ColorRgba(0.10f, 0.80f, 0.56f, obj.color.a),
-                ColorRgba(0.88f, 0.30f, 0.55f, obj.color.a)
+                ColorRgba(0.22f, 0.78f, 0.98f, raw.color.a),
+                ColorRgba(0.96f, 0.62f, 0.08f, raw.color.a),
+                ColorRgba(0.10f, 0.80f, 0.56f, raw.color.a),
+                ColorRgba(0.88f, 0.30f, 0.55f, raw.color.a)
             )
-            val nextColor = palette[(obj.localId + (System.currentTimeMillis() / 500L).toInt()) % palette.size]
-            val updated = obj.copy(color = nextColor, isFullbright = true)
-            allSceneObjects[obj.localId] = updated
-            _state.update { it.copy(selectedObject = updated) }
+            val nextColor = palette[(raw.localId + (System.currentTimeMillis() / 500L).toInt()) % palette.size]
+            val updated = raw.copy(color = nextColor, isFullbright = true)
+            allSceneObjects[raw.localId] = updated
+            _state.update { it.copy(selectedObject = resolveWorldSceneObject(raw.localId)) }
             pushSceneSnapshot()
         }
-        appendLocalChat(ChatMessage(speaker = obj.name, text = "Triggered ObjectGrab touch_start()"))
-        showToast("Touched ${obj.name}")
+        appendLocalChat(ChatMessage(speaker = raw.name, text = "Triggered ObjectGrab touch_start()"))
+        showToast("Touched ${raw.name}")
+    }
+
+    // --- Phase 7: Prim Build, Transform, Appearance & Linkset Studio ---
+
+    private fun allocateLocalPrimId(): Int {
+        val maxExisting = allSceneObjects.keys.filter { it < 9000 }.maxOrNull() ?: 5000
+        return maxExisting.coerceAtLeast(5000) + 1
+    }
+
+    private fun resolveWorldSceneObject(localId: Int): SceneObject? {
+        val obj = allSceneObjects[localId] ?: return null
+        if (obj.parentId != 0) {
+            val parent = allSceneObjects[obj.parentId]
+            if (parent != null && parent.parentId == 0 && !parent.isHudAttachment && parent.attachmentPoint == 0) {
+                val world = PrimTransformMath.linkLocalToWorld(
+                    childLocalPos = obj.position,
+                    childLocalRot = obj.rotation,
+                    rootWorldPos = parent.position,
+                    rootWorldRot = parent.rotation
+                )
+                return obj.copy(position = world.position, rotation = world.rotation)
+            }
+        }
+        return obj
+    }
+
+    private fun syncSelectedObjectState(preferredLocalId: Int? = _state.value.selectedObject?.localId) {
+        val refreshed = preferredLocalId?.let { resolveWorldSceneObject(it) }
+        val validQueue = _state.value.buildSelectionIds.filter { allSceneObjects.containsKey(it) }
+        _state.update { s ->
+            s.copy(
+                selectedObject = refreshed,
+                buildSelectionIds = validQueue
+            )
+        }
+    }
+
+    override fun rezPrim(
+        preset: PrimBuildPackets.PrimPreset,
+        position: Vec3?,
+        scale: Vec3,
+        material: PrimBuildPackets.PrimMaterial
+    ) {
+        val self = avatars[selfAgentId]
+        val avPos = self?.position ?: _state.value.avatarPosition
+        val avYaw = self?.yaw ?: 0f
+        val clampedScale = PrimTransformMath.clampScale(scale)
+        val (rayStart, computedEnd) = PrimTransformMath.computeRezRay(
+            avatarPos = avPos,
+            avatarYawRad = avYaw,
+            primScaleZ = clampedScale.z
+        ) { x, y ->
+            terrain.sampleWorldHeight(x, y).coerceAtLeast(terrain.waterHeight)
+        }
+        val targetPos = position?.let { PrimTransformMath.clampWorldPosition(it) } ?: computedEnd
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.rezObject(
+                preset = preset,
+                rayStart = rayStart,
+                rayEnd = targetPos,
+                scale = clampedScale,
+                rotation = Quat.IDENTITY,
+                material = material,
+                createSelected = true
+            )
+            showToast("Rezzing ${preset.label} at <${"%.1f".format(targetPos.x)}, ${"%.1f".format(targetPos.y)}, ${"%.1f".format(targetPos.z)}>")
+        } else {
+            val newId = allocateLocalPrimId()
+            val defaultTint = when (preset) {
+                PrimBuildPackets.PrimPreset.BOX -> ColorRgba(0.85f, 0.72f, 0.52f, 1f)
+                PrimBuildPackets.PrimPreset.CYLINDER -> ColorRgba(0.38f, 0.78f, 0.92f, 1f)
+                PrimBuildPackets.PrimPreset.PRISM -> ColorRgba(0.94f, 0.62f, 0.28f, 1f)
+                PrimBuildPackets.PrimPreset.SPHERE -> ColorRgba(0.46f, 0.86f, 0.64f, 1f)
+                PrimBuildPackets.PrimPreset.TORUS -> ColorRgba(0.84f, 0.46f, 0.90f, 1f)
+                PrimBuildPackets.PrimPreset.TUBE -> ColorRgba(0.34f, 0.64f, 0.96f, 1f)
+                PrimBuildPackets.PrimPreset.RING -> ColorRgba(0.96f, 0.78f, 0.32f, 1f)
+            }
+            val newObj = SceneObject(
+                localId = newId,
+                uuid = UUID.randomUUID(),
+                parentId = 0,
+                name = "New ${preset.label}",
+                description = "${material.label} ${preset.label} Prim",
+                ownerId = selfAgentId,
+                creatorId = selfAgentId,
+                pCode = PrimBuildPackets.PCODE_PRIM,
+                shape = preset.shape,
+                position = targetPos,
+                rotation = Quat.IDENTITY,
+                scale = clampedScale,
+                color = defaultTint
+            )
+            allSceneObjects[newId] = newObj
+            _state.update { s ->
+                s.copy(
+                    selectedObject = newObj,
+                    activeFloater = s.activeFloater ?: DockToolId.INSPECTOR
+                )
+            }
+            pushSceneSnapshot(flashLocalId = newId)
+            showToast("Rezzed ${preset.label} (#$newId)")
+        }
+    }
+
+    override fun setEditLinkedParts(enabled: Boolean) {
+        _state.update { it.copy(editLinkedParts = enabled) }
+    }
+
+    override fun updateObjectTransform(
+        localId: Int,
+        position: Vec3?,
+        rotation: Quat?,
+        scale: Vec3?,
+        editLinkedParts: Boolean?
+    ) {
+        val rawTarget = allSceneObjects[localId] ?: return
+        val editParts = editLinkedParts ?: _state.value.editLinkedParts
+        val clampedScale = scale?.let { PrimTransformMath.clampScale(it) }
+
+        val parentObj = if (rawTarget.parentId != 0) allSceneObjects[rawTarget.parentId] else null
+        val isLinksetChild = parentObj != null && parentObj.parentId == 0 && !parentObj.isHudAttachment && parentObj.attachmentPoint == 0
+
+        if (!editParts && isLinksetChild) {
+            // Whole-linkset mode while a child prim is selected: shift/rotate the linkset root by the world delta
+            val currentChildWorld = resolveWorldSceneObject(localId) ?: rawTarget
+            val nextRootPos = position?.let { desiredChildWorld ->
+                val delta = desiredChildWorld - currentChildWorld.position
+                PrimTransformMath.clampWorldPosition(parentObj.position + delta)
+            }
+            val nextRootRot = rotation?.let { desiredChildWorldRot ->
+                val deltaRot = (desiredChildWorldRot.normalized() * currentChildWorld.rotation.inverse()).normalized()
+                (deltaRot * parentObj.rotation).normalized()
+            }
+            val updatedRoot = parentObj.copy(
+                position = nextRootPos ?: parentObj.position,
+                rotation = nextRootRot ?: parentObj.rotation,
+                scale = if (clampedScale != null && localId == parentObj.localId) clampedScale else parentObj.scale
+            )
+            allSceneObjects[parentObj.localId] = updatedRoot
+            if (clampedScale != null) {
+                allSceneObjects[localId] = rawTarget.copy(scale = clampedScale)
+            }
+            if (_state.value.connection is ConnectionState.Connected) {
+                if (nextRootPos != null || nextRootRot != null) {
+                    lludpEngine.updateObjectTransform(
+                        localId = parentObj.localId,
+                        position = nextRootPos,
+                        rotation = nextRootRot,
+                        scale = null,
+                        editLinkedParts = false
+                    )
+                }
+                if (clampedScale != null) {
+                    lludpEngine.updateObjectTransform(
+                        localId = localId,
+                        scale = clampedScale,
+                        editLinkedParts = true
+                    )
+                }
+            }
+        } else if (isLinksetChild) {
+            // Edit Linked Parts on a child prim: convert desired world pos/rot into root-relative local coordinates
+            val currentWorld = resolveWorldSceneObject(localId) ?: rawTarget
+            val targetWorldPos = position?.let { PrimTransformMath.clampWorldPosition(it) } ?: currentWorld.position
+            val targetWorldRot = rotation?.normalized() ?: currentWorld.rotation
+            val localFrame = PrimTransformMath.worldToLinkLocal(
+                childWorldPos = targetWorldPos,
+                childWorldRot = targetWorldRot,
+                rootWorldPos = parentObj.position,
+                rootWorldRot = parentObj.rotation
+            )
+            val updatedChild = rawTarget.copy(
+                position = if (position != null || rotation != null) localFrame.position else rawTarget.position,
+                rotation = if (rotation != null || position != null) localFrame.rotation else rawTarget.rotation,
+                scale = clampedScale ?: rawTarget.scale
+            )
+            allSceneObjects[localId] = updatedChild
+            if (_state.value.connection is ConnectionState.Connected) {
+                lludpEngine.updateObjectTransform(
+                    localId = localId,
+                    position = if (position != null) updatedChild.position else null,
+                    rotation = if (rotation != null) updatedChild.rotation else null,
+                    scale = clampedScale,
+                    editLinkedParts = true
+                )
+            }
+        } else {
+            // Root or standalone world prim
+            val nextWorldPos = position?.let { PrimTransformMath.clampWorldPosition(it) } ?: rawTarget.position
+            val nextWorldRot = rotation?.normalized() ?: rawTarget.rotation
+
+            if (editParts && (position != null || rotation != null)) {
+                // Keep child prims stationary in world space when moving/rotating ONLY the root prim in Edit Linked Parts mode
+                val children = allSceneObjects.values.filter { it.parentId == localId }
+                val childWorldSnapshots = children.map { child ->
+                    child to PrimTransformMath.linkLocalToWorld(child.position, child.rotation, rawTarget.position, rawTarget.rotation)
+                }
+                allSceneObjects[localId] = rawTarget.copy(
+                    position = nextWorldPos,
+                    rotation = nextWorldRot,
+                    scale = clampedScale ?: rawTarget.scale
+                )
+                for ((child, worldSnap) in childWorldSnapshots) {
+                    val recomputedLocal = PrimTransformMath.worldToLinkLocal(
+                        childWorldPos = worldSnap.position,
+                        childWorldRot = worldSnap.rotation,
+                        rootWorldPos = nextWorldPos,
+                        rootWorldRot = nextWorldRot
+                    )
+                    allSceneObjects[child.localId] = child.copy(
+                        position = recomputedLocal.position,
+                        rotation = recomputedLocal.rotation
+                    )
+                }
+            } else {
+                allSceneObjects[localId] = rawTarget.copy(
+                    position = nextWorldPos,
+                    rotation = nextWorldRot,
+                    scale = clampedScale ?: rawTarget.scale
+                )
+            }
+
+            if (_state.value.connection is ConnectionState.Connected) {
+                lludpEngine.updateObjectTransform(
+                    localId = localId,
+                    position = position?.let { nextWorldPos },
+                    rotation = rotation?.let { nextWorldRot },
+                    scale = clampedScale,
+                    editLinkedParts = editParts
+                )
+            }
+        }
+
+        syncSelectedObjectState(localId)
+        pushSceneSnapshot()
+    }
+
+    override fun updateObjectMetadata(localId: Int, name: String?, description: String?) {
+        val raw = allSceneObjects[localId] ?: return
+        val nextName = name?.take(63) ?: raw.name
+        val nextDesc = description?.take(127) ?: raw.description
+        allSceneObjects[localId] = raw.copy(name = nextName, description = nextDesc)
+        if (_state.value.connection is ConnectionState.Connected) {
+            if (name != null) lludpEngine.setObjectName(localId, nextName)
+            if (description != null) lludpEngine.setObjectDescription(localId, nextDesc)
+        }
+        syncSelectedObjectState(localId)
+        pushSceneSnapshot()
+    }
+
+    override fun updateObjectFlags(
+        localId: Int,
+        usePhysics: Boolean,
+        isPhantom: Boolean,
+        isTemporary: Boolean,
+        castsShadows: Boolean
+    ) {
+        val raw = allSceneObjects[localId] ?: return
+        allSceneObjects[localId] = raw.copy(
+            isPhysical = usePhysics,
+            isPhantom = isPhantom,
+            isTemporary = isTemporary,
+            castsShadows = castsShadows
+        )
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.updateObjectFlags(
+                localId = localId,
+                usePhysics = usePhysics,
+                isPhantom = isPhantom,
+                isTemporary = isTemporary,
+                castsShadows = castsShadows
+            )
+        }
+        syncSelectedObjectState(localId)
+        pushSceneSnapshot()
+    }
+
+    override fun updateObjectAppearance(
+        localId: Int,
+        color: ColorRgba,
+        isFullbright: Boolean,
+        glow: Float
+    ) {
+        val raw = allSceneObjects[localId] ?: return
+        val clampedColor = ColorRgba(
+            r = color.r.coerceIn(0f, 1f),
+            g = color.g.coerceIn(0f, 1f),
+            b = color.b.coerceIn(0f, 1f),
+            a = color.a.coerceIn(0f, 1f)
+        )
+        val clampedGlow = glow.coerceIn(0f, 1f)
+        allSceneObjects[localId] = raw.copy(
+            color = clampedColor,
+            faceColors = if (raw.faceColors.isEmpty()) emptyMap() else raw.faceColors.mapValues { clampedColor },
+            isFullbright = isFullbright,
+            glow = clampedGlow
+        )
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.updateObjectAppearance(
+                localId = localId,
+                defaultTextureId = raw.defaultTextureId,
+                faceTextures = raw.faceTextures,
+                color = clampedColor,
+                fullbright = isFullbright,
+                glow = clampedGlow
+            )
+        }
+        syncSelectedObjectState(localId)
+        pushSceneSnapshot()
+    }
+
+    override fun toggleBuildQueueSelection(localId: Int) {
+        if (!allSceneObjects.containsKey(localId)) return
+        _state.update { s ->
+            val next = if (localId in s.buildSelectionIds) {
+                s.buildSelectionIds - localId
+            } else {
+                s.buildSelectionIds + localId
+            }
+            s.copy(buildSelectionIds = next)
+        }
+    }
+
+    override fun clearBuildQueueSelection() {
+        _state.update { it.copy(buildSelectionIds = emptyList()) }
+    }
+
+    override fun linkObjects(localIds: List<Int>) {
+        val validIds = localIds
+            .distinct()
+            .filter { id ->
+                val o = allSceneObjects[id]
+                o != null && !o.isHudAttachment && o.attachmentPoint == 0 && o.attachedAvatarId == null
+            }
+        if (validIds.size < 2) {
+            showToast("Select at least 2 prims to link")
+            return
+        }
+        val rootId = validIds.first()
+        val worldSnapshots = validIds.associateWith { id -> resolveWorldSceneObject(id)!! }
+        val rootSnap = worldSnapshots.getValue(rootId)
+
+        // Detach any existing child pointers to old linksets cleanly and parent all selected children under rootId
+        allSceneObjects[rootId] = allSceneObjects.getValue(rootId).copy(
+            parentId = 0,
+            position = rootSnap.position,
+            rotation = rootSnap.rotation
+        )
+        for (childId in validIds.drop(1)) {
+            val childWorld = worldSnapshots.getValue(childId)
+            val localFrame = PrimTransformMath.worldToLinkLocal(
+                childWorldPos = childWorld.position,
+                childWorldRot = childWorld.rotation,
+                rootWorldPos = rootSnap.position,
+                rootWorldRot = rootSnap.rotation
+            )
+            allSceneObjects[childId] = allSceneObjects.getValue(childId).copy(
+                parentId = rootId,
+                position = localFrame.position,
+                rotation = localFrame.rotation
+            )
+            // Also re-parent any children that previously had childId as root
+            allSceneObjects.values.filter { it.parentId == childId }.forEach { grandChild ->
+                val gcWorld = PrimTransformMath.linkLocalToWorld(
+                    grandChild.position,
+                    grandChild.rotation,
+                    childWorld.position,
+                    childWorld.rotation
+                )
+                val gcNewLocal = PrimTransformMath.worldToLinkLocal(
+                    gcWorld.position,
+                    gcWorld.rotation,
+                    rootSnap.position,
+                    rootSnap.rotation
+                )
+                allSceneObjects[grandChild.localId] = grandChild.copy(
+                    parentId = rootId,
+                    position = gcNewLocal.position,
+                    rotation = gcNewLocal.rotation
+                )
+            }
+        }
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.linkObjects(validIds)
+        }
+        _state.update { s ->
+            s.copy(
+                selectedObject = resolveWorldSceneObject(rootId),
+                buildSelectionIds = emptyList()
+            )
+        }
+        pushSceneSnapshot(flashLocalId = rootId)
+        showToast("Linked ${validIds.size} prims (Root #$rootId)")
+    }
+
+    override fun unlinkObjects(localIds: List<Int>) {
+        if (localIds.isEmpty()) return
+        val expandedIds = LinkedHashSet<Int>()
+        for (id in localIds) {
+            val obj = allSceneObjects[id] ?: continue
+            expandedIds.add(id)
+            if (obj.parentId == 0) {
+                // Unlinking a root prim unlinks all of its child prims
+                allSceneObjects.values.filter { it.parentId == id }.forEach { expandedIds.add(it.localId) }
+            } else if (!_state.value.editLinkedParts) {
+                // Whole-linkset unlink when a child is selected
+                val rootId = obj.parentId
+                expandedIds.add(rootId)
+                allSceneObjects.values.filter { it.parentId == rootId }.forEach { expandedIds.add(it.localId) }
+            }
+        }
+        if (expandedIds.isEmpty()) return
+
+        var unlinkedCount = 0
+        for (id in expandedIds) {
+            val obj = allSceneObjects[id] ?: continue
+            if (obj.parentId != 0) {
+                val world = resolveWorldSceneObject(id) ?: obj
+                allSceneObjects[id] = obj.copy(
+                    parentId = 0,
+                    position = world.position,
+                    rotation = world.rotation
+                )
+                unlinkedCount++
+            }
+        }
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.delinkObjects(expandedIds.toList())
+        }
+        syncSelectedObjectState()
+        pushSceneSnapshot()
+        showToast(if (unlinkedCount > 0) "Unlinked $unlinkedCount child prim(s)" else "Sent ObjectDelink")
+    }
+
+    override fun duplicateObject(localId: Int, offset: Vec3) {
+        val raw = allSceneObjects[localId] ?: return
+        val editParts = _state.value.editLinkedParts
+        val rootId = if (!editParts && raw.parentId != 0 && allSceneObjects.containsKey(raw.parentId)) {
+            raw.parentId
+        } else {
+            localId
+        }
+        val sourceRoot = allSceneObjects[rootId] ?: return
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.duplicateObjects(listOf(rootId), offset = offset)
+            showToast("Duplicating ${sourceRoot.name}...")
+            return
+        }
+
+        val sourceWorld = resolveWorldSceneObject(rootId) ?: sourceRoot
+        val newRootId = allocateLocalPrimId()
+        val dupRootPos = PrimTransformMath.clampWorldPosition(sourceWorld.position + offset)
+        val dupRoot = sourceRoot.copy(
+            localId = newRootId,
+            uuid = UUID.randomUUID(),
+            parentId = 0,
+            name = "${sourceRoot.name} Copy",
+            position = dupRootPos,
+            rotation = sourceWorld.rotation
+        )
+        allSceneObjects[newRootId] = dupRoot
+
+        if (!editParts && sourceRoot.parentId == 0) {
+            val children = allSceneObjects.values.filter { it.parentId == rootId }
+            for (child in children) {
+                val newChildId = allocateLocalPrimId()
+                allSceneObjects[newChildId] = child.copy(
+                    localId = newChildId,
+                    uuid = UUID.randomUUID(),
+                    parentId = newRootId
+                )
+            }
+        }
+
+        _state.update { it.copy(selectedObject = dupRoot) }
+        pushSceneSnapshot(flashLocalId = newRootId)
+        showToast("Duplicated ${sourceRoot.name} (#$newRootId)")
+    }
+
+    override fun takeObjectToInventory(localId: Int) {
+        val raw = allSceneObjects[localId] ?: return
+        val rootId = if (!_state.value.editLinkedParts && raw.parentId != 0 && allSceneObjects.containsKey(raw.parentId)) {
+            raw.parentId
+        } else {
+            localId
+        }
+        val target = allSceneObjects[rootId] ?: return
+        val objectsFolderId = _state.value.inventoryEntries
+            .firstOrNull { it.isFolder && it.name.contains("Object", ignoreCase = true) }?.id
+            ?: _state.value.inventoryEntries.firstOrNull { it.isFolder }?.id
+            ?: PrimBuildPackets.ZERO_UUID
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.deRezObjects(
+                localIds = listOf(rootId),
+                destination = PrimBuildPackets.DeRezDestination.TAKE_TO_AGENT_INVENTORY,
+                destinationId = objectsFolderId
+            )
+        }
+
+        val familyIds = buildSet {
+            add(rootId)
+            if (target.parentId == 0) {
+                allSceneObjects.values.filter { it.parentId == rootId }.forEach { add(it.localId) }
+            }
+        }
+        familyIds.forEach { allSceneObjects.remove(it) }
+
+        val takenEntry = InventoryEntry(
+            id = target.uuid,
+            parentId = objectsFolderId,
+            name = target.name,
+            isFolder = false,
+            assetType = 6
+        )
+        _state.update { s ->
+            val nextInv = if (s.inventoryEntries.any { it.id == takenEntry.id }) {
+                s.inventoryEntries
+            } else {
+                s.inventoryEntries + takenEntry
+            }
+            val nextSel = s.selectedObject?.takeIf { it.localId !in familyIds }
+            s.copy(
+                inventoryEntries = nextInv,
+                selectedObject = nextSel,
+                buildSelectionIds = s.buildSelectionIds.filterNot { it in familyIds }
+            )
+        }
+        pushSceneSnapshot()
+        showToast("Took ${target.name} to Inventory")
+    }
+
+    override fun deleteObjectToTrash(localId: Int) {
+        val raw = allSceneObjects[localId] ?: return
+        val rootId = if (!_state.value.editLinkedParts && raw.parentId != 0 && allSceneObjects.containsKey(raw.parentId)) {
+            raw.parentId
+        } else {
+            localId
+        }
+        val target = allSceneObjects[rootId] ?: return
+        val trashFolderId = _state.value.inventoryEntries
+            .firstOrNull { it.isFolder && it.name.contains("Trash", ignoreCase = true) }?.id
+            ?: PrimBuildPackets.ZERO_UUID
+
+        if (_state.value.connection is ConnectionState.Connected) {
+            lludpEngine.deRezObjects(
+                localIds = listOf(rootId),
+                destination = PrimBuildPackets.DeRezDestination.TRASH_FOLDER,
+                destinationId = trashFolderId
+            )
+        }
+
+        val familyIds = buildSet {
+            add(rootId)
+            if (target.parentId == 0) {
+                allSceneObjects.values.filter { it.parentId == rootId }.forEach { add(it.localId) }
+            }
+        }
+        familyIds.forEach { allSceneObjects.remove(it) }
+
+        _state.update { s ->
+            s.copy(
+                selectedObject = s.selectedObject?.takeIf { it.localId !in familyIds },
+                buildSelectionIds = s.buildSelectionIds.filterNot { it in familyIds }
+            )
+        }
+        pushSceneSnapshot()
+        showToast("Deleted ${target.name}")
     }
 
     override fun onAvatarSelected(agentId: UUID?) {

@@ -156,6 +156,8 @@ data class ViewerState(
     val hudSlotStates: Map<Int, AvatarHudSlotState> = emptyMap(),
     val sceneSnapshot: RenderSceneSnapshot = RenderSceneSnapshot(),
     val selectedObject: SceneObject? = null,
+    val editLinkedParts: Boolean = false,
+    val buildSelectionIds: List<Int> = emptyList(),
     val selectedAvatarId: UUID? = null,
     val projectedNametags: List<ProjectedNametag> = emptyList(),
     val textureRevision: Int = 0,

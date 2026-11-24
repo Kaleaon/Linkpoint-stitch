@@ -1,6 +1,7 @@
 package com.example.linkpoint.client
 
 import android.graphics.Bitmap
+import com.example.linkpoint.build.PrimBuildPackets
 import com.example.linkpoint.cache.SavedAccountEntity
 import com.example.linkpoint.designsystem.AccentPreset
 import com.example.linkpoint.designsystem.DesignLanguage
@@ -11,8 +12,10 @@ import com.example.linkpoint.designsystem.JoystickSide
 import com.example.linkpoint.designsystem.TelemetryPosition
 import com.example.linkpoint.designsystem.UiDensity
 import com.example.linkpoint.scene.CameraMode
+import com.example.linkpoint.scene.ColorRgba
 import com.example.linkpoint.scene.EnvironmentPreset
 import com.example.linkpoint.scene.HudHitResult
+import com.example.linkpoint.scene.Quat
 import com.example.linkpoint.scene.SceneObject
 import com.example.linkpoint.scene.Vec3
 import com.example.linkpoint.store.ChatRange
@@ -63,6 +66,43 @@ interface ViewerClient {
     fun onHudAttachmentTapped(hit: HudHitResult)
     fun onWorldObjectSelected(obj: SceneObject?)
     fun touchSelectedObject()
+
+    // Phase 7: Prim Build, Transform, Appearance & Linkset Studio
+    fun rezPrim(
+        preset: PrimBuildPackets.PrimPreset,
+        position: Vec3? = null,
+        scale: Vec3 = preset.defaultScale,
+        material: PrimBuildPackets.PrimMaterial = PrimBuildPackets.PrimMaterial.WOOD
+    )
+    fun setEditLinkedParts(enabled: Boolean)
+    fun updateObjectTransform(
+        localId: Int,
+        position: Vec3? = null,
+        rotation: Quat? = null,
+        scale: Vec3? = null,
+        editLinkedParts: Boolean? = null
+    )
+    fun updateObjectMetadata(localId: Int, name: String? = null, description: String? = null)
+    fun updateObjectFlags(
+        localId: Int,
+        usePhysics: Boolean,
+        isPhantom: Boolean,
+        isTemporary: Boolean = false,
+        castsShadows: Boolean = true
+    )
+    fun updateObjectAppearance(
+        localId: Int,
+        color: ColorRgba,
+        isFullbright: Boolean,
+        glow: Float
+    )
+    fun toggleBuildQueueSelection(localId: Int)
+    fun clearBuildQueueSelection()
+    fun linkObjects(localIds: List<Int>)
+    fun unlinkObjects(localIds: List<Int>)
+    fun duplicateObject(localId: Int, offset: Vec3 = Vec3(0.5f, 0.5f, 0f))
+    fun takeObjectToInventory(localId: Int)
+    fun deleteObjectToTrash(localId: Int)
     fun onAvatarSelected(agentId: UUID?)
     fun requestAvatarRefresh(agentId: UUID)
     fun getCachedTextureBitmap(textureId: UUID?): Bitmap?
