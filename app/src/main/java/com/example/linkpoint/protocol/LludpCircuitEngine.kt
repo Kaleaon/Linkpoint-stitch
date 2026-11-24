@@ -99,6 +99,7 @@ sealed class SimEvent {
     ) : SimEvent()
     data class UuidNamesResolved(val names: Map<UUID, String>) : SimEvent()
     data class ObjectKilled(val localId: Int) : SimEvent()
+    data class DeRezAckReceived(val transactionId: UUID, val success: Boolean) : SimEvent()
     data class ObjectPropertiesReceived(
         val objectId: UUID,
         val creatorId: UUID,
@@ -646,6 +647,12 @@ class LludpCircuitEngine {
             }
             LludpPackets.MSG_LOGOUT_REPLY -> {
                 _events.tryEmit(SimEvent.LoggedOut)
+            }
+            LludpPackets.MSG_DEREZ_ACK -> {
+                if (buf.remaining() >= 17) {
+                    val ack = PrimBuildPackets.parseDeRezAckPayload(buf)
+                    _events.tryEmit(SimEvent.DeRezAckReceived(ack.transactionId, ack.success))
+                }
             }
         }
     }
@@ -1256,7 +1263,7 @@ class LludpCircuitEngine {
     fun sendChat(message: String, chatType: Byte = 1, channel: Int = 0) {
         if (!running.get()) return
         val body = LludpPackets.buildChatFromViewer(agentId, sessionId, message, chatType, channel)
-        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true)
+        send(LludpPackets.MSG_CHAT_FROM_VIEWER, body, reliable = true, zeroCode = true)
     }
 
     fun sendInstantMessage(toAgentId: UUID, imSessionId: UUID, fromName: String, message: String) {
@@ -1393,6 +1400,12 @@ class LludpCircuitEngine {
         send(PrimBuildPackets.MSG_OBJECT_FLAG_UPDATE, body, reliable = true, zeroCode = true)
     }
 
+    fun updateObjectShape(localId: Int, volumeParams: PrimBuildPackets.PrimVolumeParams) {
+        if (!running.get()) return
+        val body = PrimBuildPackets.buildObjectShapeBody(agentId, sessionId, listOf(localId to volumeParams))
+        send(PrimBuildPackets.MSG_OBJECT_SHAPE, body, reliable = true, zeroCode = true)
+    }
+
     fun updateObjectAppearance(
         localId: Int,
         defaultTextureId: UUID?,
@@ -1400,7 +1413,9 @@ class LludpCircuitEngine {
         color: ColorRgba,
         faceColors: Map<Int, ColorRgba> = emptyMap(),
         fullbright: Boolean,
-        glow: Float
+        faceFullbright: Map<Int, Boolean> = emptyMap(),
+        glow: Float,
+        faceGlows: Map<Int, Float> = emptyMap()
     ) {
         if (!running.get()) return
         val teBytes = PrimBuildPackets.buildCompactTextureEntry(
@@ -1409,7 +1424,9 @@ class LludpCircuitEngine {
             defaultColor = color,
             faceColors = faceColors,
             fullbright = fullbright,
-            glow = glow
+            faceFullbright = faceFullbright,
+            glow = glow,
+            faceGlows = faceGlows
         )
         val body = PrimBuildPackets.buildObjectImageBody(agentId, sessionId, localId, teBytes)
         send(PrimBuildPackets.MSG_OBJECT_IMAGE, body, reliable = true, zeroCode = true)

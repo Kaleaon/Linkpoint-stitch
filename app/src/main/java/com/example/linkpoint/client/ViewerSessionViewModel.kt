@@ -570,6 +570,12 @@ class ViewerSessionViewModel(application: Application) : AndroidViewModel(applic
                         appendDiagnostic(evt.technicalDetail)
                         showToast(evt.message)
                     }
+                    is SimEvent.DeRezAckReceived -> {
+                        appendDiagnostic("LLUDP <- DeRezAck tx=${evt.transactionId} success=${evt.success}")
+                        if (!evt.success) {
+                            showToast("Simulator declined DeRezObject request")
+                        }
+                    }
                     SimEvent.LoggedOut -> disconnect()
                 }
             }

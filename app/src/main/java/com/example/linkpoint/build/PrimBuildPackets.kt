@@ -42,6 +42,7 @@ object PrimBuildPackets {
     const val MSG_OBJECT_LINK: Int = 0xFFFF0073.toInt()          // Low 115, Unencoded
     const val MSG_OBJECT_DELINK: Int = 0xFFFF0074.toInt()        // Low 116, Unencoded
     const val MSG_OBJECT_DEREZ: Int = 0xFFFF0123.toInt()         // Low 291 (DeRezObject), Zerocoded
+    const val MSG_DEREZ_ACK: Int = 0xFFFF0124.toInt()            // Low 292 (DeRezAck), Unencoded
 
     // --- ObjectAdd & ObjectUpdate Constants ---
     const val PCODE_PRIM: Int = 9
@@ -76,6 +77,14 @@ object PrimBuildPackets {
     const val PROFILE_CURVE_EQUALTRI: Int = 0x03
     const val PROFILE_CURVE_RIGHTTRI: Int = 0x04
     const val PROFILE_CURVE_CIRCLE_HALF: Int = 0x05
+
+    // ProfileCurve upper-nibble hole type masks (LLProfileParams::LL_PCODE_HOLE_*)
+    const val HOLE_SAME: Int = 0x00
+    const val HOLE_CIRCLE: Int = 0x10
+    const val HOLE_SQUARE: Int = 0x20
+    const val HOLE_TRIANGLE: Int = 0x30
+    const val MAX_FACES: Int = 32
+    const val ALL_FACES: Int = -1
 
     enum class PrimMaterial(val code: Int, val label: String) {
         STONE(0, "Stone"),
@@ -206,7 +215,168 @@ object PrimBuildPackets {
         }
     }
 
-    // --- Parsed Verification Models (for deterministic round-trip inspection & testing) ---
+    // --- Canonical 23-Byte PrimVolumeParams & Parsed Verification Models ---
+
+    /**
+     * Canonical Second Life parametric primitive volume parameters (`LLVolumeMessage::packVolumeParams` /
+     * `unpackVolumeParams`), shared identically across `ObjectAdd` (`Medium 1`), `ObjectShape` (`Low 98`),
+     * and `ObjectUpdate` (`High 12`).
+     *
+     * Quantization rules (matching `indra/llprimitive/llvolumemessage.cpp` & `PrimPathParams` / `PrimProfileParams`):
+     * - `pathBegin`, `profileBegin` (`0.0 .. 0.99`): `U16 = round(v * 50000)` (`CUT_QUANTA = 2e-5`)
+     * - `pathEnd`, `profileEnd` (`0.01 .. 1.0`): `U16 = round((1.0 - v) * 50000)` (`0` on wire => `1.0` uncut)
+     * - `pathScaleX`, `pathScaleY` (`0.0 .. 2.0`): `U8 = round(200 - v * 100)` (`100` => `1.0`, `175` => `0.25`, `200` => `0.0`)
+     * - `pathShearX`, `pathShearY` (`-0.5 .. +0.5`): `S8 = round(v * 100)`
+     * - `twist`, `twistBegin`, `radiusOffset`, `taperX`, `taperY` (`-1.0 .. +1.0`): `S8 = round(v * 100)`
+     * - `revolutions` (`1.0 .. 4.0`): `U8 = round((v - 1.0) / 0.015)`
+     * - `skew` (`-0.95 .. +0.95`): `S8 = round(v * 100)`
+     * - `hollow` (`0.0 .. 0.95`): `U16 = round(v * 50000)` (`0 .. 47500`, `HOLLOW_QUANTA = 2e-5`)
+     */
+    data class PrimVolumeParams(
+        val pathCurve: Int = PATH_CURVE_LINE,
+        val profileCurve: Int = PROFILE_CURVE_SQUARE,
+        val pathBegin: Float = 0f,
+        val pathEnd: Float = 1f,
+        val pathScaleX: Float = 1f,
+        val pathScaleY: Float = 1f,
+        val pathShearX: Float = 0f,
+        val pathShearY: Float = 0f,
+        val twist: Float = 0f,
+        val twistBegin: Float = 0f,
+        val radiusOffset: Float = 0f,
+        val taperX: Float = 0f,
+        val taperY: Float = 0f,
+        val revolutions: Float = 1f,
+        val skew: Float = 0f,
+        val profileBegin: Float = 0f,
+        val profileEnd: Float = 1f,
+        val hollow: Float = 0f
+    ) {
+        val profileShape: Int get() = profileCurve and 0x0F
+        val holeType: Int get() = profileCurve and 0xF0
+
+        fun packToBuffer(buf: ByteBuffer) {
+            val rawPathBegin = (pathBegin.coerceIn(0f, 0.99f) * 50000f).roundToInt().coerceIn(0, 49999)
+            val rawPathEnd = ((1f - pathEnd.coerceIn(0.01f, 1f)) * 50000f).roundToInt().coerceIn(0, 49999)
+            val rawScaleX = (200 - (pathScaleX.coerceIn(0f, 2f) * 100f).roundToInt()).coerceIn(0, 200)
+            val rawScaleY = (200 - (pathScaleY.coerceIn(0f, 2f) * 100f).roundToInt()).coerceIn(0, 200)
+            val rawShearX = (pathShearX.coerceIn(-0.5f, 0.5f) * 100f).roundToInt().coerceIn(-50, 50)
+            val rawShearY = (pathShearY.coerceIn(-0.5f, 0.5f) * 100f).roundToInt().coerceIn(-50, 50)
+            val rawTwist = (twist.coerceIn(-1f, 1f) * 100f).roundToInt().coerceIn(-100, 100)
+            val rawTwistBegin = (twistBegin.coerceIn(-1f, 1f) * 100f).roundToInt().coerceIn(-100, 100)
+            val rawRadiusOffset = (radiusOffset.coerceIn(-1f, 1f) * 100f).roundToInt().coerceIn(-100, 100)
+            val rawTaperX = (taperX.coerceIn(-1f, 1f) * 100f).roundToInt().coerceIn(-100, 100)
+            val rawTaperY = (taperY.coerceIn(-1f, 1f) * 100f).roundToInt().coerceIn(-100, 100)
+            val rawRevolutions = ((revolutions.coerceIn(1f, 4f) - 1f) / 0.015f).roundToInt().coerceIn(0, 200)
+            val rawSkew = (skew.coerceIn(-0.95f, 0.95f) * 100f).roundToInt().coerceIn(-95, 95)
+            val rawProfBegin = (profileBegin.coerceIn(0f, 0.99f) * 50000f).roundToInt().coerceIn(0, 49999)
+            val rawProfEnd = ((1f - profileEnd.coerceIn(0.01f, 1f)) * 50000f).roundToInt().coerceIn(0, 49999)
+            val rawHollow = (hollow.coerceIn(0f, 0.95f) * 50000f).roundToInt().coerceIn(0, 47500)
+
+            buf.put((pathCurve and 0xFF).toByte())
+            buf.put((profileCurve and 0xFF).toByte())
+            buf.putShort(rawPathBegin.toShort())
+            buf.putShort(rawPathEnd.toShort())
+            buf.put(rawScaleX.toByte())
+            buf.put(rawScaleY.toByte())
+            buf.put(rawShearX.toByte())
+            buf.put(rawShearY.toByte())
+            buf.put(rawTwist.toByte())
+            buf.put(rawTwistBegin.toByte())
+            buf.put(rawRadiusOffset.toByte())
+            buf.put(rawTaperX.toByte())
+            buf.put(rawTaperY.toByte())
+            buf.put(rawRevolutions.toByte())
+            buf.put(rawSkew.toByte())
+            buf.putShort(rawProfBegin.toShort())
+            buf.putShort(rawProfEnd.toShort())
+            buf.putShort(rawHollow.toShort())
+        }
+
+        companion object {
+            const val BYTE_SIZE: Int = 23
+
+            fun fromPreset(
+                preset: PrimPreset,
+                hollow: Float = 0f,
+                holeType: Int = HOLE_SAME,
+                twist: Float = 0f,
+                twistBegin: Float = 0f,
+                taperX: Float = 0f,
+                taperY: Float = 0f,
+                pathShearX: Float = 0f,
+                pathShearY: Float = 0f,
+                pathBegin: Float = 0f,
+                pathEnd: Float = 1f,
+                profileBegin: Float = 0f,
+                profileEnd: Float = 1f,
+                radiusOffset: Float = 0f,
+                revolutions: Float = 1f,
+                skew: Float = 0f
+            ): PrimVolumeParams = PrimVolumeParams(
+                pathCurve = preset.pathCurve,
+                profileCurve = (holeType and 0xF0) or (preset.profileCurve and 0x0F),
+                pathBegin = pathBegin,
+                pathEnd = pathEnd,
+                pathScaleX = (200 - preset.pathScaleX) * 0.01f,
+                pathScaleY = (200 - preset.pathScaleY) * 0.01f,
+                pathShearX = pathShearX,
+                pathShearY = pathShearY,
+                twist = twist,
+                twistBegin = twistBegin,
+                radiusOffset = radiusOffset,
+                taperX = taperX,
+                taperY = taperY,
+                revolutions = revolutions,
+                skew = skew,
+                profileBegin = profileBegin,
+                profileEnd = profileEnd,
+                hollow = hollow
+            )
+
+            fun unpackFromBuffer(buf: ByteBuffer): PrimVolumeParams {
+                val pathCurve = buf.get().toInt() and 0xFF
+                val profileCurve = buf.get().toInt() and 0xFF
+                val rawPathBegin = buf.short.toInt() and 0xFFFF
+                val rawPathEnd = buf.short.toInt() and 0xFFFF
+                val rawScaleX = buf.get().toInt() and 0xFF
+                val rawScaleY = buf.get().toInt() and 0xFF
+                val rawShearX = buf.get().toInt() // signed S8
+                val rawShearY = buf.get().toInt() // signed S8
+                val rawTwist = buf.get().toInt() // signed S8
+                val rawTwistBegin = buf.get().toInt() // signed S8
+                val rawRadiusOffset = buf.get().toInt() // signed S8
+                val rawTaperX = buf.get().toInt() // signed S8
+                val rawTaperY = buf.get().toInt() // signed S8
+                val rawRevolutions = buf.get().toInt() and 0xFF
+                val rawSkew = buf.get().toInt() // signed S8
+                val rawProfBegin = buf.short.toInt() and 0xFFFF
+                val rawProfEnd = buf.short.toInt() and 0xFFFF
+                val rawHollow = buf.short.toInt() and 0xFFFF
+
+                return PrimVolumeParams(
+                    pathCurve = pathCurve,
+                    profileCurve = profileCurve,
+                    pathBegin = rawPathBegin * 2.0e-5f,
+                    pathEnd = (50000 - rawPathEnd) * 2.0e-5f,
+                    pathScaleX = (200 - rawScaleX) * 0.01f,
+                    pathScaleY = (200 - rawScaleY) * 0.01f,
+                    pathShearX = rawShearX * 0.01f,
+                    pathShearY = rawShearY * 0.01f,
+                    twist = rawTwist * 0.01f,
+                    twistBegin = rawTwistBegin * 0.01f,
+                    radiusOffset = rawRadiusOffset * 0.01f,
+                    taperX = rawTaperX * 0.01f,
+                    taperY = rawTaperY * 0.01f,
+                    revolutions = rawRevolutions * 0.015f + 1.0f,
+                    skew = rawSkew * 0.01f,
+                    profileBegin = rawProfBegin * 2.0e-5f,
+                    profileEnd = (50000 - rawProfEnd) * 2.0e-5f,
+                    hollow = rawHollow * 2.0e-5f
+                )
+            }
+        }
+    }
 
     data class DecodedObjectAdd(
         val agentId: UUID,
@@ -221,9 +391,19 @@ object PrimBuildPackets {
         val pathEnd: Int,
         val pathScaleX: Int,
         val pathScaleY: Int,
+        val pathShearX: Int,
+        val pathShearY: Int,
+        val pathTwist: Int,
+        val pathTwistBegin: Int,
+        val pathRadiusOffset: Int,
+        val pathTaperX: Int,
+        val pathTaperY: Int,
+        val pathRevolutions: Int,
+        val pathSkew: Int,
         val profileBegin: Int,
         val profileEnd: Int,
         val profileHollow: Int,
+        val volumeParams: PrimVolumeParams,
         val bypassRaycast: Int,
         val rayStart: Vec3,
         val rayEnd: Vec3,
@@ -281,6 +461,67 @@ object PrimBuildPackets {
         val localIds: List<Int>
     )
 
+    data class DecodedDeRezAck(
+        val transactionId: UUID,
+        val success: Boolean
+    )
+
+    data class DecodedObjectShapeEntry(
+        val localId: Int,
+        val volumeParams: PrimVolumeParams
+    )
+
+    data class DecodedObjectShape(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val entries: List<DecodedObjectShapeEntry>
+    )
+
+    data class DecodedObjectFlagUpdate(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val localId: Int,
+        val usePhysics: Boolean,
+        val isTemporary: Boolean,
+        val isPhantom: Boolean,
+        val castsShadows: Boolean
+    )
+
+    data class DecodedObjectImageEntry(
+        val localId: Int,
+        val mediaUrl: String,
+        val textureEntryBytes: ByteArray
+    )
+
+    data class DecodedObjectImage(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val entries: List<DecodedObjectImageEntry>
+    )
+
+    data class DecodedObjectExtraParamEntry(
+        val localId: Int,
+        val paramType: Int,
+        val paramInUse: Boolean,
+        val paramSize: Int,
+        val paramData: ByteArray
+    )
+
+    data class DecodedObjectExtraParams(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val entries: List<DecodedObjectExtraParamEntry>
+    )
+
+    data class DecodedObjectDuplicate(
+        val agentId: UUID,
+        val sessionId: UUID,
+        val groupId: UUID,
+        val offset: Vec3,
+        val duplicateFlags: Int,
+        val localIds: List<Int>
+    )
+
     // --- 1. ObjectAdd (Medium 1 = 0xFF01, Zerocoded, 144-byte body) ---
 
     fun buildObjectAddBody(
@@ -298,6 +539,7 @@ object PrimBuildPackets {
         scale: Vec3 = preset.defaultScale,
         rotation: Quat = Quat.IDENTITY,
         profileHollow: Int = 0,
+        volumeParams: PrimVolumeParams? = null,
         state: Int = 0
     ): ByteArray {
         val clampedScale = PrimTransformMath.clampScale(scale)
@@ -312,24 +554,14 @@ object PrimBuildPackets {
         buf.put(material.code.toByte())
         buf.putInt(addFlags)
 
-        buf.put(preset.pathCurve.toByte())
-        buf.put(preset.profileCurve.toByte())
-        buf.putShort(0) // PathBegin
-        buf.putShort(0) // PathEnd (0 => 1.0 uncut in LLVolumeMessage)
-        buf.put(preset.pathScaleX.toByte())
-        buf.put(preset.pathScaleY.toByte())
-        buf.put(0) // PathShearX
-        buf.put(0) // PathShearY
-        buf.put(0) // PathTwist
-        buf.put(0) // PathTwistBegin
-        buf.put(0) // PathRadiusOffset
-        buf.put(0) // PathTaperX
-        buf.put(0) // PathTaperY
-        buf.put(0) // PathRevolutions
-        buf.put(0) // PathSkew
-        buf.putShort(0) // ProfileBegin
-        buf.putShort(0) // ProfileEnd (0 => 1.0 uncut)
-        buf.putShort(profileHollow.coerceIn(0, 47500).toShort())
+        if (volumeParams != null) {
+            volumeParams.packToBuffer(buf)
+        } else {
+            PrimVolumeParams.fromPreset(
+                preset = preset,
+                hollow = (profileHollow.coerceIn(0, 47500) * 2.0e-5f)
+            ).packToBuffer(buf)
+        }
 
         buf.put(if (bypassRaycast) 1.toByte() else 0.toByte())
         LludpPackets.putVec3(buf, rayStart)
@@ -354,7 +586,9 @@ object PrimBuildPackets {
         rayEnd: Vec3,
         rayEndIsIntersection: Boolean = false,
         scale: Vec3 = preset.defaultScale,
-        rotation: Quat = Quat.IDENTITY
+        rotation: Quat = Quat.IDENTITY,
+        volumeParams: PrimVolumeParams? = null,
+        reliable: Boolean = true
     ): ByteArray {
         val body = buildObjectAddBody(
             agentId = agentId,
@@ -367,11 +601,12 @@ object PrimBuildPackets {
             rayEnd = rayEnd,
             rayEndIsIntersection = rayEndIsIntersection,
             scale = scale,
-            rotation = rotation
+            rotation = rotation,
+            volumeParams = volumeParams
         )
         return LludpPackets.framePacket(
             sequenceNumber = sequenceNumber,
-            reliable = true,
+            reliable = reliable,
             messageId = MSG_OBJECT_ADD,
             body = body,
             useZeroCoding = true
@@ -386,16 +621,29 @@ object PrimBuildPackets {
         val pCode = buf.get().toInt() and 0xFF
         val matCode = buf.get().toInt() and 0xFF
         val addFlags = buf.int
-        val pathCurve = buf.get().toInt() and 0xFF
-        val profileCurve = buf.get().toInt() and 0xFF
-        val pathBegin = buf.short.toInt() and 0xFFFF
-        val pathEnd = buf.short.toInt() and 0xFFFF
-        val pathScaleX = buf.get().toInt() and 0xFF
-        val pathScaleY = buf.get().toInt() and 0xFF
-        buf.position(buf.position() + 9) // ShearX/Y, Twist, TwistBegin, RadiusOffset, TaperX/Y, Revolutions, Skew
-        val profileBegin = buf.short.toInt() and 0xFFFF
-        val profileEnd = buf.short.toInt() and 0xFFFF
-        val profileHollow = buf.short.toInt() and 0xFFFF
+        val volStart = buf.position()
+        val volume = PrimVolumeParams.unpackFromBuffer(buf)
+        val rawVol = buf.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        rawVol.position(volStart)
+        val pathCurve = rawVol.get().toInt() and 0xFF
+        val profileCurve = rawVol.get().toInt() and 0xFF
+        val pathBegin = rawVol.short.toInt() and 0xFFFF
+        val pathEnd = rawVol.short.toInt() and 0xFFFF
+        val pathScaleX = rawVol.get().toInt() and 0xFF
+        val pathScaleY = rawVol.get().toInt() and 0xFF
+        val pathShearX = rawVol.get().toInt()
+        val pathShearY = rawVol.get().toInt()
+        val pathTwist = rawVol.get().toInt()
+        val pathTwistBegin = rawVol.get().toInt()
+        val pathRadiusOffset = rawVol.get().toInt()
+        val pathTaperX = rawVol.get().toInt()
+        val pathTaperY = rawVol.get().toInt()
+        val pathRevolutions = rawVol.get().toInt() and 0xFF
+        val pathSkew = rawVol.get().toInt()
+        val profileBegin = rawVol.short.toInt() and 0xFFFF
+        val profileEnd = rawVol.short.toInt() and 0xFFFF
+        val profileHollow = rawVol.short.toInt() and 0xFFFF
+
         val bypass = buf.get().toInt() and 0xFF
         val rayStart = LludpPackets.readVec3(buf)
         val rayEnd = LludpPackets.readVec3(buf)
@@ -417,9 +665,19 @@ object PrimBuildPackets {
             pathEnd = pathEnd,
             pathScaleX = pathScaleX,
             pathScaleY = pathScaleY,
+            pathShearX = pathShearX,
+            pathShearY = pathShearY,
+            pathTwist = pathTwist,
+            pathTwistBegin = pathTwistBegin,
+            pathRadiusOffset = pathRadiusOffset,
+            pathTaperX = pathTaperX,
+            pathTaperY = pathTaperY,
+            pathRevolutions = pathRevolutions,
+            pathSkew = pathSkew,
             profileBegin = profileBegin,
             profileEnd = profileEnd,
             profileHollow = profileHollow,
+            volumeParams = volume,
             bypassRaycast = bypass,
             rayStart = rayStart,
             rayEnd = rayEnd,
@@ -429,6 +687,54 @@ object PrimBuildPackets {
             rotation = rotation,
             state = state
         )
+    }
+
+    // --- 1b. ObjectShape (Low 98 = 0xFFFF0062, Zerocoded) ---
+
+    fun buildObjectShapeBody(
+        agentId: UUID,
+        sessionId: UUID,
+        entries: List<Pair<Int, PrimVolumeParams>>
+    ): ByteArray {
+        val capped = entries.take(255)
+        val buf = ByteBuffer.allocate(33 + capped.size * (4 + PrimVolumeParams.BYTE_SIZE))
+            .order(ByteOrder.LITTLE_ENDIAN)
+        LludpPackets.putUuid(buf, agentId)
+        LludpPackets.putUuid(buf, sessionId)
+        buf.put(capped.size.toByte())
+        for ((localId, vol) in capped) {
+            buf.putInt(localId)
+            vol.packToBuffer(buf)
+        }
+        return buf.array()
+    }
+
+    fun frameObjectShapePacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        entries: List<Pair<Int, PrimVolumeParams>>,
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_OBJECT_SHAPE,
+        body = buildObjectShapeBody(agentId, sessionId, entries),
+        useZeroCoding = true
+    )
+
+    fun parseObjectShapePayload(payload: ByteBuffer): DecodedObjectShape {
+        val buf = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val count = buf.get().toInt() and 0xFF
+        val entries = ArrayList<DecodedObjectShapeEntry>(count)
+        repeat(count) {
+            val localId = buf.int
+            val vol = PrimVolumeParams.unpackFromBuffer(buf)
+            entries.add(DecodedObjectShapeEntry(localId, vol))
+        }
+        return DecodedObjectShape(agentId, sessionId, entries)
     }
 
     // --- 2. MultipleObjectUpdate (Medium 2 = 0xFF02, Zerocoded) ---
@@ -472,12 +778,13 @@ object PrimBuildPackets {
         sequenceNumber: Int,
         agentId: UUID,
         sessionId: UUID,
-        entries: List<ObjectTransformEntry>
+        entries: List<ObjectTransformEntry>,
+        reliable: Boolean = true
     ): ByteArray {
         val body = buildMultipleObjectUpdateBody(agentId, sessionId, entries)
         return LludpPackets.framePacket(
             sequenceNumber = sequenceNumber,
-            reliable = true,
+            reliable = reliable,
             messageId = MSG_MULTIPLE_OBJECT_UPDATE,
             body = body,
             useZeroCoding = true
@@ -525,6 +832,49 @@ object PrimBuildPackets {
         localId: Int,
         description: String
     ): ByteArray = buildObjectStringFieldBody(agentId, sessionId, listOf(localId to description), maxChars = 127)
+
+    fun frameObjectNamePacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        localId: Int,
+        name: String,
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_OBJECT_NAME,
+        body = buildObjectNameBody(agentId, sessionId, localId, name),
+        useZeroCoding = true
+    )
+
+    fun frameObjectDescriptionPacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        localId: Int,
+        description: String,
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_OBJECT_DESCRIPTION,
+        body = buildObjectDescriptionBody(agentId, sessionId, localId, description),
+        useZeroCoding = true
+    )
+
+    fun parseObjectStringFieldPayload(payload: ByteBuffer): Triple<UUID, UUID, List<Pair<Int, String>>> {
+        val buf = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val count = buf.get().toInt() and 0xFF
+        val items = List(count) {
+            val id = buf.int
+            val len = buf.get().toInt() and 0xFF
+            id to LludpPackets.readCString(buf, len)
+        }
+        return Triple(agentId, sessionId, items)
+    }
 
     private fun buildObjectStringFieldBody(
         agentId: UUID,
@@ -574,12 +924,59 @@ object PrimBuildPackets {
         return buf.array()
     }
 
+    fun frameObjectFlagUpdatePacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        localId: Int,
+        usePhysics: Boolean,
+        isTemporary: Boolean = false,
+        isPhantom: Boolean,
+        castsShadows: Boolean = true,
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_OBJECT_FLAG_UPDATE,
+        body = buildObjectFlagUpdateBody(
+            agentId = agentId,
+            sessionId = sessionId,
+            localId = localId,
+            usePhysics = usePhysics,
+            isTemporary = isTemporary,
+            isPhantom = isPhantom,
+            castsShadows = castsShadows
+        ),
+        useZeroCoding = true
+    )
+
+    fun parseObjectFlagUpdatePayload(payload: ByteBuffer): DecodedObjectFlagUpdate {
+        val buf = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val localId = buf.int
+        val usePhysics = (buf.get().toInt() and 0xFF) != 0
+        val isTemporary = (buf.get().toInt() and 0xFF) != 0
+        val isPhantom = (buf.get().toInt() and 0xFF) != 0
+        val castsShadows = (buf.get().toInt() and 0xFF) != 0
+        return DecodedObjectFlagUpdate(
+            agentId = agentId,
+            sessionId = sessionId,
+            localId = localId,
+            usePhysics = usePhysics,
+            isTemporary = isTemporary,
+            isPhantom = isPhantom,
+            castsShadows = castsShadows
+        )
+    }
+
     // --- 5. Compact TextureEntry & ObjectImage (Low 96 = 0xFFFF0060, Zerocoded) ---
 
     /**
      * Packs a canonical Second Life binary `TextureEntry` (compatible with both SL simulators and
-     * [SlBinaryParsers.parseTextureEntry]), encoding default/per-face Texture UUIDs, SL inverted-alpha
-     * `Color4U`, UV repeat/offset/rotation, Fullbright (`0x20` in Material byte), Media, and Glow (`0..255`).
+     * [SlBinaryParsers.parseTextureEntry]), encoding default and 0-based per-face (`0..31`) Texture UUIDs,
+     * SL inverted-alpha `Color4U`, UV repeat/offset/rotation, Fullbright (`0x20` in Material byte),
+     * Media, and Glow (`0..255`).
      */
     fun buildCompactTextureEntry(
         defaultTextureId: UUID? = SlBinaryParsers.DEFAULT_BLANK_UUID,
@@ -587,9 +984,13 @@ object PrimBuildPackets {
         defaultColor: ColorRgba = ColorRgba(1f, 1f, 1f, 1f),
         faceColors: Map<Int, ColorRgba> = emptyMap(),
         fullbright: Boolean = false,
+        faceFullbright: Map<Int, Boolean> = emptyMap(),
         glow: Float = 0f,
+        faceGlows: Map<Int, Float> = emptyMap(),
         repeatU: Float = 1f,
-        repeatV: Float = 1f
+        faceRepeatU: Map<Int, Float> = emptyMap(),
+        repeatV: Float = 1f,
+        faceRepeatV: Map<Int, Float> = emptyMap()
     ): ByteArray {
         val out = ByteArrayOutputStream(128)
 
@@ -620,17 +1021,24 @@ object PrimBuildPackets {
             }
         }
 
-        fun writeSlColor4U(c: ColorRgba) {
+        fun packSlColor4UInt(c: ColorRgba): Int {
             val r = (c.r.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
             val g = (c.g.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
             val b = (c.b.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
             // SL stores inverted transparency: 0 = opaque (alpha 1.0), 255 = fully transparent (alpha 0.0)
             val rawTrans = (255 - (c.a.coerceIn(0f, 1f) * 255f).roundToInt()).coerceIn(0, 255)
-            out.write(r)
-            out.write(g)
-            out.write(b)
-            out.write(rawTrans)
+            return (r shl 24) or (g shl 16) or (b shl 8) or rawTrans
         }
+
+        fun writePackedColor4U(packed: Int) {
+            out.write((packed ushr 24) and 0xFF)
+            out.write((packed ushr 16) and 0xFF)
+            out.write((packed ushr 8) and 0xFF)
+            out.write(packed and 0xFF)
+        }
+
+        fun quantizeGlowByte(g: Float): Int =
+            (g.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
 
         fun writeFloatLe(v: Float) {
             val b = ByteBuffer.allocate(4).order(ByteOrder.LITTLE_ENDIAN).putFloat(v)
@@ -642,31 +1050,49 @@ object PrimBuildPackets {
             out.write(b.array())
         }
 
-        // 1. Default Texture UUID + per-face overrides
+        // 1. Default Texture UUID + 0-indexed per-face overrides (0..31)
         val defTex = defaultTextureId ?: SlBinaryParsers.DEFAULT_BLANK_UUID
         writeUuidBe(defTex)
-        for ((faceIdx, texId) in faceTextures) {
-            if (faceIdx in 0..31 && texId != defTex) {
+        for ((faceIdx, texId) in faceTextures.entries.sortedBy { it.key }) {
+            if (faceIdx in 0 until MAX_FACES && texId != defTex) {
                 writeFaceBitfield(1 shl faceIdx)
                 writeUuidBe(texId)
             }
         }
         writeFaceBitfield(0)
 
-        // 2. Default RGBA + per-face overrides
-        writeSlColor4U(defaultColor)
-        for ((faceIdx, col) in faceColors) {
-            if (faceIdx in 0..31 && col != defaultColor) {
-                writeFaceBitfield(1 shl faceIdx)
-                writeSlColor4U(col)
+        // 2. Default RGBA + 0-indexed per-face overrides (0..31)
+        val defColorPacked = packSlColor4UInt(defaultColor)
+        writePackedColor4U(defColorPacked)
+        for ((faceIdx, col) in faceColors.entries.sortedBy { it.key }) {
+            if (faceIdx in 0 until MAX_FACES) {
+                val packed = packSlColor4UInt(col)
+                if (packed != defColorPacked) {
+                    writeFaceBitfield(1 shl faceIdx)
+                    writePackedColor4U(packed)
+                }
             }
         }
         writeFaceBitfield(0)
 
-        // 3. RepeatU (F32) & 4. RepeatV (F32)
+        // 3. RepeatU (F32) + per-face overrides
         writeFloatLe(repeatU)
+        for ((faceIdx, fRepU) in faceRepeatU.entries.sortedBy { it.key }) {
+            if (faceIdx in 0 until MAX_FACES && fRepU != repeatU) {
+                writeFaceBitfield(1 shl faceIdx)
+                writeFloatLe(fRepU)
+            }
+        }
         writeFaceBitfield(0)
+
+        // 4. RepeatV (F32) + per-face overrides
         writeFloatLe(repeatV)
+        for ((faceIdx, fRepV) in faceRepeatV.entries.sortedBy { it.key }) {
+            if (faceIdx in 0 until MAX_FACES && fRepV != repeatV) {
+                writeFaceBitfield(1 shl faceIdx)
+                writeFloatLe(fRepV)
+            }
+        }
         writeFaceBitfield(0)
 
         // 5. OffsetU (S16) & 6. OffsetV (S16) & 7. Rotation (S16)
@@ -677,21 +1103,98 @@ object PrimBuildPackets {
         writeShortLe(0)
         writeFaceBitfield(0)
 
-        // 8. Material byte (bit 0x20 = Fullbright)
-        val matByte = if (fullbright) TE_MATERIAL_FULLBRIGHT_MASK else 0
-        out.write(matByte)
+        // 8. Material byte (bit 0x20 = Fullbright) + per-face overrides
+        val defMatByte = if (fullbright) TE_MATERIAL_FULLBRIGHT_MASK else 0
+        out.write(defMatByte)
+        for ((faceIdx, fb) in faceFullbright.entries.sortedBy { it.key }) {
+            if (faceIdx in 0 until MAX_FACES) {
+                val fMat = if (fb) TE_MATERIAL_FULLBRIGHT_MASK else 0
+                if (fMat != defMatByte) {
+                    writeFaceBitfield(1 shl faceIdx)
+                    out.write(fMat)
+                }
+            }
+        }
         writeFaceBitfield(0)
 
         // 9. Media byte
         out.write(0)
         writeFaceBitfield(0)
 
-        // 10. Glow byte (0..255)
-        val glowByte = (glow.coerceIn(0f, 1f) * 255f).roundToInt().coerceIn(0, 255)
-        out.write(glowByte)
+        // 10. Glow byte (0..255) + per-face overrides
+        val defGlowByte = quantizeGlowByte(glow)
+        out.write(defGlowByte)
+        for ((faceIdx, fg) in faceGlows.entries.sortedBy { it.key }) {
+            if (faceIdx in 0 until MAX_FACES) {
+                val fGlowByte = quantizeGlowByte(fg)
+                if (fGlowByte != defGlowByte) {
+                    writeFaceBitfield(1 shl faceIdx)
+                    out.write(fGlowByte)
+                }
+            }
+        }
         writeFaceBitfield(0)
 
         return out.toByteArray()
+    }
+
+    /**
+     * Applies an update to either [ALL_FACES] (`-1`) or a single 0-indexed face (`0..31`) on top of an
+     * existing [com.example.linkpoint.protocol.ParsedTextureEntry] and packs the resulting `TextureEntry`
+     * without shifting or clobbering sibling face indices.
+     */
+    fun applyFaceUpdateAndPack(
+        existing: com.example.linkpoint.protocol.ParsedTextureEntry,
+        faceIndex: Int = ALL_FACES,
+        textureId: UUID? = null,
+        color: ColorRgba? = null,
+        fullbright: Boolean? = null,
+        glow: Float? = null
+    ): ByteArray {
+        return if (faceIndex == ALL_FACES) {
+            buildCompactTextureEntry(
+                defaultTextureId = textureId ?: existing.defaultTextureId ?: SlBinaryParsers.DEFAULT_BLANK_UUID,
+                faceTextures = if (textureId != null) emptyMap() else existing.faceTextures,
+                defaultColor = color ?: existing.defaultColor,
+                faceColors = if (color != null) emptyMap() else existing.faceColors,
+                fullbright = fullbright ?: existing.defaultFullbright,
+                faceFullbright = if (fullbright != null) emptyMap() else existing.faceFullbright,
+                glow = glow ?: existing.defaultGlow,
+                faceGlows = if (glow != null) emptyMap() else existing.faceGlows,
+                repeatU = existing.defaultRepeatU,
+                faceRepeatU = existing.faceRepeatU,
+                repeatV = existing.defaultRepeatV,
+                faceRepeatV = existing.faceRepeatV
+            )
+        } else {
+            require(faceIndex in 0 until MAX_FACES) { "Face index must be in 0..31 (got $faceIndex)" }
+            val nextTex = LinkedHashMap(existing.faceTextures).apply {
+                if (textureId != null) put(faceIndex, textureId)
+            }
+            val nextColors = LinkedHashMap(existing.faceColors).apply {
+                if (color != null) put(faceIndex, color)
+            }
+            val nextFb = LinkedHashMap(existing.faceFullbright).apply {
+                if (fullbright != null) put(faceIndex, fullbright)
+            }
+            val nextGlows = LinkedHashMap(existing.faceGlows).apply {
+                if (glow != null) put(faceIndex, glow)
+            }
+            buildCompactTextureEntry(
+                defaultTextureId = existing.defaultTextureId ?: SlBinaryParsers.DEFAULT_BLANK_UUID,
+                faceTextures = nextTex,
+                defaultColor = existing.defaultColor,
+                faceColors = nextColors,
+                fullbright = existing.defaultFullbright,
+                faceFullbright = nextFb,
+                glow = existing.defaultGlow,
+                faceGlows = nextGlows,
+                repeatU = existing.defaultRepeatU,
+                faceRepeatU = existing.faceRepeatU,
+                repeatV = existing.defaultRepeatV,
+                faceRepeatV = existing.faceRepeatV
+            )
+        }
     }
 
     fun buildObjectImageBody(
@@ -715,6 +1218,39 @@ object PrimBuildPackets {
         buf.putShort(textureEntryBytes.size.toShort()) // TextureEntry Variable 2
         buf.put(textureEntryBytes)
         return buf.array()
+    }
+
+    fun frameObjectImagePacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        localId: Int,
+        textureEntryBytes: ByteArray,
+        mediaUrl: String = "",
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_OBJECT_IMAGE,
+        body = buildObjectImageBody(agentId, sessionId, localId, textureEntryBytes, mediaUrl),
+        useZeroCoding = true
+    )
+
+    fun parseObjectImagePayload(payload: ByteBuffer): DecodedObjectImage {
+        val buf = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val count = buf.get().toInt() and 0xFF
+        val entries = List(count) {
+            val localId = buf.int
+            val mediaLen = buf.get().toInt() and 0xFF
+            val mediaUrl = LludpPackets.readCString(buf, mediaLen)
+            val teLen = buf.short.toInt() and 0xFFFF
+            val teBytes = ByteArray(teLen)
+            buf.get(teBytes)
+            DecodedObjectImageEntry(localId, mediaUrl, teBytes)
+        }
+        return DecodedObjectImage(agentId, sessionId, entries)
     }
 
     // --- 6. ObjectExtraParams (Low 99 = 0xFFFF0063, Zerocoded) ---
@@ -759,6 +1295,41 @@ object PrimBuildPackets {
         return buf.array()
     }
 
+    fun frameObjectExtraParamsPacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        localId: Int,
+        paramType: Int,
+        paramInUse: Boolean,
+        paramData: ByteArray,
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_OBJECT_EXTRA_PARAMS,
+        body = buildObjectExtraParamsBody(agentId, sessionId, localId, paramType, paramInUse, paramData),
+        useZeroCoding = true
+    )
+
+    fun parseObjectExtraParamsPayload(payload: ByteBuffer): DecodedObjectExtraParams {
+        val buf = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val count = buf.get().toInt() and 0xFF
+        val entries = List(count) {
+            val localId = buf.int
+            val paramType = buf.short.toInt() and 0xFFFF
+            val paramInUse = (buf.get().toInt() and 0xFF) != 0
+            val paramSize = buf.int
+            val dataLen = buf.get().toInt() and 0xFF
+            val data = ByteArray(dataLen)
+            buf.get(data)
+            DecodedObjectExtraParamEntry(localId, paramType, paramInUse, paramSize, data)
+        }
+        return DecodedObjectExtraParams(agentId, sessionId, entries)
+    }
+
     // --- 7. ObjectLink (Low 115 = 0xFFFF0073, Unencoded) & ObjectDelink (Low 116 = 0xFFFF0074, Unencoded) ---
 
     fun buildObjectLinkBody(
@@ -777,10 +1348,11 @@ object PrimBuildPackets {
         sequenceNumber: Int,
         agentId: UUID,
         sessionId: UUID,
-        localIds: List<Int>
+        localIds: List<Int>,
+        reliable: Boolean = true
     ): ByteArray = LludpPackets.framePacket(
         sequenceNumber = sequenceNumber,
-        reliable = true,
+        reliable = reliable,
         messageId = MSG_OBJECT_LINK,
         body = buildObjectLinkBody(agentId, sessionId, localIds),
         useZeroCoding = false // Unencoded in message_template.msg
@@ -790,10 +1362,11 @@ object PrimBuildPackets {
         sequenceNumber: Int,
         agentId: UUID,
         sessionId: UUID,
-        localIds: List<Int>
+        localIds: List<Int>,
+        reliable: Boolean = true
     ): ByteArray = LludpPackets.framePacket(
         sequenceNumber = sequenceNumber,
-        reliable = true,
+        reliable = reliable,
         messageId = MSG_OBJECT_DELINK,
         body = buildObjectDelinkBody(agentId, sessionId, localIds),
         useZeroCoding = false // Unencoded in message_template.msg
@@ -849,6 +1422,35 @@ object PrimBuildPackets {
         return buf.array()
     }
 
+    fun frameObjectDuplicatePacket(
+        sequenceNumber: Int,
+        agentId: UUID,
+        sessionId: UUID,
+        groupId: UUID = ZERO_UUID,
+        offset: Vec3 = Vec3(0.5f, 0.5f, 0f),
+        duplicateFlags: Int = DUPLICATE_FLAG_CREATE_SELECTED,
+        localIds: List<Int>,
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_OBJECT_DUPLICATE,
+        body = buildObjectDuplicateBody(agentId, sessionId, groupId, offset, duplicateFlags, localIds),
+        useZeroCoding = true
+    )
+
+    fun parseObjectDuplicatePayload(payload: ByteBuffer): DecodedObjectDuplicate {
+        val buf = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val agentId = LludpPackets.readUuid(buf)
+        val sessionId = LludpPackets.readUuid(buf)
+        val groupId = LludpPackets.readUuid(buf)
+        val offset = LludpPackets.readVec3(buf)
+        val duplicateFlags = buf.int
+        val count = buf.get().toInt() and 0xFF
+        val ids = List(count) { buf.int }
+        return DecodedObjectDuplicate(agentId, sessionId, groupId, offset, duplicateFlags, ids)
+    }
+
     // --- 9. DeRezObject / ObjectDeRez (Low 291 = 0xFFFF0123, Zerocoded) ---
 
     fun buildObjectDeRezBody(
@@ -886,10 +1488,11 @@ object PrimBuildPackets {
         destinationId: UUID = ZERO_UUID,
         transactionId: UUID = UUID.randomUUID(),
         localIds: List<Int>,
-        groupId: UUID = ZERO_UUID
+        groupId: UUID = ZERO_UUID,
+        reliable: Boolean = true
     ): ByteArray = LludpPackets.framePacket(
         sequenceNumber = sequenceNumber,
-        reliable = true,
+        reliable = reliable,
         messageId = MSG_OBJECT_DEREZ,
         body = buildObjectDeRezBody(
             agentId = agentId,
@@ -926,6 +1529,35 @@ object PrimBuildPackets {
             packetNumber = packetNumber,
             localIds = ids
         )
+    }
+
+    // --- 10. DeRezAck (Low 292 = 0xFFFF0124, Unencoded) ---
+
+    fun buildDeRezAckBody(transactionId: UUID, success: Boolean): ByteArray {
+        val buf = ByteBuffer.allocate(17).order(ByteOrder.LITTLE_ENDIAN)
+        LludpPackets.putUuid(buf, transactionId)
+        buf.put(if (success) 1.toByte() else 0.toByte())
+        return buf.array()
+    }
+
+    fun frameDeRezAckPacket(
+        sequenceNumber: Int,
+        transactionId: UUID,
+        success: Boolean,
+        reliable: Boolean = true
+    ): ByteArray = LludpPackets.framePacket(
+        sequenceNumber = sequenceNumber,
+        reliable = reliable,
+        messageId = MSG_DEREZ_ACK,
+        body = buildDeRezAckBody(transactionId, success),
+        useZeroCoding = false // Unencoded in message_template.msg
+    )
+
+    fun parseDeRezAckPayload(payload: ByteBuffer): DecodedDeRezAck {
+        val buf = payload.duplicate().order(ByteOrder.LITTLE_ENDIAN)
+        val transactionId = LludpPackets.readUuid(buf)
+        val success = if (buf.hasRemaining()) (buf.get().toInt() and 0xFF) != 0 else false
+        return DecodedDeRezAck(transactionId, success)
     }
 }
 
